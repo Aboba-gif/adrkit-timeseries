@@ -1,0 +1,133 @@
+{
+  "schema_version": "adrkit.experiment/1",
+  "pipeline": "composition",
+  "science_schema_version": "adrkit.composition/1",
+  "science": {
+    "source": {
+      "kind": "p1",
+      "parameters": {
+        "knots": [
+          0,
+          1,
+          2
+        ],
+        "times": [
+          0,
+          0.5,
+          1,
+          1.5,
+          2
+        ],
+        "time_unit": "s",
+        "coefficient_unit": "1",
+        "value_unit": "1",
+        "scale": 1
+      }
+    },
+    "surrogate": {
+      "kind": "identity",
+      "parameters": {}
+    },
+    "observation": {
+      "kind": "identity",
+      "parameters": {}
+    },
+    "regularizer": {
+      "kind": "h1",
+      "parameters": {
+        "center": [
+          0.2,
+          0.3,
+          0.2
+        ],
+        "tau": 0.5
+      }
+    },
+    "initial": [
+      0,
+      0,
+      0
+    ],
+    "covariance": [
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    ],
+    "coefficient_metric": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        1
+      ]
+    ],
+    "bounds": [
+      [
+        0,
+        null
+      ],
+      [
+        0,
+        null
+      ],
+      [
+        0,
+        null
+      ]
+    ],
+    "action": "solve",
+    "optimizer": {
+      "maxiter": 100,
+      "maxfun": 200,
+      "ftol": 1e-12,
+      "gtol": 1e-09
+    },
+    "sensitivity": {
+      "max_columns": 3,
+      "max_entries": 15,
+      "max_jvp_calls": 3,
+      "relative_threshold": 1e-10
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "schema_version": "adrkit.experiment/1",
+  "science": {
+    "surrogate": {
+      "kind": "tanh",
+      "parameters": {
+        "gain": 0.5,
+        "capabilities": "jvp"
+      }
+    },
+    "action": "sensitivity"
+  }
+}

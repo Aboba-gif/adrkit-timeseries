@@ -1,0 +1,16 @@
+{
+  "diffusion": 0.018,
+  "velocity": [
+    -0.72,
+    -0.144
+  ],
+  "linear_loss": 0.013888888888888888,
+  "reaction_c_star": 1.0,
+  "source_position": [
+    0.0,
+    0.0
+  ],
+  "background": 0.0,
+  "horizon": 3.5,
+  "reaction_gamma": 0.013888888888888888
+}

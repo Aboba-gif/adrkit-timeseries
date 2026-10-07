@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adrkit-timeseries"
+version = "0.1.0"
+description = "Численные задачи переноса, обратные задачи и обработка временных рядов"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+  "numpy>=2.0", "scipy>=1.12", "pandas>=2.2", "scikit-learn>=1.4",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "threadpoolctl>=3"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["adrkit", "adrkit.*", "timeseries", "timeseries.*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib -p no:cacheprovider"

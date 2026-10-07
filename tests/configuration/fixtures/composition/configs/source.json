@@ -1,0 +1,61 @@
+{
+  "schema_version": "adrkit.experiment/1",
+  "science": {
+    "source": {
+      "kind": "bernstein",
+      "parameters": {
+        "degree": 2,
+        "interval": [
+          0,
+          2
+        ],
+        "times": [
+          0,
+          0.5,
+          1,
+          1.5,
+          2
+        ],
+        "coefficient_unit": "1",
+        "value_unit": "1",
+        "scale": 1,
+        "time_unit": "s"
+      }
+    },
+    "regularizer": {
+      "kind": "quadratic",
+      "parameters": {
+        "center": [
+          0.2,
+          0.3,
+          0.2
+        ],
+        "alpha": 0.1,
+        "gram": [
+          [
+            1,
+            0,
+            0
+          ],
+          [
+            0,
+            1,
+            0
+          ],
+          [
+            0,
+            0,
+            1
+          ]
+        ]
+      }
+    },
+    "target": [
+      1,
+      1.375,
+      1.5,
+      1.375,
+      1
+    ]
+  }
+}
