@@ -1,4 +1,5 @@
 """Дополнительный дискретный член по состоянию и его полный якобиан."""
+
 from dataclasses import dataclass
 from typing import Callable
 
@@ -9,17 +10,31 @@ from scipy import sparse
 def _arguments(state, points, time):
     points = np.asarray(points)
     state = np.asarray(state)
-    if (points.ndim != 2 or points.shape[1] != 2 or not len(points)
-            or points.dtype.kind not in "iuf" or not np.isfinite(points).all()):
+    if (
+        points.ndim != 2
+        or points.shape[1] != 2
+        or not len(points)
+        or points.dtype.kind not in "iuf"
+        or not np.isfinite(points).all()
+    ):
         raise ValueError("StateResidual requires finite real points with shape (n,2)")
-    if (state.shape != (len(points),) or state.dtype.kind not in "iuf"
-            or not np.isfinite(state).all()):
+    if (
+        state.shape != (len(points),)
+        or state.dtype.kind not in "iuf"
+        or not np.isfinite(state).all()
+    ):
         raise ValueError("StateResidual requires a finite real state with shape (n,)")
-    if (isinstance(time, (bool, np.bool_))
-            or not isinstance(time, (int, float, np.integer, np.floating))
-            or not np.isfinite(time)):
+    if (
+        isinstance(time, (bool, np.bool_))
+        or not isinstance(time, (int, float, np.integer, np.floating))
+        or not np.isfinite(time)
+    ):
         raise ValueError("StateResidual requires a finite real physical time")
-    return np.array(state, dtype=float, copy=True), np.array(points, dtype=float, copy=True), float(time)
+    return (
+        np.array(state, dtype=float, copy=True),
+        np.array(points, dtype=float, copy=True),
+        float(time),
+    )
 
 
 @dataclass(frozen=True)
@@ -108,8 +123,11 @@ class StateResidual:
         result = operation(state, points, time)
         if not derivative:
             array = np.asarray(result)
-            if (array.shape != (count,) or array.dtype.kind not in "iuf"
-                    or not np.isfinite(array).all()):
+            if (
+                array.shape != (count,)
+                or array.dtype.kind not in "iuf"
+                or not np.isfinite(array).all()
+            ):
                 raise ValueError("StateResidual value must be finite real values with shape (n,)")
             return np.array(array, dtype=float, copy=True)
         if sparse.issparse(result):
@@ -118,8 +136,11 @@ class StateResidual:
             matrix = sparse.csc_matrix(result, dtype=float, copy=True)
         else:
             array = np.asarray(result)
-            if (array.shape != (count, count) or array.dtype.kind not in "iuf"
-                    or not np.isfinite(array).all()):
+            if (
+                array.shape != (count, count)
+                or array.dtype.kind not in "iuf"
+                or not np.isfinite(array).all()
+            ):
                 raise ValueError("StateResidual Jacobian must be a finite real (n,n) matrix")
             matrix = sparse.csc_matrix(np.array(array, dtype=float, copy=True))
         matrix.sum_duplicates()

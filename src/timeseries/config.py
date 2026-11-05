@@ -1,4 +1,5 @@
 """Сборка загрузчика данных и метода заполнения из параметров."""
+
 from dataclasses import dataclass
 
 from .contracts import DataContractError, closed, text
@@ -21,6 +22,7 @@ class ConfiguredImputation:
     protocol_id, population_id : str
         Идентификаторы протокола и выборки.
     """
+
     data: DataSource
     imputer: object
     protocol_id: str
@@ -58,8 +60,7 @@ def assemble(spec, *, families=None, anchor=None):
     -----
     Сборка не читает файлы, не обучает метод и не вычисляет прогноз.
     """
-    closed(spec, {"data", "imputer", "protocol_id", "population_id"},
-           where="configuration")
+    closed(spec, {"data", "imputer", "protocol_id", "population_id"}, where="configuration")
     protocol_id = text(spec["protocol_id"], "protocol_id")
     population_id = text(spec["population_id"], "population_id")
     data_spec = closed(spec["data"], {"sources", "panel"}, where="data")

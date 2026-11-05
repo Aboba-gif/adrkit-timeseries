@@ -1,4 +1,5 @@
 """Собрать и решить малую обратную задачу из явного JSON-файла."""
+
 import argparse
 from pathlib import Path
 
@@ -29,8 +30,12 @@ def main(argv=None):
     components = assemble(config)
     if components.science["action"] != "solve":
         raise ConfigError("пример выполняет только действие solve")
-    result = solve_lbfgsb(components.objective, components.initial,
-        bounds=components.science["bounds"], options=components.science["optimizer"])
+    result = solve_lbfgsb(
+        components.objective,
+        components.initial,
+        bounds=components.science["bounds"],
+        options=components.science["optimizer"],
+    )
     if not result.success:
         raise RuntimeError(result.message)
     print("Коэффициенты:", result.x)

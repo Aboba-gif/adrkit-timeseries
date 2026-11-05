@@ -1,4 +1,5 @@
 """Композиция нагрузки, состояния ADR и линейных наблюдений."""
+
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -30,8 +31,12 @@ def solver_state_space(solver, *, state_unit=None):
     """
     if state_unit is None:
         state_unit = solver.units.concentration if solver.units is not None else "unknown"
-    return ArraySpace((solver.nt+1, solver.size), axes=("time", "node"),
-                      coordinates=(solver.times, solver.xy), units=state_unit)
+    return ArraySpace(
+        (solver.nt + 1, solver.size),
+        axes=("time", "node"),
+        coordinates=(solver.times, solver.xy),
+        units=state_unit,
+    )
 
 
 def grid_observation(space_weights, time_weights, *, state_space, codomain):
@@ -77,6 +82,7 @@ class StateCertificate:
     nonlinear_iterations : int
         Суммарное число нелинейных обновлений решателя.
     """
+
     max_scaled_residual: float
     nonlinear_iterations: int
 
@@ -96,36 +102,56 @@ def _validate_components(solver, load, observation):
         raise TypeError("Load domain and codomain must be ArraySpace records")
     for name in ("nt", "size"):
         value = getattr(solver, name, None)
-        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < 1:
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or value < 1
+        ):
             raise ValueError(f"Solver {name} must be a positive integer")
     times, points = np.asarray(solver.times), np.asarray(solver.xy)
-    if (times.shape != (solver.nt+1,) or times.dtype.kind not in "iuf"
-            or not np.isfinite(times).all() or np.any(np.diff(times) <= 0)):
+    if (
+        times.shape != (solver.nt + 1,)
+        or times.dtype.kind not in "iuf"
+        or not np.isfinite(times).all()
+        or np.any(np.diff(times) <= 0)
+    ):
         raise ValueError("Solver must declare finite increasing time nodes")
-    if (points.shape != (solver.size, 2) or points.dtype.kind not in "iuf"
-            or not np.isfinite(points).all()):
+    if (
+        points.shape != (solver.size, 2)
+        or points.dtype.kind not in "iuf"
+        or not np.isfinite(points).all()
+    ):
         raise ValueError("Solver must declare finite ordered two-dimensional geometry")
-    if (load.codomain.shape != (solver.nt+1,)
-            or observation.domain.shape != (solver.nt+1, solver.size)
-            or len(load.domain.shape) != 1
-            or load.domain.dtype != np.dtype("float64")
-            or load.codomain.dtype != load.domain.dtype
-            or observation.domain.dtype != load.domain.dtype):
+    if (
+        load.codomain.shape != (solver.nt + 1,)
+        or observation.domain.shape != (solver.nt + 1, solver.size)
+        or len(load.domain.shape) != 1
+        or load.domain.dtype != np.dtype("float64")
+        or load.codomain.dtype != load.domain.dtype
+        or observation.domain.dtype != load.domain.dtype
+    ):
         raise ValueError("Control, state and observation layouts must agree")
-    if (load.codomain.coordinates[0] != tuple(times)
-            or observation.domain.coordinates[0] != tuple(times)
-            or observation.domain.coordinates[1] != tuple(map(tuple, points))):
+    if (
+        load.codomain.coordinates[0] != tuple(times)
+        or observation.domain.coordinates[0] != tuple(times)
+        or observation.domain.coordinates[1] != tuple(map(tuple, points))
+    ):
         raise ValueError("Actual control/state times and ordered geometry must agree")
     if observation.codomain.units != observation.domain.units:
         raise ValueError("Observation and concentration units must agree")
     if solver.units is not None:
         if not isinstance(solver.units, ADRUnits):
             raise TypeError("Solver units must be ADRUnits or None")
-        if (load.codomain.units != solver.units.source
-                or observation.domain.units != solver.units.concentration):
+        if (
+            load.codomain.units != solver.units.source
+            or observation.domain.units != solver.units.concentration
+        ):
             raise ValueError("Declared units must agree with the PDE solver")
-    return load if isinstance(load, MapCapabilities) else MapCapabilities(
-        load, load.domain, load.codomain, load, load)
+    return (
+        load
+        if isinstance(load, MapCapabilities)
+        else MapCapabilities(load, load.domain, load.codomain, load, load)
+    )
 
 
 class GridPrediction:
@@ -177,8 +203,9 @@ class GridPrediction:
         """
         if self._trajectory is None:
             return None
-        return StateCertificate(float(self._trajectory.max_scaled_residual),
-                                int(self._trajectory.nonlinear_iterations))
+        return StateCertificate(
+            float(self._trajectory.max_scaled_residual), int(self._trajectory.nonlinear_iterations)
+        )
 
     def invalidate(self):
         """Освободить сохранённую точку, прогноз и траекторию."""
@@ -220,7 +247,9 @@ class GridPrediction:
         """
         point = self.domain.array(point, name="parameter point", copy=True)
         if self._point is None or not np.array_equal(point, self._point):
-            trajectory = self._solver.solve_controls(self._load_capabilities.predict.predict(point))
+            trajectory = self._solver.solve_controls(
+                self._load_capabilities.predict.predict(point)
+            )
             value = self.observe(trajectory.states)
             self._trajectory, self._value = trajectory, value
             self._point = point.copy()
@@ -271,7 +300,8 @@ class GridPrediction:
         direction = self.domain.array(direction, name="direction", copy=True)
         self.predict(point)
         tangent = self._solver.tangent_controls(
-            self._trajectory, self._load_capabilities.jvp.jvp(point, direction))
+            self._trajectory, self._load_capabilities.jvp.jvp(point, direction)
+        )
         return self.observe(tangent)
 
     def vjp(self, point, cotangent):
@@ -343,7 +373,8 @@ class GridPrediction:
         matrices = [np.empty((obs.codomain.size, self.domain.size)) for obs in observations]
         for j, d in enumerate(np.eye(self.domain.size)):
             tangent = self._solver.tangent_controls(
-                self._trajectory, self._load_capabilities.jvp.jvp(point, d))
+                self._trajectory, self._load_capabilities.jvp.jvp(point, d)
+            )
             for matrix, obs in zip(matrices, observations):
                 matrix[:, j] = obs.predict(tangent)
         return tuple(matrices)
@@ -399,8 +430,9 @@ class SelectedPrediction:
             Независимая копия выбранного прогноза формы codomain.shape.
         """
         point = self.domain.array(point, name="parameter point", copy=True)
-        return self.codomain.array(self._selection.take(self.base.predict(point)),
-                                   name="selected prediction", copy=True)
+        return self.codomain.array(
+            self._selection.take(self.base.predict(point)), name="selected prediction", copy=True
+        )
 
     def vjp(self, point, cotangent):
         """Перенести ковектор выбранных наблюдений к параметрам прогноза.
@@ -438,8 +470,11 @@ class SelectedPrediction:
         """
         point = self.domain.array(point, name="parameter point", copy=True)
         direction = self.domain.array(direction, name="direction", copy=True)
-        return self.codomain.array(self._selection.take(self.base.jvp(point, direction)),
-                                   name="selected JVP output", copy=True)
+        return self.codomain.array(
+            self._selection.take(self.base.jvp(point, direction)),
+            name="selected JVP output",
+            copy=True,
+        )
 
     def jacobian(self, point):
         """Собрать матрицу производной прогноза по параметрам.

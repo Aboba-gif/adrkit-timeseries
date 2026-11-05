@@ -1,4 +1,5 @@
 """Проверка JSON-параметров семейств составной задачи."""
+
 from adrkit.errors import ConfigError
 
 from .loader import ScienceSchema
@@ -69,7 +70,11 @@ def matrix(value):
 
 
 def _p1_parameters(p, *, partial):
-    fields(p, {"knots", "times", "time_unit", "coefficient_unit", "value_unit", "scale"}, partial=partial)
+    fields(
+        p,
+        {"knots", "times", "time_unit", "coefficient_unit", "value_unit", "scale"},
+        partial=partial,
+    )
     p = dict(p)
     for key in ("knots", "times"):
         if key in p:
@@ -83,7 +88,11 @@ def _p1_parameters(p, *, partial):
             string(p[key], where=key)
     if "scale" in p:
         p["scale"] = number(p["scale"], positive=True)
-    if "knots" in p and "times" in p and (p["times"][0] < p["knots"][0] or p["times"][-1] > p["knots"][-1]):
+    if (
+        "knots" in p
+        and "times" in p
+        and (p["times"][0] < p["knots"][0] or p["times"][-1] > p["knots"][-1])
+    ):
         raise ConfigError("sample times must lie within the source interval")
     return p
 
@@ -160,9 +169,21 @@ def composition_schema(*, families):
 
     def normalize(science, context):
         def partial(path):
-            return context.partial and not any(path == p or path.startswith(p + "/") for p in context.complete_paths)
+            return context.partial and not any(
+                path == p or path.startswith(p + "/") for p in context.complete_paths
+            )
 
-        keys = {*available, "target", "covariance", "coefficient_metric", "initial", "bounds", "action", "optimizer", "sensitivity"}
+        keys = {
+            *available,
+            "target",
+            "covariance",
+            "coefficient_metric",
+            "initial",
+            "bounds",
+            "action",
+            "optimizer",
+            "sensitivity",
+        }
         fields(science, keys, partial=partial("/science"), where="science")
         s = JSONRecord(science).to_dict()
         for role, choices in available.items():
@@ -177,7 +198,9 @@ def composition_schema(*, families):
             if type(spec["kind"]) is not str or spec["kind"] not in choices:
                 raise ConfigError(f"unsupported {role} kind: {spec['kind']!r}")
             if "parameters" in spec:
-                spec["parameters"] = choices[spec["kind"]].validate(spec["parameters"], partial=partial(path + "/parameters"))
+                spec["parameters"] = choices[spec["kind"]].validate(
+                    spec["parameters"], partial=partial(path + "/parameters")
+                )
         for key in ("initial", "target"):
             if key in s:
                 s[key] = vector(s[key])
@@ -198,13 +221,29 @@ def composition_schema(*, families):
         if "action" in s and s["action"] not in ("score", "solve", "sensitivity"):
             raise ConfigError("action must be score, solve or sensitivity")
         if "optimizer" in s:
-            options = fields(s["optimizer"], {"maxiter", "maxfun", "ftol", "gtol"}, partial=partial("/science/optimizer"))
+            options = fields(
+                s["optimizer"],
+                {"maxiter", "maxfun", "ftol", "gtol"},
+                partial=partial("/science/optimizer"),
+            )
             for key, value in options.items():
-                options[key] = integer(value, minimum=1) if key in ("maxiter", "maxfun") else number(value, positive=True)
+                options[key] = (
+                    integer(value, minimum=1)
+                    if key in ("maxiter", "maxfun")
+                    else number(value, positive=True)
+                )
         if "sensitivity" in s:
-            limits = fields(s["sensitivity"], {"max_columns", "max_entries", "max_jvp_calls", "relative_threshold"}, partial=partial("/science/sensitivity"))
+            limits = fields(
+                s["sensitivity"],
+                {"max_columns", "max_entries", "max_jvp_calls", "relative_threshold"},
+                partial=partial("/science/sensitivity"),
+            )
             for key, value in limits.items():
-                limits[key] = number(value, minimum=0) if key == "relative_threshold" else integer(value, minimum=1)
+                limits[key] = (
+                    number(value, minimum=0)
+                    if key == "relative_threshold"
+                    else integer(value, minimum=1)
+                )
         return s
 
     return ScienceSchema("composition", "adrkit.composition/1", normalize, lambda s: ())

@@ -1,4 +1,5 @@
 """Линейные пространственные и временные наблюдения сеточного состояния."""
+
 import numpy as np
 
 from adrkit.spaces import _LinearMap
@@ -81,19 +82,26 @@ class GridObservation(_LinearMap):
         self._space_weights = np.array(space_weights, dtype=domain.dtype, copy=True)
         self._time_weights = np.array(time_weights, dtype=domain.dtype, copy=True)
         s, w = self._space_weights, self._time_weights
-        if (s.ndim != 2 or w.ndim != 2 or not np.isfinite(s).all()
-                or not np.isfinite(w).all() or domain.shape != (w.shape[1], s.shape[1])
-                or codomain.shape != (s.shape[0]*w.shape[0],)):
+        if (
+            s.ndim != 2
+            or w.ndim != 2
+            or not np.isfinite(s).all()
+            or not np.isfinite(w).all()
+            or domain.shape != (w.shape[1], s.shape[1])
+            or codomain.shape != (s.shape[0] * w.shape[0],)
+        ):
             raise ValueError("S/W shapes must match state and receiver-major observation spaces")
         super().__init__(domain, codomain, self._matvec, self._rmatvec)
 
     def _matvec(self, x):
-        return apply_observation(x.reshape(self.domain.shape),
-                                 self._space_weights, self._time_weights)
+        return apply_observation(
+            x.reshape(self.domain.shape), self._space_weights, self._time_weights
+        )
 
     def _rmatvec(self, z):
-        return transpose_observation(z.reshape(-1),
-                                     self._space_weights, self._time_weights).ravel()
+        return transpose_observation(
+            z.reshape(-1), self._space_weights, self._time_weights
+        ).ravel()
 
     @property
     def space_weights(self):
@@ -126,5 +134,6 @@ def observation_map(space_weights, time_weights, *, domain, codomain):
     mapping : MapCapabilities
         Прогноз и JVP/VJP оператора GridObservation.
     """
-    return GridObservation(space_weights, time_weights,
-                           domain=domain, codomain=codomain).capabilities()
+    return GridObservation(
+        space_weights, time_weights, domain=domain, codomain=codomain
+    ).capabilities()

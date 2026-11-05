@@ -11,11 +11,12 @@ requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
-  "numpy>=2.0", "scipy>=1.12", "pandas>=2.2", "scikit-learn>=1.4",
+  "numpy>=2.0", "scipy>=1.18", "pandas>=2.2", "scikit-learn>=1.4",
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "threadpoolctl>=3"]
+dev = ["black==26.10.1"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -29,3 +30,7 @@ namespaces = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--import-mode=importlib -p no:cacheprovider"
+
+[tool.black]
+line-length = 99
+target-version = ["py312"]

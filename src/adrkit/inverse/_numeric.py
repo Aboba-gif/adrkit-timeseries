@@ -1,4 +1,5 @@
 """Проверки вещественных числовых входов для операций обратной задачи."""
+
 import numpy as np
 
 
@@ -99,8 +100,8 @@ def symmetric_psd_matrix(value, size, *, name, copy=False):
     if not np.allclose(matrix, matrix.T, rtol=1e-12, atol=1e-14):
         raise ValueError(f"{name} must be symmetric")
     # Допуск учитывает округление собственных значений; исходная матрица сохраняется.
-    tolerance = 100*np.finfo(float).eps*max(1., np.linalg.norm(matrix, 2))
-    symmetric_part = .5*matrix+.5*matrix.T
+    tolerance = 100 * np.finfo(float).eps * max(1.0, np.linalg.norm(matrix, 2))
+    symmetric_part = 0.5 * matrix + 0.5 * matrix.T
     if np.linalg.eigvalsh(symmetric_part).min() < -tolerance:
         raise ValueError(f"{name} must be positive semidefinite")
     return matrix, tolerance

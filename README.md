@@ -39,6 +39,11 @@ python -m venv .venv
 Описание интерфейсов: [архитектура](docs/ARCHITECTURE.md),
 [расширение ADR](docs/EXTENDING.md), [временные ряды](docs/TIME_SERIES.md).
 
+Временной источник можно собрать из `adrkit.sources.GaussianBasis` или
+`P1Basis` и отображения `sampled_source_map`. Число центров или узлов задаёт
+размерность коэффициентов. Оба базиса вычисляют значения, интегралы и матрицу
+Грама. Подключение собственного базиса описано в руководстве по расширению ADR.
+
 ## Примеры
 
 | Файл | Операция |
@@ -66,6 +71,14 @@ python -B examples/configuration.py --config examples/configuration.json
 
 ```text
 python -X utf8 -B -m pytest -q
+```
+
+Для разработки установите `".[test,dev]"`. Код оформляется по PEP 8,
+документация функций — по PEP 257 с разделами NumPy. Единое форматирование
+задаёт Black; параметры находятся в `pyproject.toml`:
+
+```text
+python -m black --check src tests examples
 ```
 
 Код распространяется по [MIT-лицензии](LICENSE).

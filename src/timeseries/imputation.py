@@ -1,4 +1,5 @@
 """Методы заполнения, их параметры и состояния обучения."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -7,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .numerics import HGBFiller, KalmanDLM, SoftImpute, fill_linear, fill_pchip
+
 
 @dataclass(frozen=True)
 class NoFitState:
@@ -19,6 +21,7 @@ class NoFitState:
     edge_policy : str
         Правило обработки края соответствующего метода.
     """
+
     kind: str
     edge_policy: str
 
@@ -41,11 +44,13 @@ class InterpolationImputer:
     no_fit_state : NoFitState
         Состояние, которое следует явно передать в ``predict`` как ``fitted``.
     """
+
     kind: str
     edge_policy: str
 
     def __post_init__(self):
         from .contracts import choice
+
         choice(self.kind, {"linear", "pchip"}, "imputer.kind")
         _interpolation_parameters(self.kind, {"edge_policy": self.edge_policy})
 
@@ -78,6 +83,7 @@ class InterpolationImputer:
         использует позиции на регулярной временной сетке.
         """
         from .contracts import DataContractError, MaskedInputs, result_from_inputs
+
         if not isinstance(inputs, MaskedInputs):
             raise DataContractError("predict requires MaskedInputs, never panel/truth")
         if not isinstance(fitted, NoFitState) or fitted != self.no_fit_state:
@@ -96,17 +102,15 @@ class InterpolationImputer:
                 else:
                     filled = series.copy()  # Для кубического интерполянта нужны хотя бы два узла.
                 # Копия нужна для записи: pandas может вернуть неизменяемое представление.
-                
+
                 filled = np.array(filled, dtype=float, copy=True)
                 if self.edge_policy == "abstain":
-                    filled[:observed[0]] = np.nan
-                    filled[observed[-1]+1:] = np.nan
+                    filled[: observed[0]] = np.nan
+                    filled[observed[-1] + 1 :] = np.nan
                 prediction[:, site, channel] = filled
         # Численный метод не должен менять видимые наблюдения.
         prediction[inputs.visible] = inputs.values[inputs.visible]
-        available = np.isfinite(prediction)
-        status = np.where(inputs.visible, "observed", np.where(available, "imputed", "unavailable"))
-        return result_from_inputs(inputs, prediction, availability=available, status=status)
+        return result_from_inputs(inputs, prediction)
 
 
 @dataclass(frozen=True)
@@ -128,11 +132,13 @@ class ImputerFamily:
     Метод без обучения предоставляет ``no_fit_state``. Внешние семейства
     передаются явно через ``families``; они не заменяют встроенные имена.
     """
+
     validate_parameters: object
     constructor: object
 
     def __post_init__(self):
         from .contracts import DataContractError
+
         if not callable(self.validate_parameters) or not callable(self.constructor):
             raise DataContractError("family requires explicit Python validator and constructor")
 
@@ -140,6 +146,7 @@ class ImputerFamily:
 def _interpolation_parameters(kind, parameters):
     """Проверить правило края для выбранного вида интерполяции."""
     from .contracts import choice, closed
+
     closed(parameters, {"edge_policy"}, where=kind + ".parameters")
     allowed = {"abstain", "nearest"} if kind == "linear" else {"abstain", "extrapolate"}
     return {"edge_policy": choice(parameters["edge_policy"], allowed, "edge_policy")}
@@ -148,17 +155,28 @@ def _interpolation_parameters(kind, parameters):
 def _families(additional):
     """Соединить встроенные и явно переданные семейства методов."""
     from .contracts import DataContractError, text
+
     result = {
-        "linear": ImputerFamily(lambda p: _interpolation_parameters("linear", p),
-                                lambda p: InterpolationImputer("linear", p["edge_policy"])),
-        "pchip": ImputerFamily(lambda p: _interpolation_parameters("pchip", p),
-                               lambda p: InterpolationImputer("pchip", p["edge_policy"])),
-        "kalman_dlm": ImputerFamily(lambda p: KalmanParameters.from_dict(p).to_dict(),
-                                    lambda p: KalmanImputer(KalmanParameters.from_dict(p))),
-        "soft_impute": ImputerFamily(lambda p: SoftImputeParameters.from_dict(p).to_dict(),
-                                     lambda p: SoftImputeAdapter(SoftImputeParameters.from_dict(p))),
-        "hgb": ImputerFamily(lambda p: HGBParameters.from_dict(p).to_dict(),
-                             lambda p: HGBImputer(HGBParameters.from_dict(p))),
+        "linear": ImputerFamily(
+            lambda p: _interpolation_parameters("linear", p),
+            lambda p: InterpolationImputer("linear", p["edge_policy"]),
+        ),
+        "pchip": ImputerFamily(
+            lambda p: _interpolation_parameters("pchip", p),
+            lambda p: InterpolationImputer("pchip", p["edge_policy"]),
+        ),
+        "kalman_dlm": ImputerFamily(
+            lambda p: KalmanParameters.from_dict(p).to_dict(),
+            lambda p: KalmanImputer(KalmanParameters.from_dict(p)),
+        ),
+        "soft_impute": ImputerFamily(
+            lambda p: SoftImputeParameters.from_dict(p).to_dict(),
+            lambda p: SoftImputeAdapter(SoftImputeParameters.from_dict(p)),
+        ),
+        "hgb": ImputerFamily(
+            lambda p: HGBParameters.from_dict(p).to_dict(),
+            lambda p: HGBImputer(HGBParameters.from_dict(p)),
+        ),
     }
     if additional is not None:
         if type(additional) is not dict:
@@ -195,6 +213,7 @@ def validate_imputer_spec(spec, *, families=None):
     """
     import json
     from .contracts import DataContractError, closed, text
+
     closed(spec, {"kind", "parameters"}, where="imputer")
     kind = text(spec["kind"], "imputer.kind")
     available = _families(families)
@@ -236,6 +255,7 @@ def build_imputer(spec, *, families=None):
     может задавать собственный метод и смысл стандартного отклонения.
     """
     from .contracts import DataContractError
+
     normalized = validate_imputer_spec(spec, families=families)
     result = _families(families)[normalized["kind"]].constructor(normalized["parameters"])
     if not callable(getattr(result, "predict", None)):
@@ -246,6 +266,7 @@ def build_imputer(spec, *, families=None):
 def _positive_integer(value, name):
     """Вернуть положительное целое число либо отклонить значение."""
     from .contracts import DataContractError
+
     if type(value) is not int or value <= 0:
         raise DataContractError(f"{name}: positive integer required")
     return value
@@ -282,6 +303,7 @@ class KalmanParameters:
     уровень численного фильтра использует среднее всего переданного ряда;
     название ``tail`` само по себе не задаёт прогноз в реальном времени.
     """
+
     period: int
     harmonics: int
     maxiter: int
@@ -291,29 +313,38 @@ class KalmanParameters:
 
     def __post_init__(self):
         from .contracts import DataContractError, choice
+
         for key in ("period", "harmonics", "maxiter"):
             _positive_integer(getattr(self, key), key)
         choice(self.mode, {"interior", "tail", "head"}, "kalman_dlm.mode")
         variance = self.initial_variance
-        if (isinstance(variance, (bool, np.bool_))
-                or not isinstance(variance, (int, float, np.integer, np.floating))):
+        if isinstance(variance, (bool, np.bool_)) or not isinstance(
+            variance, (int, float, np.integer, np.floating)
+        ):
             raise DataContractError("kalman_dlm.initial_variance: finite positive number required")
         try:
             variance = float(variance)
         except OverflowError as exc:
-            raise DataContractError("kalman_dlm.initial_variance: finite positive number required") from exc
+            raise DataContractError(
+                "kalman_dlm.initial_variance: finite positive number required"
+            ) from exc
         if not np.isfinite(variance) or variance <= 0:
             raise DataContractError("kalman_dlm.initial_variance: finite positive number required")
         object.__setattr__(self, "initial_variance", variance)
         if self.x0 is not None:
             values = np.asarray(self.x0, dtype=object)
-            if (values.shape != (5,) or any(isinstance(v, (bool, np.bool_))
-                    or not isinstance(v, (int, float, np.integer, np.floating)) for v in values)):
+            if values.shape != (5,) or any(
+                isinstance(v, (bool, np.bool_))
+                or not isinstance(v, (int, float, np.integer, np.floating))
+                for v in values
+            ):
                 raise DataContractError("kalman_dlm.x0: five finite real numbers required")
             try:
                 point = tuple(float(v) for v in values)
             except OverflowError as exc:
-                raise DataContractError("kalman_dlm.x0: five finite real numbers required") from exc
+                raise DataContractError(
+                    "kalman_dlm.x0: five finite real numbers required"
+                ) from exc
             if not np.isfinite(point).all():
                 raise DataContractError("kalman_dlm.x0: five finite real numbers required")
             object.__setattr__(self, "x0", point)
@@ -322,12 +353,20 @@ class KalmanParameters:
     def from_dict(cls, value):
         """Создать проверенные параметры из словаря полей класса."""
         from .contracts import closed
-        return cls(**closed(value, {"period", "harmonics", "maxiter", "mode", "initial_variance", "x0"},
-                            optional={"initial_variance", "x0"}, where="kalman_dlm.parameters"))
+
+        return cls(
+            **closed(
+                value,
+                {"period", "harmonics", "maxiter", "mode", "initial_variance", "x0"},
+                optional={"initial_variance", "x0"},
+                where="kalman_dlm.parameters",
+            )
+        )
 
     def to_dict(self):
         """Вернуть независимый словарь нормализованных параметров."""
         from dataclasses import asdict
+
         result = asdict(self)
         result["x0"] = None if self.x0 is None else list(self.x0)
         return result
@@ -359,6 +398,7 @@ class SoftImputeParameters:
     Строки начинаются с первого элемента ряда; последняя дополняется
     ``NaN``. ``cycle_length`` не привязывает позиции к календарным суткам.
     """
+
     lam: float
     rank_max: int
     max_iter: int
@@ -367,6 +407,7 @@ class SoftImputeParameters:
 
     def __post_init__(self):
         from .contracts import DataContractError
+
         for key in ("rank_max", "max_iter", "cycle_length"):
             _positive_integer(getattr(self, key), key)
         for key in ("lam", "tol"):
@@ -378,12 +419,19 @@ class SoftImputeParameters:
     def from_dict(cls, value):
         """Создать проверенные параметры из словаря полей класса."""
         from .contracts import closed
-        return cls(**closed(value, {"lam", "rank_max", "max_iter", "tol", "cycle_length"},
-                            where="soft_impute.parameters"))
+
+        return cls(
+            **closed(
+                value,
+                {"lam", "rank_max", "max_iter", "tol", "cycle_length"},
+                where="soft_impute.parameters",
+            )
+        )
 
     def to_dict(self):
         """Вернуть независимый словарь нормализованных параметров."""
         from dataclasses import asdict
+
         return asdict(self)
 
 
@@ -404,21 +452,34 @@ def input_layout(inputs):
     """
     import json
     from .contracts import DataContractError, MaskedInputs
+
     if not isinstance(inputs, MaskedInputs):
         raise DataContractError("expected MaskedInputs, never panel/truth")
     layout = inputs.spec.to_dict()
-    return json.dumps({key: layout[key] for key in (
-        "sites", "channels", "units", "frequency", "origin", "clock", "timezone", "calendar"
-    )}, sort_keys=True)
+    return json.dumps(
+        {
+            key: layout[key]
+            for key in (
+                "sites",
+                "channels",
+                "units",
+                "frequency",
+                "origin",
+                "clock",
+                "timezone",
+                "calendar",
+            )
+        },
+        sort_keys=True,
+    )
 
 
 def _imputation_result(inputs, prediction, uncertainty=None):
     """Сохранить видимые значения и построить привязанный результат."""
     from .contracts import result_from_inputs
+
     prediction[inputs.visible] = inputs.values[inputs.visible]
-    available = np.isfinite(prediction)
-    status = np.where(inputs.visible, "observed", np.where(available, "imputed", "unavailable"))
-    return result_from_inputs(inputs, prediction, availability=available, status=status, uncertainty=uncertainty)
+    return result_from_inputs(inputs, prediction, uncertainty=uncertainty)
 
 
 @dataclass(frozen=True)
@@ -442,6 +503,7 @@ class KalmanState:
     ``theta`` копируется в буфер без права записи. Диапазон времени
     обучающей выборки не ограничивает последующий диапазон прогноза.
     """
+
     parameters: KalmanParameters
     protocol_id: str
     population_id: str
@@ -450,10 +512,13 @@ class KalmanState:
 
     def __post_init__(self):
         from .contracts import DataContractError, snapshot
+
         shape = np.shape(self.theta)
         if len(shape) != 3 or shape[-1] != 5 or not np.isfinite(self.theta).all():
             raise DataContractError("invalid Kalman fitted coefficients")
-        object.__setattr__(self, "theta", snapshot(self.theta, dtype=float, shape=shape, name="theta"))
+        object.__setattr__(
+            self, "theta", snapshot(self.theta, dtype=float, shape=shape, name="theta")
+        )
 
 
 @dataclass(frozen=True)
@@ -465,6 +530,7 @@ class KalmanImputer:
     parameters : KalmanParameters
         Настройки обучения, режима прогноза и начальной ковариации.
     """
+
     parameters: KalmanParameters
 
     def fit(self, train_inputs, *, rng):
@@ -491,20 +557,27 @@ class KalmanImputer:
         прерывает обучение. Этот детерминированный метод не расходует ``rng``.
         """
         from .contracts import DataContractError
+
         layout = input_layout(train_inputs)
         if train_inputs.population_kind != "train" or not isinstance(rng, np.random.Generator):
             raise DataContractError("fit requires explicit train population and RNG")
         values = train_inputs.values
-        
-        if any(np.isfinite(values[:, i, j]).sum() < 2 or np.nanvar(values[:, i, j]) <= 0
-               for i in range(values.shape[1]) for j in range(values.shape[2])):
-            raise DataContractError("Kalman fit needs varying visible training observations per series")
+
+        if any(
+            np.isfinite(values[:, i, j]).sum() < 2 or np.nanvar(values[:, i, j]) <= 0
+            for i in range(values.shape[1])
+            for j in range(values.shape[2])
+        ):
+            raise DataContractError(
+                "Kalman fit needs varying visible training observations per series"
+            )
         theta = np.empty((*values.shape[1:], 5))
         p = self.parameters
         for i in range(values.shape[1]):
             for j in range(values.shape[2]):
-                model = KalmanDLM(period=p.period, harmonics=p.harmonics,
-                                  initial_variance=p.initial_variance)
+                model = KalmanDLM(
+                    period=p.period, harmonics=p.harmonics, initial_variance=p.initial_variance
+                )
                 model.fit(values[:, i, j], x0=p.x0, maxiter=p.maxiter)
                 theta[i, j] = model.theta
         return KalmanState(p, train_inputs.protocol_id, train_inputs.population_id, layout, theta)
@@ -537,10 +610,15 @@ class KalmanImputer:
         Модельный SD сохраняется также в видимых позициях.
         """
         from .contracts import DataContractError
+
         layout = input_layout(inputs)
-        if (not isinstance(fitted, KalmanState) or fitted.parameters != self.parameters or
-                fitted.protocol_id != inputs.protocol_id or fitted.layout != layout or
-                fitted.theta.shape != (*inputs.values.shape[1:], 5)):
+        if (
+            not isinstance(fitted, KalmanState)
+            or fitted.parameters != self.parameters
+            or fitted.protocol_id != inputs.protocol_id
+            or fitted.layout != layout
+            or fitted.theta.shape != (*inputs.values.shape[1:], 5)
+        ):
             raise DataContractError("Kalman fitted state binding mismatch")
         prediction = np.full(inputs.values.shape, np.nan)
         uncertainty = np.full(inputs.values.shape, np.nan)
@@ -550,9 +628,15 @@ class KalmanImputer:
                 y = inputs.values[:, i, j]
                 if not np.isfinite(y).any():
                     continue  # Среднее для начального уровня нельзя вычислить без наблюдений.
-                model = KalmanDLM(period=p.period, harmonics=p.harmonics,
-                                  theta=fitted.theta[i, j].copy(), initial_variance=p.initial_variance)
-                result = model.smooth(y) if p.mode == "interior" else model.filter_only(y, mode=p.mode)
+                model = KalmanDLM(
+                    period=p.period,
+                    harmonics=p.harmonics,
+                    theta=fitted.theta[i, j].copy(),
+                    initial_variance=p.initial_variance,
+                )
+                result = (
+                    model.smooth(y) if p.mode == "interior" else model.filter_only(y, mode=p.mode)
+                )
                 prediction[:, i, j], uncertainty[:, i, j] = result
         return _imputation_result(inputs, prediction, uncertainty)
 
@@ -572,6 +656,7 @@ class SoftImputeAdapter:
         Настройки метода, передаваемые в ``predict`` без отдельного
         обучения.
     """
+
     parameters: SoftImputeParameters
 
     @property
@@ -602,6 +687,7 @@ class SoftImputeAdapter:
         пропуски этого ряда остаются ``unavailable``. Обучающая выборка не нужна.
         """
         from .contracts import DataContractError
+
         input_layout(inputs)
         if not isinstance(fitted, SoftImputeParameters) or fitted != self.parameters:
             raise DataContractError("explicit matching SoftImpute no-fit state required")
@@ -618,25 +704,43 @@ class SoftImputeAdapter:
 def _validate_hgb_estimator(parameters):
     """Проверить численные настройки оценщика HGB."""
     from .contracts import DataContractError
+
     for name in ("max_iter", "max_leaf_nodes", "min_samples_leaf"):
         _positive_integer(getattr(parameters, name), name)
     if parameters.max_leaf_nodes < 2:
         raise DataContractError("hgb.max_leaf_nodes must be at least two")
     for name in ("learning_rate", "l2_regularization"):
         value = getattr(parameters, name)
-        if (type(value) not in (int, float) or not np.isfinite(value) or
-                value < 0 or (name == "learning_rate" and value == 0)):
+        if (
+            type(value) not in (int, float)
+            or not np.isfinite(value)
+            or value < 0
+            or (name == "learning_rate" and value == 0)
+        ):
             raise DataContractError(f"hgb.{name}: invalid finite value")
-    if not (type(parameters.early_stopping) is bool or
-            (type(parameters.early_stopping) is str and parameters.early_stopping == "auto")):
+    if not (
+        type(parameters.early_stopping) is bool
+        or (type(parameters.early_stopping) is str and parameters.early_stopping == "auto")
+    ):
         raise DataContractError("hgb.early_stopping must be boolean or 'auto'")
 
 
 def _hgb_estimator_parameters(parameters, seed):
     """Собрать параметры оценщика HGB с явным ``random_state``."""
-    return {**{key: getattr(parameters, key) for key in (
-        "max_iter", "learning_rate", "max_leaf_nodes", "l2_regularization",
-        "min_samples_leaf", "early_stopping")}, "random_state": seed}
+    return {
+        **{
+            key: getattr(parameters, key)
+            for key in (
+                "max_iter",
+                "learning_rate",
+                "max_leaf_nodes",
+                "l2_regularization",
+                "min_samples_leaf",
+                "early_stopping",
+            )
+        },
+        "random_state": seed,
+    }
 
 
 @dataclass(frozen=True)
@@ -674,6 +778,7 @@ class HGBParameters:
     Признаки сохраняют единицы входных каналов. Преобразования шкалы
     целевого значения и его ограничения не вводятся этим классом.
     """
+
     target: str
     lags: tuple
     leads: tuple
@@ -689,6 +794,7 @@ class HGBParameters:
 
     def __post_init__(self):
         from .contracts import DataContractError, strings, text
+
         text(self.target, "hgb.target")
         for name in ("lags", "leads"):
             values = getattr(self, name)
@@ -706,7 +812,7 @@ class HGBParameters:
             raise DataContractError("hgb feature columns overlap each other, target or lag names")
         if type(self.use_leads) is not bool:
             raise DataContractError("hgb.use_leads must be boolean")
-        
+
         if not self.lags and not (self.use_leads and self.leads):
             raise DataContractError("hgb requires an active lag or lead")
         _validate_hgb_estimator(self)
@@ -716,11 +822,13 @@ class HGBParameters:
         """Создать проверенные параметры из словаря полей класса."""
         from .contracts import closed
         from dataclasses import fields
+
         return cls(**closed(value, {f.name for f in fields(cls)}, where="hgb.parameters"))
 
     def to_dict(self):
         """Вернуть независимый словарь настроек метода."""
         from dataclasses import asdict
+
         return asdict(self)
 
     def estimator_parameters(self, seed):
@@ -754,6 +862,7 @@ class HGBEstimatorParameters:
     Состав, единицы и временные зависимости признаков задаёт ``FeatureSet``,
     переданный через ``hgb_family``.
     """
+
     target: str
     max_iter: int
     learning_rate: float
@@ -764,6 +873,7 @@ class HGBEstimatorParameters:
 
     def __post_init__(self):
         from .contracts import text
+
         text(self.target, "hgb.target")
         _validate_hgb_estimator(self)
 
@@ -772,11 +882,13 @@ class HGBEstimatorParameters:
         """Создать проверенные параметры из словаря полей класса."""
         from dataclasses import fields
         from .contracts import closed
+
         return cls(**closed(value, {f.name for f in fields(cls)}, where="hgb.parameters"))
 
     def to_dict(self):
         """Вернуть независимый словарь настроек метода."""
         from dataclasses import asdict
+
         return asdict(self)
 
     def estimator_parameters(self, seed):
@@ -814,6 +926,7 @@ class HGBState:
     models : tuple of object
         Глубокие копии сохранённых моделей для внешнего использования.
     """
+
     parameters: HGBParameters | HGBEstimatorParameters
     protocol_id: str
     population_id: str
@@ -827,6 +940,7 @@ class HGBState:
 
     def __post_init__(self):
         from copy import deepcopy
+
         object.__setattr__(self, "seeds", tuple(self.seeds))
         object.__setattr__(self, "_models", tuple(deepcopy(m) for m in self._models))
 
@@ -834,6 +948,7 @@ class HGBState:
     def models(self):
         """Вернуть независимые глубокие копии обученных моделей."""
         from copy import deepcopy
+
         return tuple(deepcopy(m) for m in self._models)
 
 
@@ -858,6 +973,7 @@ class HGBImputer:
     Для ``causal`` внешний ``FeatureSet`` должен объявлять ``uses_future=False``.
     Выбор признаков не задаёт общую причинность обучения и заполнения.
     """
+
     parameters: HGBParameters | HGBEstimatorParameters
     features: object | None = None
     feature_context: str = "retrospective"
@@ -865,19 +981,30 @@ class HGBImputer:
     def __post_init__(self):
         from .contracts import DataContractError
         from .features import FeatureSet
+
         if self.feature_context not in ("retrospective", "causal"):
             raise DataContractError("feature context must be retrospective or causal")
         if self.features is None:
-            if not isinstance(self.parameters, HGBParameters) or self.feature_context != "retrospective":
-                raise DataContractError("built-in HGB features require HGBParameters and retrospective context")
-        elif not isinstance(self.features, FeatureSet) or not isinstance(self.parameters, HGBEstimatorParameters):
-            raise DataContractError("injected HGB features require FeatureSet and HGBEstimatorParameters")
+            if (
+                not isinstance(self.parameters, HGBParameters)
+                or self.feature_context != "retrospective"
+            ):
+                raise DataContractError(
+                    "built-in HGB features require HGBParameters and retrospective context"
+                )
+        elif not isinstance(self.features, FeatureSet) or not isinstance(
+            self.parameters, HGBEstimatorParameters
+        ):
+            raise DataContractError(
+                "injected HGB features require FeatureSet and HGBEstimatorParameters"
+            )
         elif self.feature_context == "causal" and self.features.uses_future is not False:
             raise DataContractError("causal features require an explicit no-future dependency")
 
     def _columns(self, inputs):
         """Проверить входные каналы и вернуть индексы цели и дополнительных столбцов."""
         from .contracts import DataContractError
+
         input_layout(inputs)
         channels = inputs.spec.to_dict()["channels"]
         required = (self.parameters.target,)
@@ -918,6 +1045,7 @@ class HGBImputer:
         внешний набор применяется через ``FeatureSet.transform``.
         """
         from .contracts import DataContractError
+
         target, columns = self._columns(train_inputs)
         if train_inputs.population_kind != "train" or not isinstance(rng, np.random.Generator):
             raise DataContractError("fit requires explicit train population and RNG")
@@ -928,21 +1056,39 @@ class HGBImputer:
         for site in range(train_inputs.values.shape[1]):
             seed = int(rng.integers(0, 2**32 - 1))
             if features is None:
-                model = HGBFiller(list(p.lags), list(p.leads), list(p.covs), list(p.calendar),
-                                  p.estimator_parameters(seed))
-                frame = pd.DataFrame({name: train_inputs.values[:, site, j] for name, j in columns.items()})
+                model = HGBFiller(
+                    list(p.lags),
+                    list(p.leads),
+                    list(p.covs),
+                    list(p.calendar),
+                    p.estimator_parameters(seed),
+                )
+                frame = pd.DataFrame(
+                    {name: train_inputs.values[:, site, j] for name, j in columns.items()}
+                )
                 model.fit(train_inputs.values[:, site, target], frame, use_leads=p.use_leads)
             else:
                 from sklearn.ensemble import HistGradientBoostingRegressor
+
                 visible = train_inputs.visible[:, site, target]
                 model = HistGradientBoostingRegressor(**p.estimator_parameters(seed))
-                model.fit(features.values[visible, site, :], train_inputs.values[visible, site, target])
+                model.fit(
+                    features.values[visible, site, :], train_inputs.values[visible, site, target]
+                )
             models.append(model)
             seeds.append(seed)
-        return HGBState(p, train_inputs.protocol_id, train_inputs.population_id,
-                        input_layout(train_inputs), tuple(seeds), tuple(models), self.features,
-                        self.feature_context, features.names if features is not None else (),
-                        features.units if features is not None else ())
+        return HGBState(
+            p,
+            train_inputs.protocol_id,
+            train_inputs.population_id,
+            input_layout(train_inputs),
+            tuple(seeds),
+            tuple(models),
+            self.features,
+            self.feature_context,
+            features.names if features is not None else (),
+            features.units if features is not None else (),
+        )
 
     def predict(self, inputs, *, fitted):
         """Заполнить целевой канал обученными моделями HGB.
@@ -971,27 +1117,40 @@ class HGBImputer:
         в признаки не подаются.
         """
         from .contracts import DataContractError
+
         target, columns = self._columns(inputs)
-        if (not isinstance(fitted, HGBState) or fitted.parameters != self.parameters or
-                fitted.protocol_id != inputs.protocol_id or fitted.layout != input_layout(inputs) or
-                len(fitted._models) != inputs.values.shape[1] or fitted.features is not self.features or
-                fitted.feature_context != self.feature_context):
+        if (
+            not isinstance(fitted, HGBState)
+            or fitted.parameters != self.parameters
+            or fitted.protocol_id != inputs.protocol_id
+            or fitted.layout != input_layout(inputs)
+            or len(fitted._models) != inputs.values.shape[1]
+            or fitted.features is not self.features
+            or fitted.feature_context != self.feature_context
+        ):
             raise DataContractError("HGB fitted state binding mismatch")
         features = self._feature_values(inputs) if self.features is not None else None
-        if features is not None and (features.names != fitted.feature_names or features.units != fitted.feature_units):
+        if features is not None and (
+            features.names != fitted.feature_names or features.units != fitted.feature_units
+        ):
             raise DataContractError("HGB fitted feature layout/units mismatch")
         prediction = inputs.values.copy()
         for site, model in enumerate(fitted._models):
             y = inputs.values[:, site, target]
             if not np.isnan(y).any():
-                continue  # При отсутствии пропусков predict не вызывается: sklearn не принимает ноль строк.
-                          
+                # При отсутствии пропусков predict не нужен: sklearn не принимает ноль строк.
+                continue
+
             if features is None:
-                frame = pd.DataFrame({name: inputs.values[:, site, j] for name, j in columns.items()})
+                frame = pd.DataFrame(
+                    {name: inputs.values[:, site, j] for name, j in columns.items()}
+                )
                 prediction[:, site, target], _ = model.fill(y, frame)
             else:
                 missing = ~inputs.visible[:, site, target]
-                prediction[missing, site, target] = model.predict(features.values[missing, site, :])
+                prediction[missing, site, target] = model.predict(
+                    features.values[missing, site, :]
+                )
         return _imputation_result(inputs, prediction)
 
 
@@ -1013,9 +1172,12 @@ def hgb_family(features, *, context="retrospective"):
     """
     from .contracts import DataContractError
     from .features import FeatureSet
+
     if not isinstance(features, FeatureSet) or context not in ("retrospective", "causal"):
         raise DataContractError("hgb_family requires FeatureSet and explicit feature context")
     if context == "causal" and features.uses_future is not False:
         raise DataContractError("causal features require an explicit no-future dependency")
-    return ImputerFamily(lambda p: HGBEstimatorParameters.from_dict(p).to_dict(),
-                         lambda p: HGBImputer(HGBEstimatorParameters.from_dict(p), features, context))
+    return ImputerFamily(
+        lambda p: HGBEstimatorParameters.from_dict(p).to_dict(),
+        lambda p: HGBImputer(HGBEstimatorParameters.from_dict(p), features, context),
+    )

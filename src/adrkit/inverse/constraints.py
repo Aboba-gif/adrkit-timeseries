@@ -1,4 +1,5 @@
 """Покомпонентные границы параметров обратной задачи."""
+
 import numpy as np
 
 
@@ -26,7 +27,7 @@ def gradient_mapping(theta, gradient):
 
     Здесь :math:`g` — переданный gradient.
     """
-    return np.asarray(theta)-np.maximum(0., np.asarray(theta)-gradient)
+    return np.asarray(theta) - np.maximum(0.0, np.asarray(theta) - gradient)
 
 
 def box_bounds(bounds, size):
@@ -47,7 +48,7 @@ def box_bounds(bounds, size):
         границы отклоняются.
     """
     if bounds is None:
-        return [(None, None)]*size
+        return [(None, None)] * size
     if len(bounds) != size:
         raise ValueError("One bound pair per coefficient required")
     result = []

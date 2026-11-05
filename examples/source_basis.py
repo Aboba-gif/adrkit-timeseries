@@ -1,4 +1,5 @@
 """Базис Бернштейна для временного профиля источника."""
+
 from math import comb
 
 import numpy as np
@@ -24,6 +25,7 @@ class BernsteinBasis:
     Базис вычисляется непосредственно как полином;
     нулевое продолжение вне интервала не задаётся.
     """
+
     def __init__(self, degree, interval, time_unit):
         self.size = degree + 1
         self.interval = tuple(interval)
@@ -54,19 +56,21 @@ class BernsteinBasis:
         """
         t = (np.asarray(times) - self.interval[0]) / (self.interval[1] - self.interval[0])
         n = self.size - 1
-        return np.column_stack([comb(n, j) * t**j * (1-t)**(n-j) for j in range(n+1)])
+        return np.column_stack([comb(n, j) * t**j * (1 - t) ** (n - j) for j in range(n + 1)])
 
 
 def main():
     """Показать линейное отображение источника в базисе Бернштейна."""
-    times = np.array([0., .5, 1., 1.5, 2.])
-    basis = BernsteinBasis(2, (0., 2.), "s")
-    coefficients = ArraySpace((3,), axes=("bernstein_coefficient",), coordinates=((0, 1, 2),), units="1")
+    times = np.array([0.0, 0.5, 1.0, 1.5, 2.0])
+    basis = BernsteinBasis(2, (0.0, 2.0), "s")
+    coefficients = ArraySpace(
+        (3,), axes=("bernstein_coefficient",), coordinates=((0, 1, 2),), units="1"
+    )
     values = ArraySpace((5,), axes=("time",), coordinates=(times,), units="1")
-    mapping = sampled_source_map(basis, times, scale=1., domain=coefficients, codomain=values)
-    point = np.array([.4, .6, .8])
-    t = times/2
-    expected = point[0]*(1-t)**2 + 2*point[1]*t*(1-t) + point[2]*t**2
+    mapping = sampled_source_map(basis, times, scale=1.0, domain=coefficients, codomain=values)
+    point = np.array([0.4, 0.6, 0.8])
+    t = times / 2
+    expected = point[0] * (1 - t) ** 2 + 2 * point[1] * t * (1 - t) + point[2] * t**2
     np.testing.assert_allclose(mapping.predict.predict(point), expected, rtol=1e-14)
     print(mapping.predict.predict(point))
 

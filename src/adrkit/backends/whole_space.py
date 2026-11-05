@@ -1,4 +1,5 @@
 """Наблюдения линейной ADR на плоскости по гауссову ядру."""
+
 from dataclasses import dataclass, replace
 import numpy as np
 from numpy.polynomial.legendre import leggauss
@@ -30,6 +31,7 @@ class Transport:
         Положительное стандартное отклонение пространственного
         усреднения по каждой координате в единицах длины.
     """
+
     diffusion: float
     velocity: tuple[float, float]
     reaction: float
@@ -44,7 +46,9 @@ class Transport:
             raise ValueError("A finite real two-component velocity is required") from error
         if len(velocity) != 2:
             raise ValueError("A finite real two-component velocity is required")
-        object.__setattr__(self, "velocity", tuple(_constant(value, "velocity") for value in velocity))
+        object.__setattr__(
+            self, "velocity", tuple(_constant(value, "velocity") for value in velocity)
+        )
         if self.diffusion <= 0 or self.footprint <= 0:
             raise ValueError("Finite positive diffusion and footprint are required")
         if self.reaction < 0:
@@ -77,9 +81,13 @@ class Transport:
         """
         if a <= 0 or time_scale <= 0:
             raise ValueError("Positive coordinate/time scales are required")
-        return replace(self, diffusion=time_scale*a*a*self.diffusion,
-                       velocity=tuple(time_scale*a*np.asarray(self.velocity)),
-                       reaction=time_scale*self.reaction, footprint=a*self.footprint)
+        return replace(
+            self,
+            diffusion=time_scale * a * a * self.diffusion,
+            velocity=tuple(time_scale * a * np.asarray(self.velocity)),
+            reaction=time_scale * self.reaction,
+            footprint=a * self.footprint,
+        )
 
 
 def _spatial_point(value, name):
@@ -133,11 +141,13 @@ def gaussian_kernel(lag, receiver, source, model):
         raise ValueError("Lag must be finite and nonnegative")
     receiver = _spatial_point(receiver, "receiver")
     source = _spatial_point(source, "source")
-    r = receiver-source
-    variance = model.footprint**2+2*model.diffusion*lag
-    dx = r[0]-model.velocity[0]*lag
-    dy = r[1]-model.velocity[1]*lag
-    return np.exp(-model.reaction*lag-(dx*dx+dy*dy)/(2*variance))/(2*np.pi*variance)
+    r = receiver - source
+    variance = model.footprint**2 + 2 * model.diffusion * lag
+    dx = r[0] - model.velocity[0] * lag
+    dy = r[1] - model.velocity[1] * lag
+    return np.exp(-model.reaction * lag - (dx * dx + dy * dy) / (2 * variance)) / (
+        2 * np.pi * variance
+    )
 
 
 def observation_matrix(times, receivers, source, edges, model, order=24):
@@ -171,26 +181,33 @@ def observation_matrix(times, receivers, source, edges, model, order=24):
     Интервалы после времени наблюдения дают нулевой вклад.
     """
     times, receivers, source, edges = map(
-        lambda x: np.asarray(x, dtype=float), (times, receivers, source, edges))
+        lambda x: np.asarray(x, dtype=float), (times, receivers, source, edges)
+    )
     if times.ndim != 1 or receivers.shape != (len(times), 2) or source.shape != (2,):
         raise ValueError("Incompatible observation arrays")
     if edges.ndim != 1 or len(edges) < 2 or np.any(np.diff(edges) <= 0):
         raise ValueError("Strictly increasing bin edges are required")
     if not all(np.isfinite(x).all() for x in (times, receivers, source, edges)):
         raise ValueError("All observation inputs must be finite")
-    if isinstance(order, (bool, np.bool_)) or not isinstance(order, (int, np.integer)) or order < 2:
+    if (
+        isinstance(order, (bool, np.bool_))
+        or not isinstance(order, (int, np.integer))
+        or order < 2
+    ):
         raise ValueError("Quadrature order must be an integer >= 2")
     nodes, weights = leggauss(order)
-    A = np.zeros((len(times), len(edges)-1))
+    A = np.zeros((len(times), len(edges) - 1))
     for receiver in np.unique(receivers, axis=0):
         sel = np.all(receivers == receiver, axis=1)
         t = times[sel, None]
-        lower = np.broadcast_to(edges[:-1], (len(t), len(edges)-1))
+        lower = np.broadcast_to(edges[:-1], (len(t), len(edges) - 1))
         upper = np.minimum(t, edges[1:])
-        width = np.maximum(0, upper-lower)
-        s = lower[..., None]+0.5*width[..., None]*(nodes+1)
-        lag = np.maximum(0, t[..., None]-s)
-        A[sel] = 0.5*width*np.sum(gaussian_kernel(lag, receiver, source, model)*weights, axis=-1)
+        width = np.maximum(0, upper - lower)
+        s = lower[..., None] + 0.5 * width[..., None] * (nodes + 1)
+        lag = np.maximum(0, t[..., None] - s)
+        A[sel] = (
+            0.5 * width * np.sum(gaussian_kernel(lag, receiver, source, model) * weights, axis=-1)
+        )
     return A
 
 
@@ -223,6 +240,7 @@ class WholeSpacePredictor(MatrixMap):
     --------
     observation_matrix : Порядок строк, столбцов и единицы матрицы.
     """
+
     def __init__(self, times, receivers, source, edges, model, *, domain, codomain, order=24):
         matrix = observation_matrix(times, receivers, source, edges, model, order)
         if domain.shape != (matrix.shape[1],) or codomain.shape != (matrix.shape[0],):

@@ -1,4 +1,5 @@
 """Линейные наблюдения источника P1 по ядру ADR на плоскости."""
+
 from dataclasses import dataclass
 import numpy as np
 from numpy.polynomial.legendre import leggauss
@@ -29,6 +30,7 @@ class SensorSpec:
     Порядок строк сохраняется. Каждое временное окно заканчивается
     в момент соответствующего наблюдения; среднее делится на полную ширину.
     """
+
     times: tuple
     receivers: tuple
     windows: tuple | None
@@ -37,22 +39,30 @@ class SensorSpec:
 
     def __init__(self, times, receivers, *, windows=None, time_unit="s", length_unit="m"):
         times, receivers = np.asarray(times, float), np.asarray(receivers, float)
-        if (times.ndim != 1 or not len(times) or receivers.shape != (len(times), 2)
-                or not np.isfinite(times).all() or not np.isfinite(receivers).all()):
+        if (
+            times.ndim != 1
+            or not len(times)
+            or receivers.shape != (len(times), 2)
+            or not np.isfinite(times).all()
+            or not np.isfinite(receivers).all()
+        ):
             raise ValueError("Finite times and paired 2D receivers required")
         if not time_unit or not length_unit:
             raise ValueError("Explicit time and length units required")
         if windows is not None:
             windows = np.asarray(windows, float)
-            if (windows.shape != times.shape or not np.isfinite(windows).all()
-                    or np.any(windows <= 0)):
+            if (
+                windows.shape != times.shape
+                or not np.isfinite(windows).all()
+                or np.any(windows <= 0)
+            ):
                 raise ValueError("One positive backward window width per row required")
             windows = tuple(windows.tolist())
-        object.__setattr__(self, 'times', tuple(times.tolist()))
-        object.__setattr__(self, 'receivers', tuple(map(tuple, receivers.tolist())))
-        object.__setattr__(self, 'windows', windows)
-        object.__setattr__(self, 'time_unit', time_unit)
-        object.__setattr__(self, 'length_unit', length_unit)
+        object.__setattr__(self, "times", tuple(times.tolist()))
+        object.__setattr__(self, "receivers", tuple(map(tuple, receivers.tolist())))
+        object.__setattr__(self, "windows", windows)
+        object.__setattr__(self, "time_unit", time_unit)
+        object.__setattr__(self, "length_unit", length_unit)
 
 
 @dataclass(frozen=True)
@@ -66,6 +76,7 @@ class SpatialSource:
     length_unit : str, optional
         Единица координат position.
     """
+
     position: tuple
     length_unit: str = "m"
 
@@ -73,7 +84,7 @@ class SpatialSource:
         position = np.asarray(self.position, float)
         if position.shape != (2,) or not np.isfinite(position).all() or not self.length_unit:
             raise ValueError("A finite fixed spatial delta position and length unit required")
-        object.__setattr__(self, 'position', tuple(position.tolist()))
+        object.__setattr__(self, "position", tuple(position.tolist()))
 
 
 @dataclass(frozen=True)
@@ -85,15 +96,21 @@ class Quadrature:
     order : int, optional
         Число узлов на подынтервале; не меньше двух.
     """
+
     order: int = 24
 
     def __post_init__(self):
-        if isinstance(self.order, bool) or not isinstance(self.order, (int, np.integer)) or self.order < 2:
+        if (
+            isinstance(self.order, bool)
+            or not isinstance(self.order, (int, np.integer))
+            or self.order < 2
+        ):
             raise ValueError("Gauss order must be an integer >= 2")
 
 
-def p1_response(basis, sensors, transport, spatial_source, *, quadrature,
-                coefficient_scale, domain, codomain):
+def p1_response(
+    basis, sensors, transport, spatial_source, *, quadrature, coefficient_scale, domain, codomain
+):
     r"""Создать линейный отклик кусочно-линейного источника.
 
     Parameters
@@ -147,29 +164,35 @@ def p1_response(basis, sensors, transport, spatial_source, *, quadrature,
         raise TypeError("Transport and fixed SpatialSource required")
     if not isinstance(quadrature, Quadrature):
         raise TypeError("Explicit Quadrature required")
-    if (basis.time_unit != sensors.time_unit
-            or sensors.length_unit != spatial_source.length_unit):
+    if basis.time_unit != sensors.time_unit or sensors.length_unit != spatial_source.length_unit:
         raise ValueError("Source and sensors must use matching time/length units")
-    if (isinstance(coefficient_scale, (bool, np.bool_))
-            or not np.isfinite(coefficient_scale) or coefficient_scale <= 0):
+    if (
+        isinstance(coefficient_scale, (bool, np.bool_))
+        or not np.isfinite(coefficient_scale)
+        or coefficient_scale <= 0
+    ):
         raise ValueError("Positive finite coefficient scale required")
-    if (domain.shape != (basis.size,) or codomain.shape != (len(sensors.times),)
-            or domain.coordinates != (tuple(basis.knots),)):
+    if (
+        domain.shape != (basis.size,)
+        or codomain.shape != (len(sensors.times),)
+        or domain.coordinates != (tuple(basis.knots),)
+    ):
         raise ValueError("Spaces must match ordered P1 knots and observation rows")
     nodes, weights = leggauss(quadrature.order)
     knots = basis.knots
 
     def snapshot(time, receiver):
         upper = np.minimum(time, knots[1:])
-        widths = np.maximum(0., upper-knots[:-1])
-        source_times = knots[:-1, None]+.5*widths[:, None]*(nodes+1)
-        kernel = gaussian_kernel(np.maximum(0., time-source_times), receiver,
-                                 spatial_source.position, transport)
-        weighted = .5*widths[:, None]*weights*kernel
-        fraction = (source_times-knots[:-1, None])/np.diff(knots)[:, None]
+        widths = np.maximum(0.0, upper - knots[:-1])
+        source_times = knots[:-1, None] + 0.5 * widths[:, None] * (nodes + 1)
+        kernel = gaussian_kernel(
+            np.maximum(0.0, time - source_times), receiver, spatial_source.position, transport
+        )
+        weighted = 0.5 * widths[:, None] * weights * kernel
+        fraction = (source_times - knots[:-1, None]) / np.diff(knots)[:, None]
         values = np.zeros(basis.size)
-        values[:-1] += np.sum(weighted*(1-fraction), axis=1)
-        values[1:] += np.sum(weighted*fraction, axis=1)
+        values[:-1] += np.sum(weighted * (1 - fraction), axis=1)
+        values[1:] += np.sum(weighted * fraction, axis=1)
         return values
 
     matrix = np.zeros((len(sensors.times), basis.size))
@@ -178,12 +201,12 @@ def p1_response(basis, sensors, transport, spatial_source, *, quadrature,
             matrix[row] = snapshot(time, receiver)
         else:
             width = sensors.windows[row]
-            lower = max(knots[0], time-width)
+            lower = max(knots[0], time - width)
             if lower >= time:
                 continue
             breaks = np.unique(np.r_[lower, knots[(knots > lower) & (knots < time)], time])
             for left, right in zip(breaks[:-1], breaks[1:]):
-                obs_times = left+.5*(right-left)*(nodes+1)
+                obs_times = left + 0.5 * (right - left) * (nodes + 1)
                 responses = np.array([snapshot(t, receiver) for t in obs_times])
-                matrix[row] += .5*(right-left)*(weights @ responses)/width
-    return matrix_map(coefficient_scale*matrix, domain=domain, codomain=codomain)
+                matrix[row] += 0.5 * (right - left) * (weights @ responses) / width
+    return matrix_map(coefficient_scale * matrix, domain=domain, codomain=codomain)

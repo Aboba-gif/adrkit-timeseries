@@ -1,4 +1,5 @@
 """Отображения входа решателя в состояние и его производные."""
+
 from copy import deepcopy
 
 import numpy as np
@@ -16,8 +17,19 @@ def _states_data(trajectory):
 class _TrajectoryMap:
     """Адаптер решателя с сохранением траектории последней точки."""
 
-    def __init__(self, *, domain, codomain, solve, jvp, vjp, states,
-                 copy_trajectory, owned_trajectory=False, fixed_actions=None):
+    def __init__(
+        self,
+        *,
+        domain,
+        codomain,
+        solve,
+        jvp,
+        vjp,
+        states,
+        copy_trajectory,
+        owned_trajectory=False,
+        fixed_actions=None,
+    ):
         self.domain, self.codomain = domain, codomain
         self._solve, self._tangent, self._pullback = solve, jvp, vjp
         self._states, self._copy_trajectory = states, copy_trajectory
@@ -110,25 +122,35 @@ class _TrajectoryMap:
             tangent, pullback = self._fixed_actions()
 
         def matvec(h):
-            h = self.domain.array(np.asarray(h).reshape(self.domain.shape),
-                                  name="direction", copy=True)
-            return self.codomain.array(tangent(trajectory, h), name="JVP output", copy=True).ravel()
+            h = self.domain.array(
+                np.asarray(h).reshape(self.domain.shape), name="direction", copy=True
+            )
+            return self.codomain.array(
+                tangent(trajectory, h), name="JVP output", copy=True
+            ).ravel()
 
         def rmatvec(z):
-            z = self.codomain.array(np.asarray(z).reshape(self.codomain.shape),
-                                    name="cotangent", copy=True)
+            z = self.codomain.array(
+                np.asarray(z).reshape(self.codomain.shape), name="cotangent", copy=True
+            )
             return self.domain.array(pullback(trajectory, z), name="VJP output", copy=True).ravel()
 
-        return LinearOperator((self.codomain.size, self.domain.size),
-                              dtype=np.result_type(self.domain.dtype, self.codomain.dtype),
-                              matvec=matvec, rmatvec=rmatvec)
+        return LinearOperator(
+            (self.codomain.size, self.domain.size),
+            dtype=np.result_type(self.domain.dtype, self.codomain.dtype),
+            matvec=matvec,
+            rmatvec=rmatvec,
+        )
 
 
 def _validate_callbacks(*, domain, codomain, solve, jvp, vjp, states, copy_trajectory):
     if not isinstance(domain, ArraySpace) or not isinstance(codomain, ArraySpace):
         raise TypeError("domain and codomain must be ArraySpace records")
-    for name, action in (("solve", solve), ("states", states),
-                         ("copy_trajectory", copy_trajectory)):
+    for name, action in (
+        ("solve", solve),
+        ("states", states),
+        ("copy_trajectory", copy_trajectory),
+    ):
         if not callable(action):
             raise TypeError(f"{name} must be callable")
     for name, action in (("jvp", jvp), ("vjp", vjp)):
@@ -137,13 +159,18 @@ def _validate_callbacks(*, domain, codomain, solve, jvp, vjp, states, copy_traje
 
 
 def _capabilities(action):
-    return MapCapabilities(action, action.domain, action.codomain,
-                           action if action._tangent is not None else None,
-                           action if action._pullback is not None else None)
+    return MapCapabilities(
+        action,
+        action.domain,
+        action.codomain,
+        action if action._tangent is not None else None,
+        action if action._pullback is not None else None,
+    )
 
 
-def state_map_from_solver(*, domain, codomain, solve, jvp=None, vjp=None,
-                          states=_states_data, copy_trajectory=deepcopy):
+def state_map_from_solver(
+    *, domain, codomain, solve, jvp=None, vjp=None, states=_states_data, copy_trajectory=deepcopy
+):
     """Связать внешний решатель с пространствами массивов.
 
     Parameters
@@ -174,10 +201,26 @@ def state_map_from_solver(*, domain, codomain, solve, jvp=None, vjp=None,
     Последняя траектория используется повторно. Настройки переданных
     функций должны оставаться неизменными во время применения отображения.
     """
-    _validate_callbacks(domain=domain, codomain=codomain, solve=solve,
-                        jvp=jvp, vjp=vjp, states=states, copy_trajectory=copy_trajectory)
-    return _capabilities(_TrajectoryMap(domain=domain, codomain=codomain,
-        solve=solve, jvp=jvp, vjp=vjp, states=states, copy_trajectory=copy_trajectory))
+    _validate_callbacks(
+        domain=domain,
+        codomain=codomain,
+        solve=solve,
+        jvp=jvp,
+        vjp=vjp,
+        states=states,
+        copy_trajectory=copy_trajectory,
+    )
+    return _capabilities(
+        _TrajectoryMap(
+            domain=domain,
+            codomain=codomain,
+            solve=solve,
+            jvp=jvp,
+            vjp=vjp,
+            states=states,
+            copy_trajectory=copy_trajectory,
+        )
+    )
 
 
 def _bounded_methods(model, *, forcing):
@@ -192,23 +235,34 @@ def _bounded_methods(model, *, forcing):
 def _bounded_layout(model, domain, codomain, *, forcing):
     if not isinstance(domain, ArraySpace) or not isinstance(codomain, ArraySpace):
         raise TypeError("ArraySpace domain and codomain required")
-    missing = [name for name in ("nt", "size", "times", "xy", "units")
-               if not hasattr(model, name)]
+    missing = [name for name in ("nt", "size", "times", "xy", "units") if not hasattr(model, name)]
     if missing:
         raise TypeError(f"A bounded state backend requires metadata: {', '.join(missing)}")
     for name in ("nt", "size"):
         value = getattr(model, name)
-        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < 1:
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or value < 1
+        ):
             raise ValueError(f"Bounded backend {name} must be a positive integer")
     times, xy = np.asarray(model.times), np.asarray(model.xy)
-    if (times.shape != (model.nt+1,) or times.dtype.kind not in "iuf"
-            or not np.isfinite(times).all() or np.any(np.diff(times) <= 0)):
+    if (
+        times.shape != (model.nt + 1,)
+        or times.dtype.kind not in "iuf"
+        or not np.isfinite(times).all()
+        or np.any(np.diff(times) <= 0)
+    ):
         raise ValueError("Bounded backend must declare finite increasing time nodes")
-    if (xy.shape != (model.size, 2) or xy.dtype.kind not in "iuf" or not np.isfinite(xy).all()):
+    if xy.shape != (model.size, 2) or xy.dtype.kind not in "iuf" or not np.isfinite(xy).all():
         raise ValueError("Bounded backend must declare finite x-fast geometry")
-    expected_domain = (model.nt+1, model.size) if forcing else (model.nt+1,)
-    if (domain.shape != expected_domain or codomain.shape != (model.nt+1, model.size)
-            or domain.dtype != np.dtype("float64") or codomain.dtype != domain.dtype):
+    expected_domain = (model.nt + 1, model.size) if forcing else (model.nt + 1,)
+    if (
+        domain.shape != expected_domain
+        or codomain.shape != (model.nt + 1, model.size)
+        or domain.dtype != np.dtype("float64")
+        or codomain.dtype != domain.dtype
+    ):
         raise ValueError("State map requires float64 time controls and time-by-node states")
     if domain.coordinates[0] != tuple(times) or codomain.coordinates[0] != tuple(times):
         raise ValueError("Input coordinates must match backend time nodes")
@@ -216,7 +270,9 @@ def _bounded_layout(model, domain, codomain, *, forcing):
         raise ValueError("Forcing and state coordinates must match")
     node_coordinates, node_indices = tuple(map(tuple, xy)), tuple(range(model.size))
     if codomain.coordinates[1] not in (node_coordinates, node_indices):
-        raise ValueError("State node coordinates must match backend x-fast geometry or ordered node indices")
+        raise ValueError(
+            "State node coordinates must match backend x-fast geometry or ordered node indices"
+        )
     if model.units is not None:
         if not isinstance(model.units, ADRUnits):
             raise TypeError("Bounded backend units must be ADRUnits or None")
@@ -225,7 +281,9 @@ def _bounded_layout(model, domain, codomain, *, forcing):
         if forcing and domain.units != model.units.reaction:
             raise ValueError("Forcing unit must match backend concentration/time")
         if not forcing and domain.units != model.units.source:
-            raise ValueError("Point-source control unit must match backend concentration*length^2/time")
+            raise ValueError(
+                "Point-source control unit must match backend concentration*length^2/time"
+            )
 
 
 def _bounded_state_map(model, domain, codomain, *, forcing):
@@ -242,12 +300,17 @@ def _bounded_state_map(model, domain, codomain, *, forcing):
         raise ValueError("Solver snapshot must preserve declared units")
     solve_name, tangent_name, pullback_name = names
     # При вызове использовать операции независимой копии решателя.
-    action = _TrajectoryMap(domain=domain, codomain=codomain,
+    action = _TrajectoryMap(
+        domain=domain,
+        codomain=codomain,
         solve=lambda x: getattr(snapshot, solve_name)(x),
         jvp=lambda trajectory, h: getattr(snapshot, tangent_name)(trajectory, h),
         vjp=lambda trajectory, z: getattr(snapshot, pullback_name)(trajectory, z),
-        states=_states_data, copy_trajectory=deepcopy, owned_trajectory=True,
-        fixed_actions=lambda: (getattr(snapshot, tangent_name), getattr(snapshot, pullback_name)))
+        states=_states_data,
+        copy_trajectory=deepcopy,
+        owned_trajectory=True,
+        fixed_actions=lambda: (getattr(snapshot, tangent_name), getattr(snapshot, pullback_name)),
+    )
     return _capabilities(action)
 
 

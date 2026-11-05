@@ -1,4 +1,5 @@
 """Подгонка неотрицательных коэффициентов с квадратичным штрафом."""
+
 from typing import Protocol
 
 import numpy as np
@@ -92,11 +93,24 @@ class FitMetric(Protocol):
         ...
 
 
-def fit(prediction, observations, metric, gram, alpha, jacobian, offset,
-        *, tolerance=1e-6, max_iterations=80, initial_point=None,
-        active_tolerance=1e-10,
-        nnls_max_iterations=1000, max_backtracks=24,
-        backtrack_factor=0.5, armijo_coefficient=1e-4):
+def fit(
+    prediction,
+    observations,
+    metric,
+    gram,
+    alpha,
+    jacobian,
+    offset,
+    *,
+    tolerance=1e-6,
+    max_iterations=80,
+    initial_point=None,
+    active_tolerance=1e-10,
+    nnls_max_iterations=1000,
+    max_backtracks=24,
+    backtrack_factor=0.5,
+    armijo_coefficient=1e-4,
+):
     r"""Подогнать неотрицательные коэффициенты с квадратичным штрафом.
 
     Parameters
@@ -181,24 +195,38 @@ def fit(prediction, observations, metric, gram, alpha, jacobian, offset,
     G, умноженный на квадрат евклидовой нормы коэффициентов.
     """
     parameters = {}
-    for name, value in (("tolerance", tolerance), ("active_tolerance", active_tolerance),
-                        ("backtrack_factor", backtrack_factor),
-                        ("armijo_coefficient", armijo_coefficient)):
+    for name, value in (
+        ("tolerance", tolerance),
+        ("active_tolerance", active_tolerance),
+        ("backtrack_factor", backtrack_factor),
+        ("armijo_coefficient", armijo_coefficient),
+    ):
         parameters[name] = real_scalar(value, name=name)
-        if parameters[name] < 0 or (name in ("tolerance", "backtrack_factor", "armijo_coefficient")
-                                    and parameters[name] == 0):
-            raise ValueError(f"{name} must be {'positive' if name == 'tolerance' else 'nonnegative'}")
-    tolerance, active_tolerance = (
-        parameters[name] for name in ("tolerance", "active_tolerance"))
+        if parameters[name] < 0 or (
+            name in ("tolerance", "backtrack_factor", "armijo_coefficient")
+            and parameters[name] == 0
+        ):
+            raise ValueError(
+                f"{name} must be {'positive' if name == 'tolerance' else 'nonnegative'}"
+            )
+    tolerance, active_tolerance = (parameters[name] for name in ("tolerance", "active_tolerance"))
     backtrack_factor, armijo_coefficient = (
-        parameters[name] for name in ("backtrack_factor", "armijo_coefficient"))
+        parameters[name] for name in ("backtrack_factor", "armijo_coefficient")
+    )
     if backtrack_factor >= 1 or armijo_coefficient >= 1:
-        raise ValueError("backtrack_factor and armijo_coefficient must lie strictly between zero and one")
-    for name, value, minimum in (("max_iterations", max_iterations, 0),
-                                ("nnls_max_iterations", nnls_max_iterations, 1),
-                                ("max_backtracks", max_backtracks, 1)):
-        if (isinstance(value, (bool, np.bool_))
-                or not isinstance(value, (int, np.integer)) or value < minimum):
+        raise ValueError(
+            "backtrack_factor and armijo_coefficient must lie strictly between zero and one"
+        )
+    for name, value, minimum in (
+        ("max_iterations", max_iterations, 0),
+        ("nnls_max_iterations", nnls_max_iterations, 1),
+        ("max_backtracks", max_backtracks, 1),
+    ):
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or value < minimum
+        ):
             raise ValueError(f"{name} must be an integer >= {minimum}")
     alpha = real_scalar(alpha, name="alpha")
     if alpha < 0:
@@ -217,47 +245,51 @@ def fit(prediction, observations, metric, gram, alpha, jacobian, offset,
     if initial_point is not None:
         point = real_array(initial_point, name="initial_point", copy=True)
         if point.shape != (size,) or np.any(point < 0):
-            raise ValueError("initial_point must be a nonnegative coefficient vector of shape (n,)")
+            raise ValueError(
+                "initial_point must be a nonnegative coefficient vector of shape (n,)"
+            )
     white = metric.whiten_matrix(jacobian)
-    hessian = white.T @ white + alpha*gram
+    hessian = white.T @ white + alpha * gram
     root = cholesky(hessian, lower=False)
     if initial_point is None:
-        target = white.T @ metric.whiten(observations-offset)
+        target = white.T @ metric.whiten(observations - offset)
         initial_rhs = solve_triangular(root.T, target, lower=True)
         point = nnls(root, initial_rhs, maxiter=nnls_max_iterations)[0]
     status = "iteration_limit"
-    for iteration in range(max_iterations+1):
+    for iteration in range(max_iterations + 1):
         predicted = prediction.predict(point)
-        residual = predicted-observations
+        residual = predicted - observations
         precision = metric.apply_precision(residual)
-        data = .5*float(residual @ precision)
-        penalty = .5*alpha*float(point @ gram @ point)
+        data = 0.5 * float(residual @ precision)
+        penalty = 0.5 * alpha * float(point @ gram @ point)
         gd = prediction.vjp(point, precision)
-        gp = alpha*(gram @ point)
-        gradient = gd+gp
+        gp = alpha * (gram @ point)
+        gradient = gd + gp
         projected = np.where(point <= active_tolerance, np.minimum(gradient, 0), gradient)
-        scale = max(1., np.max(np.abs(gd)), np.max(np.abs(gp)))
-        stationarity = float(np.max(np.abs(projected))/scale)
+        scale = max(1.0, np.max(np.abs(gd)), np.max(np.abs(gp)))
+        stationarity = float(np.max(np.abs(projected)) / scale)
         multipliers = np.where(point <= active_tolerance, np.maximum(gradient, 0), 0)
-        complementarity = float(np.max(np.abs(point*multipliers))/max(1., data+penalty))
+        complementarity = float(np.max(np.abs(point * multipliers)) / max(1.0, data + penalty))
         if max(stationarity, complementarity) <= tolerance:
             status = "accepted"
             break
         if iteration == max_iterations:
             break
-        rhs = solve_triangular(root.T, hessian @ point-gradient, lower=True)
+        rhs = solve_triangular(root.T, hessian @ point - gradient, lower=True)
         destination = nnls(root, rhs, maxiter=nnls_max_iterations)[0]
-        direction = destination-point
+        direction = destination - point
         slope = float(gradient @ direction)
         if slope >= 0:
             status = "non_descent"
             break
         for backtrack in range(max_backtracks):
             fraction = backtrack_factor**backtrack
-            trial = point+fraction*direction
-            r = prediction.predict(trial)-observations
-            objective = .5*float(r @ metric.apply_precision(r))+ .5*alpha*float(trial @ gram @ trial)
-            if objective <= data+penalty+armijo_coefficient*fraction*slope:
+            trial = point + fraction * direction
+            r = prediction.predict(trial) - observations
+            objective = 0.5 * float(r @ metric.apply_precision(r)) + 0.5 * alpha * float(
+                trial @ gram @ trial
+            )
+            if objective <= data + penalty + armijo_coefficient * fraction * slope:
                 point = trial
                 break
         else:
@@ -265,21 +297,26 @@ def fit(prediction, observations, metric, gram, alpha, jacobian, offset,
             break
     # После отклонённого поиска шага в сохранённом состоянии может оставаться пробная точка.
     predicted = prediction.predict(point)
-    residual = predicted-observations
+    residual = predicted - observations
     penalty_squared = float(point @ gram @ point)
     if penalty_squared < 0:
-        roundoff_bound = gram_tolerance*float(point @ point)
+        roundoff_bound = gram_tolerance * float(point @ point)
         if penalty_squared < -roundoff_bound:
             raise ValueError("Penalty quadratic form is negative beyond the Gram tolerance")
-        penalty_squared = 0.
-    return dict(alpha=float(alpha), status=status,
-        initialization='affine_nnls' if initial_point is None else 'explicit_point',
+        penalty_squared = 0.0
+    return dict(
+        alpha=float(alpha),
+        status=status,
+        initialization="affine_nnls" if initial_point is None else "explicit_point",
         accepted=bool(status == "accepted"),
-        coefficients=point.copy(), prediction=predicted.copy(),
+        coefficients=point.copy(),
+        prediction=predicted.copy(),
         residual_norm=float(np.linalg.norm(metric.whiten(residual))),
         penalty_norm=float(np.sqrt(penalty_squared)),
-        stationarity=stationarity, complementarity=complementarity,
-        iterations=iteration)
+        stationarity=stationarity,
+        complementarity=complementarity,
+        iterations=iteration,
+    )
 
 
 def lcurve_corner(path):
@@ -306,11 +343,14 @@ def lcurve_corner(path):
     Порог учитывает округление логарифмов норм и соседние шаги
     логарифмической сетки `alpha`.
     """
-    if len(path) < 5 or any(not isinstance(row.get("accepted"), (bool, np.bool_))
-                            or not row["accepted"] for row in path):
+    if len(path) < 5 or any(
+        not isinstance(row.get("accepted"), (bool, np.bool_)) or not row["accepted"]
+        for row in path
+    ):
         return None
-    values = np.array([[r["alpha"], r["residual_norm"], r["penalty_norm"]]
-                       for r in path], dtype=float)
+    values = np.array(
+        [[r["alpha"], r["residual_norm"], r["penalty_norm"]] for r in path], dtype=float
+    )
     if not np.isfinite(values).all() or np.any(values <= 0):
         return None
     t, x, y = np.log(values).T
@@ -321,24 +361,29 @@ def lcurve_corner(path):
     def derivative(z):
         # Разности исключают вычитание больших абсолютных логарифмов на неравномерной сетке alpha;
         # постоянный участок даёт точно нулевой наклон.
-        slopes = np.diff(z)/spacing
+        slopes = np.diff(z) / spacing
         result = np.empty_like(z)
         result[0], result[-1] = slopes[0], slopes[-1]
-        result[1:-1] = (spacing[1:]*slopes[:-1]+spacing[:-1]*slopes[1:])/(spacing[:-1]+spacing[1:])
+        result[1:-1] = (spacing[1:] * slopes[:-1] + spacing[:-1] * slopes[1:]) / (
+            spacing[:-1] + spacing[1:]
+        )
         return result
 
     dx, dy = derivative(x), derivative(y)
     # Положительная кривизна соответствует повороту против часовой стрелки
     # в координатах (логарифм нормы невязки, логарифм нормы штрафа).
-    speed = (dx*dx+dy*dy)**1.5
+    speed = (dx * dx + dy * dy) ** 1.5
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        curvature = (dx*derivative(dy)-dy*derivative(dx))/speed
-    candidates = np.arange(2, len(path)-2)
+        curvature = (dx * derivative(dy) - dy * derivative(dx)) / speed
+    candidates = np.arange(2, len(path) - 2)
     # Порог учитывает округление логарифмов и его усиление
     # на малых шагах сетки.
     local_spacing = np.minimum(np.r_[spacing[0], spacing], np.r_[spacing, spacing[-1]])
-    resolution = 32*np.finfo(float).eps*np.maximum(1., np.maximum(abs(x), abs(y)))/local_spacing
+    resolution = (
+        32 * np.finfo(float).eps * np.maximum(1.0, np.maximum(abs(x), abs(y))) / local_spacing
+    )
     resolved = np.hypot(dx, dy) > resolution
-    candidates = candidates[np.isfinite(curvature[candidates]) &
-                            (curvature[candidates] > 0) & resolved[candidates]]
+    candidates = candidates[
+        np.isfinite(curvature[candidates]) & (curvature[candidates] > 0) & resolved[candidates]
+    ]
     return int(candidates[np.argmax(curvature[candidates])]) if candidates.size else None

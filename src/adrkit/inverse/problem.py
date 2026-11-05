@@ -1,40 +1,15 @@
 """Обратная задача из прогноза, невязки, штрафа и границ."""
-from adrkit.contracts import MapCapabilities, ScalarCapabilities, require_capability
+
+from adrkit.contracts import (
+    require_capability,
+    validate_map_capabilities,
+    validate_scalar_capabilities,
+)
 from adrkit.spaces import ArraySpace
 
 from .constraints import box_bounds
 from .objectives import compose_maps, evaluate_score, make_objective
 from .optimizers import solve_lbfgsb
-
-
-def _check_operation(component, method, name):
-    """Проверить наличие вызываемой операции компонента."""
-    if not callable(getattr(component, method, None)):
-        raise TypeError(f"{name} must provide callable {method}()")
-
-
-def _check_map(forward):
-    if not isinstance(forward, MapCapabilities):
-        raise TypeError("forward must declare MapCapabilities")
-    if not isinstance(forward.domain, ArraySpace) or not isinstance(forward.codomain, ArraySpace):
-        raise TypeError("forward domain and codomain must be ArraySpace records")
-    _check_operation(forward.predict, "predict", "forward prediction")
-    for method in ("jvp", "vjp"):
-        operation = getattr(forward, method)
-        if operation is not None:
-            _check_operation(operation, method, f"forward {method.upper()}")
-
-
-def _check_scalar(component, name):
-    if not isinstance(component, ScalarCapabilities):
-        raise TypeError(f"{name} must declare ScalarCapabilities; use .capabilities() for built-ins")
-    if not isinstance(component.domain, ArraySpace):
-        raise TypeError(f"{name} domain must be an ArraySpace record")
-    _check_operation(component.value, "value", f"{name} value")
-    for method in ("cotangent", "prox", "value_and_cotangent"):
-        operation = getattr(component, method)
-        if operation is not None:
-            _check_operation(operation, method, f"{name} {method}")
 
 
 def _check_selection(selection):
@@ -44,7 +19,8 @@ def _check_selection(selection):
         if not isinstance(getattr(selection, name, None), ArraySpace):
             raise TypeError(f"selection {name} must be an ArraySpace record")
     for method in ("take", "scatter"):
-        _check_operation(selection, method, "selection")
+        if not callable(getattr(selection, method, None)):
+            raise TypeError(f"selection must provide callable {method}()")
 
 
 class InverseProblem:
@@ -70,10 +46,10 @@ class InverseProblem:
     """
 
     def __init__(self, forward, loss, *, penalty=None, selection=None, bounds=None):
-        _check_map(forward)
-        _check_scalar(loss, "loss")
+        validate_map_capabilities(forward, name="forward")
+        validate_scalar_capabilities(loss, name="loss")
         if penalty is not None:
-            _check_scalar(penalty, "penalty")
+            validate_scalar_capabilities(penalty, name="penalty")
         _check_selection(selection)
         objective = make_objective(forward, selection, loss, penalty)
         checked_bounds = tuple(box_bounds(bounds, forward.domain.size))
@@ -106,9 +82,10 @@ class InverseProblem:
             Задача с составным прямым отображением.
         """
         for stage in stages:
-            _check_map(stage)
-        return cls(compose_maps(*stages), loss, penalty=penalty,
-                   selection=selection, bounds=bounds)
+            validate_map_capabilities(stage, name="forward")
+        return cls(
+            compose_maps(*stages), loss, penalty=penalty, selection=selection, bounds=bounds
+        )
 
     @property
     def parameter_space(self):
@@ -145,8 +122,9 @@ class InverseProblem:
             Прогноз формы forward.codomain.shape до выбора строк.
         """
         x = self.parameter_space.array(parameters, name="parameters", copy=True)
-        return self.forward.codomain.array(self.forward.predict.predict(x),
-                                            name="prediction", copy=True)
+        return self.forward.codomain.array(
+            self.forward.predict.predict(x), name="prediction", copy=True
+        )
 
     def value(self, parameters):
         """Вычислить функционал со штрафом.
@@ -167,11 +145,16 @@ class InverseProblem:
 
     def _require_cotangent(self):
         require_capability(self._forward.vjp, operation="forward VJP", consumer="InverseProblem")
-        require_capability(self._loss.cotangent, operation="loss cotangent", consumer="InverseProblem")
+        require_capability(
+            self._loss.cotangent, operation="loss cotangent", consumer="InverseProblem"
+        )
         if self._penalty is not None:
-            require_capability(self._penalty.cotangent, operation="penalty cotangent", consumer="InverseProblem")
-        return require_capability(self.objective.cotangent, operation="smooth cotangent",
-                                  consumer="InverseProblem")
+            require_capability(
+                self._penalty.cotangent, operation="penalty cotangent", consumer="InverseProblem"
+            )
+        return require_capability(
+            self.objective.cotangent, operation="smooth cotangent", consumer="InverseProblem"
+        )
 
     def cotangent(self, parameters):
         """Вычислить координатную производную функционала.

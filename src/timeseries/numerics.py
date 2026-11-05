@@ -1,4 +1,5 @@
 """Численные методы заполнения одномерных рядов с пропусками NaN."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -8,7 +9,6 @@ import numpy as np
 import pandas as pd
 from scipy import optimize
 from scipy.interpolate import PchipInterpolator
-
 
 
 def fill_linear(y: np.ndarray) -> tuple[np.ndarray, None]:
@@ -56,7 +56,6 @@ def fill_pchip(y: np.ndarray) -> tuple[np.ndarray, None]:
     out = y.copy()
     out[~obs] = f(x[~obs])
     return out, None
-
 
 
 @dataclass
@@ -129,6 +128,7 @@ class KalmanDLM:
     отсчёт; даже прямой проход инициализируется ретроспективно.
     Переход применяется перед каждым обновлением, включая первый шаг.
     """
+
     period: int
     harmonics: int = 3
     theta: np.ndarray | None = None
@@ -137,8 +137,12 @@ class KalmanDLM:
     T: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self):
-        if (isinstance(self.initial_variance, bool) or not isinstance(self.initial_variance, Real)
-                or not np.isfinite(self.initial_variance) or self.initial_variance <= 0):
+        if (
+            isinstance(self.initial_variance, bool)
+            or not isinstance(self.initial_variance, Real)
+            or not np.isfinite(self.initial_variance)
+            or self.initial_variance <= 0
+        ):
             raise ValueError("initial_variance must be a finite positive real number")
 
     def _build(self, theta):
@@ -156,7 +160,7 @@ class KalmanDLM:
         for j in range(K):
             w = 2 * np.pi * (j + 1) / self.period
             i = 1 + 2 * j
-            T[i:i + 2, i:i + 2] = [[np.cos(w), np.sin(w)], [-np.sin(w), np.cos(w)]]
+            T[i : i + 2, i : i + 2] = [[np.cos(w), np.sin(w)], [-np.sin(w), np.cos(w)]]
             Z[i] = 1
             Q[i, i] = Q[i + 1, i + 1] = np.exp(q_seas)
         T[-1, -1] = phi
@@ -229,9 +233,21 @@ class KalmanDLM:
         """
         if x0 is None:
             v = np.nanvar(y)
-            x0 = np.array([np.log(v * 1e-4), np.log(v * 1e-5), np.log(v * 0.3), np.arctanh(0.6), np.log(v * 0.2)])
-        res = optimize.minimize(lambda th: -self._filter(y, th, store=False), x0, method="L-BFGS-B",
-                                options={"maxiter": maxiter})
+            x0 = np.array(
+                [
+                    np.log(v * 1e-4),
+                    np.log(v * 1e-5),
+                    np.log(v * 0.3),
+                    np.arctanh(0.6),
+                    np.log(v * 0.2),
+                ]
+            )
+        res = optimize.minimize(
+            lambda th: -self._filter(y, th, store=False),
+            x0,
+            method="L-BFGS-B",
+            options={"maxiter": maxiter},
+        )
         error = f"Kalman fit did not return a usable solution (status {res.status}): {res.message}"
         if not res.success:
             raise RuntimeError(error)
@@ -240,8 +256,14 @@ class KalmanDLM:
             fun = np.asarray(res.fun)
         except (TypeError, ValueError) as exc:
             raise RuntimeError(error) from exc
-        if (theta.shape != (5,) or theta.dtype.kind not in "fiu" or not np.isfinite(theta).all()
-                or fun.shape != () or fun.dtype.kind not in "fiu" or not np.isfinite(fun)):
+        if (
+            theta.shape != (5,)
+            or theta.dtype.kind not in "fiu"
+            or not np.isfinite(theta).all()
+            or fun.shape != ()
+            or fun.dtype.kind not in "fiu"
+            or not np.isfinite(fun)
+        ):
             raise RuntimeError(error)
         self.theta = theta.copy()
         return self
@@ -343,13 +365,12 @@ class KalmanDLM:
             raise RuntimeError("fit() first")
         yy = y[::-1] if mode == "head" else y
         self._filter(yy, self.theta)
-        yhat = self._at @ self.Z          # Прогноз до обновления по текущему наблюдению.
+        yhat = self._at @ self.Z  # Прогноз до обновления по текущему наблюдению.
         R = np.exp(self.theta[-1])
         sd = np.sqrt(np.einsum("i,kij,j->k", self.Z, self._Pt, self.Z) + R)
         if mode == "head":
             yhat, sd = yhat[::-1], sd[::-1]
         return yhat, sd
-
 
 
 @dataclass
@@ -408,6 +429,7 @@ class SoftImpute:
     Число 1 в пороге относится к численному масштабу критерия без
     нормирования ряда. Смена численной единицы может изменить остановку.
     """
+
     cycle_length: int
     lam: float = 2.0
     rank_max: int = 8
@@ -467,7 +489,6 @@ class SoftImpute:
         return out, None
 
 
-
 @dataclass
 class HGBFiller:
     """Заполнять ряд HistGradientBoostingRegressor по сдвигам и другим столбцам.
@@ -502,6 +523,7 @@ class HGBFiller:
     -----
     HGB обозначает ансамблевую модель ``HistGradientBoostingRegressor``.
     """
+
     lags: list[int]
     leads: list[int]
     covs: list[str]
@@ -548,6 +570,7 @@ class HGBFiller:
         обеспечивается ``MaskedInputs`` в адаптере ``HGBImputer``.
         """
         from sklearn.ensemble import HistGradientBoostingRegressor
+
         F = self._features(y, X, use_leads)
         ok = ~np.isnan(y)
         self.model_ = HistGradientBoostingRegressor(**self.params).fit(F[ok], y[ok])

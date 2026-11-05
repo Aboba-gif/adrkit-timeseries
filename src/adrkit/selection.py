@@ -1,4 +1,5 @@
 """Упорядоченный выбор координат и дополнение ковектора нулями."""
+
 import numpy as np
 
 from adrkit.spaces import ArraySpace
@@ -19,17 +20,27 @@ class Selection:
         if not isinstance(full_layout, ArraySpace) or len(full_layout.shape) != 1:
             raise ValueError("Selection requires a one-dimensional ArraySpace layout")
         indices = np.asarray(indices)
-        if (indices.ndim != 1 or indices.dtype.kind not in "iu" or not len(indices)
-                or len(np.unique(indices)) != len(indices)
-                or np.any(indices < 0) or np.any(indices >= full_layout.size)):
+        if (
+            indices.ndim != 1
+            or indices.dtype.kind not in "iu"
+            or not len(indices)
+            or len(np.unique(indices)) != len(indices)
+            or np.any(indices < 0)
+            or np.any(indices >= full_layout.size)
+        ):
             raise ValueError("Selection indices must be nonempty, unique, integer and in range")
         self._indices = indices.astype(np.intp, copy=True)
         self._full_layout = full_layout
         self._selected_layout = ArraySpace(
-            (len(indices),), axes=full_layout.axes,
+            (len(indices),),
+            axes=full_layout.axes,
             coordinates=(tuple(full_layout.coordinates[0][i] for i in indices),),
-            units=full_layout.units, scale=full_layout.scale, pairing=full_layout.pairing,
-            dtype=full_layout.dtype, binding=full_layout.binding)
+            units=full_layout.units,
+            scale=full_layout.scale,
+            pairing=full_layout.pairing,
+            dtype=full_layout.dtype,
+            binding=full_layout.binding,
+        )
 
     @property
     def indices(self):

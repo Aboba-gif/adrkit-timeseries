@@ -1,4 +1,5 @@
 """Панели временных рядов, маски и результаты заполнения."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -124,7 +125,9 @@ def clock_timestamp(value, clock):
                 raise DataContractError("offset timestamp cannot enter a naive clock")
         else:
             if stamp.tz is None:
-                stamp = stamp.tz_localize(clock["timezone"], ambiguous="raise", nonexistent="raise")
+                stamp = stamp.tz_localize(
+                    clock["timezone"], ambiguous="raise", nonexistent="raise"
+                )
             else:
                 stamp = stamp.tz_convert(clock["timezone"])
     except DataContractError:
@@ -137,6 +140,7 @@ def clock_timestamp(value, clock):
 
 class _JSONSpec:
     """Общее преобразование неизменяемой JSON-записи в словарь."""
+
     def to_dict(self):
         """Вернуть независимый словарь полей спецификации."""
         return json.loads(self._json)
@@ -154,7 +158,8 @@ class InputSourceSpec(_JSONSpec):
     Parameters
     ----------
     value : dict
-        Описание с полями ``id``, ``path``, ``sha256``, ``format``, ``columns``, ``time``, ``site``,
+        Описание с полями ``id``, ``path``, ``sha256``, ``format``,
+        ``columns``, ``time``, ``site``,
         ``units``, ``missing_values`` и ``route``. ``columns.time`` содержит один
         заголовок времени либо пару даты и времени; ``columns.values``
         связывает каналы с заголовками CSV. ``site`` задаёт один пост или
@@ -171,11 +176,22 @@ class InputSourceSpec(_JSONSpec):
     Относительный ``path`` разрешается от абсолютного ``anchor`` в ``build_data``.
     Создание записи не читает файл; ``to_dict`` возвращает независимую копию.
     """
+
     _json: str
 
     def __init__(self, value):
-        fields = {"id", "path", "sha256", "format", "columns", "time", "site",
-                  "units", "missing_values", "route"}
+        fields = {
+            "id",
+            "path",
+            "sha256",
+            "format",
+            "columns",
+            "time",
+            "site",
+            "units",
+            "missing_values",
+            "route",
+        }
         closed(value, fields, where="source")
         for key in ("id", "path"):
             text(value[key], "source." + key)
@@ -211,18 +227,35 @@ class InputSourceSpec(_JSONSpec):
         for unit in units.values():
             text(unit, "unit (use explicit 'unknown' when unknown)")
         missing = value["missing_values"]
-        if (type(missing) is not list or any(type(v) is not str for v in missing)
-                or len(missing) != len(set(missing))):
+        if (
+            type(missing) is not list
+            or any(type(v) is not str for v in missing)
+            or len(missing) != len(set(missing))
+        ):
             raise DataContractError("missing_values requires unique literal string tokens")
         route = choice(value["route"], {"strict", "quarantine"}, "route")
-        time = closed(value["time"], {"parser", "format", "timezone", "dst_policy", "calendar",
-                                        "clock", "frequency", "origin"}, where="time")
+        time = closed(
+            value["time"],
+            {
+                "parser",
+                "format",
+                "timezone",
+                "dst_policy",
+                "calendar",
+                "clock",
+                "frequency",
+                "origin",
+            },
+            where="time",
+        )
         choice(time["parser"], {"format", "pandas_infer"}, "time.parser")
         choice(time["dst_policy"], {"fail", "shift", "drop"}, "time.dst_policy")
         if time["parser"] == "format":
             text(time["format"], "time.format")
             if "%z" in time["format"] or "%Z" in time["format"]:
-                raise DataContractError("source timestamps must be wall time; timezone is explicit")
+                raise DataContractError(
+                    "source timestamps must be wall time; timezone is explicit"
+                )
         elif time["format"] is not None or route != "quarantine":
             raise DataContractError("pandas_infer requires quarantine route and format=null")
         if time["clock"] == "naive" and time["dst_policy"] != "fail":
@@ -253,23 +286,46 @@ class PanelSpec(_JSONSpec):
     ``localized`` — явный часовой пояс. Единицы служат метками данных;
     перевод значений между ними не выполняется.
     """
+
     _json: str
 
     def __init__(self, value):
-        closed(value, {"start", "stop", "frequency", "origin", "clock", "timezone",
-                       "calendar", "sites", "channels", "units", "duplicates"},
-               optional={"duplicates"}, where="panel")
+        closed(
+            value,
+            {
+                "start",
+                "stop",
+                "frequency",
+                "origin",
+                "clock",
+                "timezone",
+                "calendar",
+                "sites",
+                "channels",
+                "units",
+                "duplicates",
+            },
+            optional={"duplicates"},
+            where="panel",
+        )
         sites = strings(value["sites"], "panel.sites")
         channels = strings(value["channels"], "panel.channels")
         units = closed(value["units"], set(channels), where="panel.units")
         for unit in units.values():
             text(unit, "panel.unit")
-        duplicate = choice(value.get("duplicates", "reject"), {"reject", "first_with_quarantine"}, "duplicates")
+        duplicate = choice(
+            value.get("duplicates", "reject"), {"reject", "first_with_quarantine"}, "duplicates"
+        )
         step, origin = _clock(value, "panel")
         start, stop = (clock_timestamp(value[k], value) for k in ("start", "stop"))
         if stop <= start or (start - origin) % step or (stop - origin) % step:
             raise DataContractError("panel range must be nonempty, ordered and grid aligned")
-        normalized = {**value, "sites": list(sites), "channels": list(channels), "duplicates": duplicate}
+        normalized = {
+            **value,
+            "sites": list(sites),
+            "channels": list(channels),
+            "duplicates": duplicate,
+        }
         object.__setattr__(self, "_json", json.dumps(normalized, sort_keys=True, allow_nan=False))
 
 
@@ -290,8 +346,12 @@ def source_resource_pointers(specs, *, prefix):
         Пары JSON Pointer к ``path`` и ``sha256`` для каждого источника в
         исходном порядке.
     """
-    if (type(prefix) is not str or not prefix.startswith("/")
-            or re.search(r"~(?![01])", prefix) or "*" in prefix):
+    if (
+        type(prefix) is not str
+        or not prefix.startswith("/")
+        or re.search(r"~(?![01])", prefix)
+        or "*" in prefix
+    ):
         raise DataContractError("prefix must be a non-root JSON Pointer without wildcards")
     if type(specs) not in (list, tuple) or not specs:
         raise DataContractError("sources must be nonempty and ordered")
@@ -353,6 +413,7 @@ class RowLocator:
     raw_time, raw_value : str
         Исходный текст времени и значения до числового разбора.
     """
+
     source_id: str
     sha256: str
     row_number: int
@@ -373,6 +434,7 @@ class QuarantinedValue:
     reason : str
         Причина исключения, например ``off_grid`` или ``duplicate_timestamp``.
     """
+
     row: RowLocator
     reason: str
 
@@ -389,6 +451,7 @@ class AcceptedValue:
     index : tuple of int, length 3
         Индексы времени, поста и канала в порядке осей панели.
     """
+
     row: RowLocator
     index: tuple[int, int, int]
 
@@ -406,6 +469,7 @@ class SourceProvenance:
     byte_count : int
         Число прочитанных байтов.
     """
+
     spec: InputSourceSpec
     resolved_path: str
     byte_count: int
@@ -417,9 +481,14 @@ def _layout(record):
         raise DataContractError("layout requires PanelSpec")
     spec = record.spec.to_dict()
     times = tuple(record.times)
-    expected = tuple(pd.date_range(clock_timestamp(spec["start"], spec),
-                                   clock_timestamp(spec["stop"], spec),
-                                   freq=spec["frequency"], inclusive="left"))
+    expected = tuple(
+        pd.date_range(
+            clock_timestamp(spec["start"], spec),
+            clock_timestamp(spec["stop"], spec),
+            freq=spec["frequency"],
+            inclusive="left",
+        )
+    )
     if times != expected:
         raise DataContractError("times differ from explicit panel grid")
     object.__setattr__(record, "times", times)
@@ -456,6 +525,7 @@ class NetworkPanel:
     элементы без исходного наблюдения. Отсутствующая строка и принятый
     CSV-пропуск остаются разными случаями.
     """
+
     spec: PanelSpec
     times: tuple
     values: np.ndarray
@@ -463,18 +533,28 @@ class NetworkPanel:
     original_observed: np.ndarray
     raw_missing: np.ndarray
     # Порядок загрузки: источник, CSV-запись, канал; обозначения пропуска тоже учитываются.
-    
+
     row_origins: tuple[AcceptedValue, ...] = ()
 
     def __post_init__(self):
         shape = _layout(self)
         for name in ("values", "row_present", "original_observed", "raw_missing"):
-            object.__setattr__(self, name, snapshot(getattr(self, name), shape=shape,
-                              dtype=float if name == "values" else bool, name=name))
-        if (np.any(np.isinf(self.values)) or
-                not np.array_equal(np.isfinite(self.values), self.original_observed) or
-                np.any(self.original_observed & ~self.row_present) or
-                not np.array_equal(self.raw_missing, self.row_present & ~self.original_observed)):
+            object.__setattr__(
+                self,
+                name,
+                snapshot(
+                    getattr(self, name),
+                    shape=shape,
+                    dtype=float if name == "values" else bool,
+                    name=name,
+                ),
+            )
+        if (
+            np.any(np.isinf(self.values))
+            or not np.array_equal(np.isfinite(self.values), self.original_observed)
+            or np.any(self.original_observed & ~self.row_present)
+            or not np.array_equal(self.raw_missing, self.row_present & ~self.original_observed)
+        ):
             raise DataContractError("inconsistent original/presence/missing masks")
         origins = tuple(self.row_origins)
         if any(not isinstance(row, AcceptedValue) for row in origins):
@@ -495,6 +575,7 @@ class LoadedSources:
     provenance : tuple of SourceProvenance
         Описания реально прочитанных файлов.
     """
+
     panel: NetworkPanel
     quarantine: tuple[QuarantinedValue, ...]
     provenance: tuple[SourceProvenance, ...]
@@ -534,6 +615,7 @@ class MaskedInputs:
     Массивы копируются без права записи. Функции признаков, ``fit`` и ``predict``
     получают эту запись, без значений ``EvaluationTruth``.
     """
+
     spec: PanelSpec
     times: tuple
     values: np.ndarray
@@ -549,17 +631,35 @@ class MaskedInputs:
         shape = _layout(self)
         for key in ("protocol_id", "population_id"):
             text(getattr(self, key), key)
-        choice(self.population_kind, {"train", "calibration", "selection", "test", "export"}, "population_kind")
+        choice(
+            self.population_kind,
+            {"train", "calibration", "selection", "test", "export"},
+            "population_kind",
+        )
         for key in ("values", "row_present", "original_observed", "artificial_mask", "mit_mask"):
-            object.__setattr__(self, key, snapshot(getattr(self, key), shape=shape,
-                              dtype=float if key == "values" else bool, name=key))
+            object.__setattr__(
+                self,
+                key,
+                snapshot(
+                    getattr(self, key),
+                    shape=shape,
+                    dtype=float if key == "values" else bool,
+                    name=key,
+                ),
+            )
         hidden = self.artificial_mask | self.mit_mask
         visible = self.original_observed & ~hidden
         if self.mit_mask.any() and self.population_kind != "train":
-            raise DataContractError("MIT supervision is restricted to original training observations")
-        if (np.any(self.artificial_mask & self.mit_mask) or np.any(hidden & ~self.original_observed)
-                or np.any(self.original_observed & ~self.row_present) or np.any(np.isinf(self.values))
-                or not np.array_equal(visible, np.isfinite(self.values))):
+            raise DataContractError(
+                "MIT supervision is restricted to original training observations"
+            )
+        if (
+            np.any(self.artificial_mask & self.mit_mask)
+            or np.any(hidden & ~self.original_observed)
+            or np.any(self.original_observed & ~self.row_present)
+            or np.any(np.isinf(self.values))
+            or not np.array_equal(visible, np.isfinite(self.values))
+        ):
             raise DataContractError("inconsistent concealment/observed/presence masks")
 
     @property
@@ -593,6 +693,7 @@ class EvaluationTruth:
     Массивы копируются без права записи. Эта запись передаётся оценке
     метрик отдельно от входов обучения и прогноза.
     """
+
     spec: PanelSpec
     times: tuple
     values: np.ndarray
@@ -605,11 +706,17 @@ class EvaluationTruth:
         shape = _layout(self)
         for key in ("protocol_id", "population_id"):
             text(getattr(self, key), key)
-        choice(self.population_kind, {"train", "calibration", "selection", "test", "export"}, "population_kind")
+        choice(
+            self.population_kind,
+            {"train", "calibration", "selection", "test", "export"},
+            "population_kind",
+        )
         mask = snapshot(self.target_mask, dtype=bool, shape=shape, name="target_mask")
         values = snapshot(self.values, dtype=float, shape=shape, name="truth")
         if np.any(np.isfinite(values) & ~mask) or np.any(np.isinf(values)):
-            raise DataContractError("truth must contain selected targets or NaN; no values outside target_mask")
+            raise DataContractError(
+                "truth must contain selected targets or NaN; no values outside target_mask"
+            )
         object.__setattr__(self, "values", values)
         object.__setattr__(self, "target_mask", mask)
 
@@ -644,11 +751,27 @@ def conceal(panel, *, artificial_mask, mit_mask, protocol_id, population_id, pop
     artificial = snapshot(artificial_mask, dtype=bool, shape=shape, name="artificial_mask")
     mit = snapshot(mit_mask, dtype=bool, shape=shape, name="mit_mask")
     hidden = artificial | mit
-    inputs = MaskedInputs(panel.spec, panel.times, np.where(hidden, np.nan, panel.values),
-                          panel.row_present, panel.original_observed, artificial, mit,
-                          protocol_id, population_id, population_kind)
-    truth = EvaluationTruth(panel.spec, panel.times, np.where(hidden, panel.values, np.nan), hidden,
-                            protocol_id, population_id, population_kind)
+    inputs = MaskedInputs(
+        panel.spec,
+        panel.times,
+        np.where(hidden, np.nan, panel.values),
+        panel.row_present,
+        panel.original_observed,
+        artificial,
+        mit,
+        protocol_id,
+        population_id,
+        population_kind,
+    )
+    truth = EvaluationTruth(
+        panel.spec,
+        panel.times,
+        np.where(hidden, panel.values, np.nan),
+        hidden,
+        protocol_id,
+        population_id,
+        population_kind,
+    )
     return inputs, truth
 
 
@@ -684,6 +807,7 @@ class ImputationResult:
     задаёт метод, возвращающий результат; автоматической калибровки нет.
     Совпадение осей, времени, протокола и выборки проверяет ``require_binding``.
     """
+
     prediction: np.ndarray
     availability: np.ndarray
     status: np.ndarray
@@ -698,13 +822,20 @@ class ImputationResult:
         shape = _layout(self)
         for key in ("protocol_id", "population_id"):
             text(getattr(self, key), key)
-        choice(self.population_kind, {"train", "calibration", "selection", "test", "export"}, "population_kind")
+        choice(
+            self.population_kind,
+            {"train", "calibration", "selection", "test", "export"},
+            "population_kind",
+        )
         pred = snapshot(self.prediction, dtype=float, shape=shape, name="prediction")
         available = snapshot(self.availability, dtype=bool, shape=shape, name="availability")
         status = snapshot(self.status, dtype=str, shape=shape, name="status")
-        if (np.any(np.isinf(pred)) or not np.array_equal(np.isfinite(pred), available)
-                or np.any(~np.isin(status, ["observed", "imputed", "unavailable"]))
-                or not np.array_equal(status != "unavailable", available)):
+        if (
+            np.any(np.isinf(pred))
+            or not np.array_equal(np.isfinite(pred), available)
+            or np.any(~np.isin(status, ["observed", "imputed", "unavailable"]))
+            or not np.array_equal(status != "unavailable", available)
+        ):
             raise DataContractError("inconsistent prediction/availability/status")
         for key, value in (("prediction", pred), ("availability", available), ("status", status)):
             object.__setattr__(self, key, value)
@@ -728,9 +859,10 @@ class ImputationResult:
         None
             При несовпадении привязки вызывается ``DataContractError``.
         """
-        if (not isinstance(reference, (MaskedInputs, EvaluationTruth)) or
-                any(getattr(self, key) != getattr(reference, key) for key in
-                    ("spec", "times", "protocol_id", "population_id", "population_kind"))):
+        if not isinstance(reference, (MaskedInputs, EvaluationTruth)) or any(
+            getattr(self, key) != getattr(reference, key)
+            for key in ("spec", "times", "protocol_id", "population_id", "population_kind")
+        ):
             raise DataContractError("prediction panel/population binding mismatch")
 
 
@@ -769,15 +901,28 @@ def result_from_inputs(inputs, prediction, *, availability=None, status=None, un
         raise DataContractError("prediction requires MaskedInputs, never panel/truth")
     raw = np.asarray(prediction)
     if raw.shape != inputs.values.shape or raw.dtype.kind not in "buif":
-        raise DataContractError("prediction requires real numeric values with the input panel shape")
+        raise DataContractError(
+            "prediction requires real numeric values with the input panel shape"
+        )
     if availability is None:
         availability = np.isfinite(raw)
     if status is None:
-        status = np.where(inputs.visible, "observed", np.where(availability, "imputed", "unavailable"))
-    result = ImputationResult(prediction, availability, status, uncertainty,
-        spec=inputs.spec, times=inputs.times, protocol_id=inputs.protocol_id,
-        population_id=inputs.population_id, population_kind=inputs.population_kind)
-    if (not np.array_equal(result.prediction[inputs.visible], inputs.values[inputs.visible]) or
-            not np.array_equal(result.status == "observed", inputs.visible)):
+        status = np.where(
+            inputs.visible, "observed", np.where(availability, "imputed", "unavailable")
+        )
+    result = ImputationResult(
+        prediction,
+        availability,
+        status,
+        uncertainty,
+        spec=inputs.spec,
+        times=inputs.times,
+        protocol_id=inputs.protocol_id,
+        population_id=inputs.population_id,
+        population_kind=inputs.population_kind,
+    )
+    if not np.array_equal(
+        result.prediction[inputs.visible], inputs.values[inputs.visible]
+    ) or not np.array_equal(result.status == "observed", inputs.visible):
         raise DataContractError("predict must retain original visible values and status")
     return result

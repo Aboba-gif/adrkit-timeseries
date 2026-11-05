@@ -1,4 +1,5 @@
 """Сборка составной обратной задачи по JSON-конфигурации."""
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,13 +17,26 @@ from adrkit.spaces import ArraySpace
 
 from .loader import ValidationContext, compose_config, read_configs
 from .schema import (
-    _empty, _h1_parameters, _l2_parameters, _p1_parameters,
-    _quadratic_parameters, _selection_parameters, composition_schema,
+    _empty,
+    _h1_parameters,
+    _l2_parameters,
+    _p1_parameters,
+    _quadratic_parameters,
+    _selection_parameters,
+    composition_schema,
 )
 from .validation import string
 
-__all__ = ["Family", "families", "Composition", "build_source", "build_identity",
-           "build_observation", "load", "assemble"]
+__all__ = [
+    "Family",
+    "families",
+    "Composition",
+    "build_source",
+    "build_identity",
+    "build_observation",
+    "load",
+    "assemble",
+]
 
 
 @dataclass(frozen=True)
@@ -38,6 +52,7 @@ class Family:
         Строит компонент из проверенных параметров; дополнительные
         аргументы определяет роль.
     """
+
     validate: object  # Проверка семейства возвращает нормализованные параметры.
     build: object
 
@@ -59,15 +74,23 @@ def build_source(p):
         Отображение коэффициентов в точечные значения на times.
     """
     basis = P1Basis(p["knots"], time_unit=p["time_unit"])
-    domain = ArraySpace((basis.size,), axes=("coefficient",), coordinates=(p["knots"],),
-                        units=p["coefficient_unit"])
-    codomain = ArraySpace((len(p["times"]),), axes=("time",), coordinates=(p["times"],),
-                          units=p["value_unit"])
-    return basis, sampled_source_map(basis, p["times"], scale=p["scale"], domain=domain, codomain=codomain)
+    domain = ArraySpace(
+        (basis.size,),
+        axes=("coefficient",),
+        coordinates=(p["knots"],),
+        units=p["coefficient_unit"],
+    )
+    codomain = ArraySpace(
+        (len(p["times"]),), axes=("time",), coordinates=(p["times"],), units=p["value_unit"]
+    )
+    return basis, sampled_source_map(
+        basis, p["times"], scale=p["scale"], domain=domain, codomain=codomain
+    )
 
 
 class _Identity:
     """Внутренний тождественный прогноз с такими же производными."""
+
     def predict(self, x):
         return np.array(x, copy=True)
 
@@ -99,6 +122,7 @@ def build_identity(p, domain):
 
 class _SelectionMap:
     """Внутренний выбор строк и дополнение ковектора нулями."""
+
     def __init__(self, selection):
         self.selection = selection
 
@@ -150,12 +174,29 @@ def families(inputs=None):
     result = {
         "source": {"p1": Family(_p1_parameters, build_source)},
         "surrogate": {"identity": Family(_empty, build_identity)},
-        "observation": {"identity": Family(_empty, build_identity),
-                        "selection": Family(_selection_parameters, build_observation)},
+        "observation": {
+            "identity": Family(_empty, build_identity),
+            "selection": Family(_selection_parameters, build_observation),
+        },
         "regularizer": {
-            "l2": Family(_l2_parameters, lambda p, b, d: build_penalty("l2", b, p["center"], p["alpha"], tau=p["tau"], domain=d)),
-            "h1": Family(_h1_parameters, lambda p, b, d: build_penalty("h1", b, p["center"], p["alpha"], tau=p["tau"], domain=d)),
-            "quadratic": Family(_quadratic_parameters, lambda p, b, d: QuadraticPenalty(p["center"], p["gram"], p["alpha"]).capabilities(d)),
+            "l2": Family(
+                _l2_parameters,
+                lambda p, b, d: build_penalty(
+                    "l2", b, p["center"], p["alpha"], tau=p["tau"], domain=d
+                ),
+            ),
+            "h1": Family(
+                _h1_parameters,
+                lambda p, b, d: build_penalty(
+                    "h1", b, p["center"], p["alpha"], tau=p["tau"], domain=d
+                ),
+            ),
+            "quadratic": Family(
+                _quadratic_parameters,
+                lambda p, b, d: QuadraticPenalty(p["center"], p["gram"], p["alpha"]).capabilities(
+                    d
+                ),
+            ),
         },
     }
     for role, additional in (inputs or {}).items():
@@ -163,7 +204,12 @@ def families(inputs=None):
             raise ConfigError(f"unknown family role: {role}")
         for kind, family in additional.items():
             string(kind)
-            if kind in result[role] or not isinstance(family, Family) or not callable(family.validate) or not callable(family.build):
+            if (
+                kind in result[role]
+                or not isinstance(family, Family)
+                or not callable(family.validate)
+                or not callable(family.build)
+            ):
                 raise ConfigError(f"invalid/duplicate family: {role}/{kind}")
             result[role][kind] = family
     return result
@@ -189,6 +235,7 @@ class Composition:
         Нормализованные научные параметры, включая действие и
         настройки решения.
     """
+
     prediction: object
     objective: object
     coefficient_metric: object
@@ -224,9 +271,11 @@ def _assemble_composition(science, inputs):
     if science["action"] == "sensitivity":
         require_capability(prediction.jvp, operation="JVP", consumer="sensitivity")
         p = science["sensitivity"]
-        limits = SensitivityLimits(**{k: p[k] for k in ("max_columns", "max_entries", "max_jvp_calls")})
+        limits = SensitivityLimits(
+            **{k: p[k] for k in ("max_columns", "max_entries", "max_jvp_calls")}
+        )
         n, m = prediction.domain.size, prediction.codomain.size
-        if n > limits.max_columns or n > limits.max_jvp_calls or n*m > limits.max_entries:
+        if n > limits.max_columns or n > limits.max_jvp_calls or n * m > limits.max_entries:
             raise ConfigError("dense sensitivity exceeds configured limits")
     return Composition(prediction, objective, coefficient_metric, metric, initial, science)
 
@@ -254,8 +303,13 @@ def load(files, *, inputs=None, overrides=(), config_root=None, output_root=None
     """
     documents = read_configs(files, config_root=config_root)
     schema = composition_schema(families=families(inputs))
-    return compose_config(documents, schema=schema, overrides=overrides,
-                          config_root=config_root, output_root=output_root)
+    return compose_config(
+        documents,
+        schema=schema,
+        overrides=overrides,
+        config_root=config_root,
+        output_root=output_root,
+    )
 
 
 def assemble(config, *, inputs=None):
@@ -281,8 +335,7 @@ def assemble(config, *, inputs=None):
     """
     tree = config.to_dict()
     schema = composition_schema(families=families(inputs))
-    if (tree["pipeline"] != schema.pipeline
-            or tree["science_schema_version"] != schema.version):
+    if tree["pipeline"] != schema.pipeline or tree["science_schema_version"] != schema.version:
         raise ConfigError("configuration must use the ADR composition schema")
     science = schema.normalize(tree["science"], ValidationContext(partial=False))
     return _assemble_composition(science, inputs)

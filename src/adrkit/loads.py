@@ -1,4 +1,5 @@
 """Средние нагрузки P1 и фиксированная известная предыстория."""
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -43,17 +44,7 @@ def interval_hat_integrals(basis, edges):
     edges = _real_array(edges, "interval edges")
     if edges.ndim != 1 or edges.size < 2 or np.any(np.diff(edges) <= 0):
         raise ValueError("interval edges must be strictly increasing")
-    result = np.zeros((edges.size - 1, basis.size))
-    knots = basis.knots
-    for j, (start, end) in enumerate(zip(knots[:-1], knots[1:])):
-        left = np.maximum(edges[:-1], start)
-        right = np.minimum(edges[1:], end)
-        active = right > left
-        width = right[active] - left[active]
-        fraction = ((left[active] - start) + (right[active] - start)) / (2*(end-start))
-        result[active, j] += width*(1-fraction)
-        result[active, j+1] += width*fraction
-    return result
+    return basis.integrals(edges[:-1], edges[1:])
 
 
 class IntervalAverageLoad:
@@ -86,20 +77,35 @@ class IntervalAverageLoad:
     Начальный компонент нагрузки не задаёт начальную концентрацию.
     """
 
-    def __init__(self, basis, state_times, *, origin, q_reference,
-                 history_integral, history_initial, source_unit):
+    def __init__(
+        self,
+        basis,
+        state_times,
+        *,
+        origin,
+        q_reference,
+        history_integral,
+        history_initial,
+        source_unit,
+    ):
         if not isinstance(basis, P1Basis):
             raise TypeError("basis must be P1Basis")
         times = _real_array(state_times, "state times")
         scalars = _real_array([origin, q_reference, history_initial], "load parameters")
         origin, q_reference, history_initial = scalars
-        if (times.ndim != 1 or len(times) < 2 or times[0] != 0
-                or np.any(np.diff(times) <= 0) or q_reference <= 0):
+        if (
+            times.ndim != 1
+            or len(times) < 2
+            or times[0] != 0
+            or np.any(np.diff(times) <= 0)
+            or q_reference <= 0
+        ):
             raise ValueError("increasing state times starting at zero and positive Qref required")
         edges = times + origin
         knots = basis.knots
-        if (edges[0] > knots[0] or not np.isclose(edges[-1], knots[-1], rtol=0,
-                atol=32*np.finfo(float).eps*max(1., abs(knots[-1])))):
+        if edges[0] > knots[0] or not np.isclose(
+            edges[-1], knots[-1], rtol=0, atol=32 * np.finfo(float).eps * max(1.0, abs(knots[-1]))
+        ):
             raise ValueError("state clock must include history and end at the unknown horizon")
         if not callable(history_integral):
             raise TypeError("history_integral must be an explicit definite-integral callable")
@@ -111,14 +117,18 @@ class IntervalAverageLoad:
         for k, (left, right) in enumerate(zip(edges[:-1], edges[1:]), start=1):
             right = min(right, knots[0])
             if left < right:
-                integral = _real_array(history_integral(float(left), float(right)), "history integral")
+                integral = _real_array(
+                    history_integral(float(left), float(right)), "history integral"
+                )
                 if integral.shape != ():
                     raise ValueError("history integral must return a scalar")
-                offset[k] = integral.item()/dt[k-1]
-        self.domain = ArraySpace((basis.size,), axes=("coefficient",),
-                                 coordinates=(knots,), units="dimensionless")
-        self.codomain = ArraySpace((len(times),), axes=("time",),
-                                   coordinates=(times,), units=source_unit)
+                offset[k] = integral.item() / dt[k - 1]
+        self.domain = ArraySpace(
+            (basis.size,), axes=("coefficient",), coordinates=(knots,), units="dimensionless"
+        )
+        self.codomain = ArraySpace(
+            (len(times),), axes=("time",), coordinates=(times,), units=source_unit
+        )
         self._matrix, self._offset = matrix, offset
         self._matrix.flags.writeable = self._offset.flags.writeable = False
         self.q_reference = float(q_reference)
@@ -161,8 +171,9 @@ class IntervalAverageLoad:
             Средние интенсивности с известной предысторией в source_unit.
         """
         a = self.domain.array(coefficients)
-        return self.codomain.array(self._offset + self.q_reference*(self._matrix @ a),
-                                   name="load prediction", copy=True)
+        return self.codomain.array(
+            self._offset + self.q_reference * (self._matrix @ a), name="load prediction", copy=True
+        )
 
     def jvp(self, at, direction):
         """Применить производную средней нагрузки к направлению.
@@ -179,8 +190,11 @@ class IntervalAverageLoad:
             дифференцируется.
         """
         self.domain.array(at)
-        return self.codomain.array(self.q_reference*(self._matrix @ self.domain.array(direction)),
-                                   name="load JVP output", copy=True)
+        return self.codomain.array(
+            self.q_reference * (self._matrix @ self.domain.array(direction)),
+            name="load JVP output",
+            copy=True,
+        )
 
     def vjp(self, at, cotangent):
         """Перенести ковектор средней нагрузки к коэффициентам.
@@ -199,8 +213,11 @@ class IntervalAverageLoad:
             координатах.
         """
         self.domain.array(at)
-        return self.domain.array(self.q_reference*(self._matrix.T @ self.codomain.array(cotangent)),
-                                 name="load VJP output", copy=True)
+        return self.domain.array(
+            self.q_reference * (self._matrix.T @ self.codomain.array(cotangent)),
+            name="load VJP output",
+            copy=True,
+        )
 
     def capabilities(self):
         """Предоставить среднюю нагрузку и её JVP/VJP как MapCapabilities."""
@@ -227,6 +244,7 @@ class DisclosedHistory:
     -----
     Хранятся числа, а не исходная функция источника.
     """
+
     intervals: tuple
     integrals: tuple
     initial: float
@@ -245,13 +263,18 @@ class DisclosedHistory:
                 raise ValueError("History intervals require two endpoints")
             left, right = (_history_scalar(value, "history endpoint") for value in pair)
             if left >= right or right > end + 1e-12:
-                raise ValueError("History intervals must increase and contain no undisclosed future")
+                raise ValueError(
+                    "History intervals must increase and contain no undisclosed future"
+                )
             owned_intervals.append((left, right))
         if len(set(owned_intervals)) != len(owned_intervals):
             raise ValueError("Disclosed history intervals must have unique endpoint pairs")
         object.__setattr__(self, "intervals", tuple(owned_intervals))
-        object.__setattr__(self, "integrals", tuple(
-            _history_scalar(value, "history integral") for value in integrals))
+        object.__setattr__(
+            self,
+            "integrals",
+            tuple(_history_scalar(value, "history integral") for value in integrals),
+        )
         object.__setattr__(self, "initial", _history_scalar(self.initial, "history initial value"))
 
     def integral(self, left, right):
@@ -271,15 +294,26 @@ class DisclosedHistory:
 
         Notes
         -----
-        Концы сравниваются с абсолютным допуском 1e-12.
+        Точное совпадение имеет приоритет. Иначе требуется единственное
+        совпадение концов с абсолютным допуском 1e-12.
         Интегралы незарегистрированных подынтервалов не вычисляются.
         """
         left, right = (_history_scalar(value, "history endpoint") for value in (left, right))
         if right > self.end + 1e-12:
             raise ValueError("Estimator requested undisclosed future source")
+        requested = (left, right)
         for interval, value in zip(self.intervals, self.integrals):
-            if np.allclose(interval, [left,right], rtol=0, atol=1e-12):
+            if interval == requested:
                 return value
+        matches = [
+            value
+            for interval, value in zip(self.intervals, self.integrals)
+            if np.allclose(interval, requested, rtol=0, atol=1e-12)
+        ]
+        if len(matches) > 1:
+            raise ValueError("Ambiguous disclosed history interval")
+        if matches:
+            return matches[0]
         raise ValueError("Unregistered disclosed history interval")
 
 
@@ -320,14 +354,23 @@ def disclose_history(source, state_times, origin, *, end=0.0):
     times = _real_array(state_times, "history state times")
     origin = _history_scalar(origin, "history time origin")
     end = _history_scalar(end, "history end")
-    if (times.ndim != 1 or len(times) < 2 or times[0] != 0 or origin > end
-            or np.any(np.diff(times) <= 0)):
-        raise ValueError("History state times must increase from zero with origin no later than end")
-    edges = _real_array(times+origin, "history physical clock")
-    intervals = tuple((float(a), float(min(b,end))) for a,b in zip(edges[:-1],edges[1:])
-                      if a < min(b,end))
-    values = tuple(_history_scalar(source.integral(a,b), "history integral") for a,b in intervals)
-    return DisclosedHistory(intervals, values,
-        _history_scalar(source.value(origin), "history initial value"), end)
-
-
+    if (
+        times.ndim != 1
+        or len(times) < 2
+        or times[0] != 0
+        or origin > end
+        or np.any(np.diff(times) <= 0)
+    ):
+        raise ValueError(
+            "History state times must increase from zero with origin no later than end"
+        )
+    edges = _real_array(times + origin, "history physical clock")
+    intervals = tuple(
+        (float(a), float(min(b, end))) for a, b in zip(edges[:-1], edges[1:]) if a < min(b, end)
+    )
+    values = tuple(
+        _history_scalar(source.integral(a, b), "history integral") for a, b in intervals
+    )
+    return DisclosedHistory(
+        intervals, values, _history_scalar(source.value(origin), "history initial value"), end
+    )

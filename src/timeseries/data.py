@@ -1,4 +1,5 @@
 """Загрузка CSV-источников на регулярную сетку панели."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ def localize_timestamps(ts: pd.Series, *, timezone: str | None, dst_policy: str)
         return ts.dt.tz_localize(timezone, ambiguous="NaT", nonexistent="NaT")
     raise ValueError(f"unknown dst_policy={dst_policy!r}")
 
+
 @dataclass(frozen=True)
 class DataSource:
     """Сохранить описание отложенной загрузки CSV.
@@ -61,6 +63,7 @@ class DataSource:
     Создавайте запись через ``build_data`` для проверки согласованности
     источников. Метод ``load`` читает файлы и возвращает ``LoadedSources``.
     """
+
     specs: tuple
     panel_spec: object
     anchor: Path | None
@@ -130,7 +133,9 @@ def build_data(specs, *, panel_spec, anchor=None) -> DataSource:
             if channel not in layout["channels"] or unit != layout["units"][channel]:
                 raise DataContractError("source/panel channel or units mismatch")
         if layout["duplicates"] == "first_with_quarantine" and source["route"] != "quarantine":
-            raise DataContractError("first_with_quarantine requires explicit quarantine route for every source")
+            raise DataContractError(
+                "first_with_quarantine requires explicit quarantine route for every source"
+            )
     return DataSource(sources, panel, anchor)
 
 
@@ -170,9 +175,17 @@ def load_sources(specs, *, panel_spec, anchor=None):
     from math import isfinite
 
     from .contracts import (
-        AcceptedValue, DataContractError, DuplicateObservationError, LoadedSources,
-        MissingInputError, NetworkPanel, QuarantinedValue, RowLocator,
-        SourceIntegrityError, SourceProvenance, clock_timestamp,
+        AcceptedValue,
+        DataContractError,
+        DuplicateObservationError,
+        LoadedSources,
+        MissingInputError,
+        NetworkPanel,
+        QuarantinedValue,
+        RowLocator,
+        SourceIntegrityError,
+        SourceProvenance,
+        clock_timestamp,
     )
 
     assembly = build_data(specs, panel_spec=panel_spec, anchor=anchor)
@@ -211,8 +224,11 @@ def load_sources(specs, *, panel_spec, anchor=None):
             raise SourceIntegrityError(f"{source['id']}: source SHA256 mismatch")
         fmt = source["format"]["parameters"]
         try:
-            reader = csv.reader(io.StringIO(content.decode(fmt["encoding"]), newline=""),
-                                delimiter=fmt["separator"], strict=True)
+            reader = csv.reader(
+                io.StringIO(content.decode(fmt["encoding"]), newline=""),
+                delimiter=fmt["separator"],
+                strict=True,
+            )
             headers = next(reader, [])
             rows = list(reader)
         except (UnicodeError, LookupError, csv.Error) as exc:
@@ -224,37 +240,50 @@ def load_sources(specs, *, panel_spec, anchor=None):
         if site_spec["kind"] == "column":
             required.add(site_spec["column"])
         if not required <= set(headers):
-            raise MissingInputError(f"{source['id']}: missing columns {sorted(required-set(headers))}")
+            raise MissingInputError(
+                f"{source['id']}: missing columns {sorted(required-set(headers))}"
+            )
         if any(len(row) != len(headers) for row in rows):
             raise DataContractError(f"{source['id']}: ragged CSV record")
         raw_rows = [dict(zip(headers, row)) for row in rows]
         raw_times = [" ".join(row[col] for col in columns["time"]) for row in raw_rows]
         time = source["time"]
         try:
-            stamps = pd.Series(pd.to_datetime(raw_times, errors="coerce",
-                               format=time["format"] if time["parser"] == "format" else None))
+            stamps = pd.Series(
+                pd.to_datetime(
+                    raw_times,
+                    errors="coerce",
+                    format=time["format"] if time["parser"] == "format" else None,
+                )
+            )
             if stamps.dt.tz is not None:
-                raise DataContractError("source timestamps must be wall time, not offset/UTC timestamps")
-            
+                raise DataContractError(
+                    "source timestamps must be wall time, not offset/UTC timestamps"
+                )
+
             if time["timezone"] is not None:
-                stamps = localize_timestamps(stamps, timezone=time["timezone"],
-                                             dst_policy=time["dst_policy"])
+                stamps = localize_timestamps(
+                    stamps, timezone=time["timezone"], dst_policy=time["dst_policy"]
+                )
         except Exception as exc:
             raise DataContractError(f"{source['id']}: incompatible timestamps/DST") from exc
         provenance.append(SourceProvenance(record, str(path), len(content)))
         # После проверки дублей strict вызывает ошибку времени, quarantine исключает значение.
-        
+
         grid_indices = grid.get_indexer(pd.DatetimeIndex(stamps))
         for row_number, (row, raw_time, stamp, grid_index) in enumerate(
-                zip(raw_rows, raw_times, stamps, grid_indices), 2):
+            zip(raw_rows, raw_times, stamps, grid_indices), 2
+        ):
             site = site_spec["id"] if site_spec["kind"] == "fixed" else row[site_spec["column"]]
             if site not in site_index:
                 raise DataContractError(f"{source['id']}:{row_number}: undeclared site {site!r}")
             missing_stamp = pd.isna(stamp)
             time_checked, time_reason, time_index = False, None, None
-            
+
             for channel, header in columns["values"].items():
-                locator = RowLocator(source["id"], actual_hash, row_number, site, channel, raw_time, row[header])
+                locator = RowLocator(
+                    source["id"], actual_hash, row_number, site, channel, raw_time, row[header]
+                )
                 reason = None
                 if missing_stamp:
                     reason = "unparseable_or_dst_dropped"
@@ -266,8 +295,8 @@ def load_sources(specs, *, panel_spec, anchor=None):
                         reason = "duplicate_timestamp"
                     else:
                         seen[key] = locator
-                        # Время общее для всех каналов записи, но дубли проверяются отдельно по каналу.
-                        
+                        # Время общее для записи; дубли проверяются отдельно по каналу.
+
                         if not time_checked:
                             if grid_index >= 0:
                                 time_index = int(grid_index)
@@ -288,17 +317,30 @@ def load_sources(specs, *, panel_spec, anchor=None):
                     try:
                         value = float(row[header])
                     except ValueError as exc:
-                        raise DataContractError(f"{locator}: undeclared missing token or nonnumeric value") from exc
+                        raise DataContractError(
+                            f"{locator}: undeclared missing token or nonnumeric value"
+                        ) from exc
                     if not isfinite(value):
-                        raise DataContractError(f"{locator}: nonfinite value is not a declared missing token")
+                        raise DataContractError(
+                            f"{locator}: nonfinite value is not a declared missing token"
+                        )
                 index = (time_index, site_index[site], channel_index[channel])
                 values[index], present[index] = value, True
                 accepted.append(AcceptedValue(locator, index))
                 sites_seen.add(site)
                 channels_seen.add(channel)
     if sites_seen != set(site_index) or channels_seen != set(channel_index):
-        raise MissingInputError("one or more required panel sites/channels have no accepted input rows")
+        raise MissingInputError(
+            "one or more required panel sites/channels have no accepted input rows"
+        )
     observed = np.isfinite(values)
-    panel = NetworkPanel(assembly.panel_spec, tuple(grid), values, present, observed,
-                         present & ~observed, tuple(accepted))
+    panel = NetworkPanel(
+        assembly.panel_spec,
+        tuple(grid),
+        values,
+        present,
+        observed,
+        present & ~observed,
+        tuple(accepted),
+    )
     return LoadedSources(panel, tuple(quarantine), tuple(provenance))

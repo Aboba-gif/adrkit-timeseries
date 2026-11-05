@@ -1,15 +1,30 @@
 """Признаки из видимых значений, их наличия и календарного времени."""
+
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
-from .contracts import (DataContractError, MaskedInputs, PanelSpec, clock_timestamp,
-                        snapshot, strings)
+from .contracts import (
+    DataContractError,
+    MaskedInputs,
+    PanelSpec,
+    clock_timestamp,
+    snapshot,
+    strings,
+)
 
-__all__ = ["FeatureValues", "FeatureSet", "feature_from_function", "combine_features",
-           "channel_features", "availability_features", "lag_features", "lead_features",
-           "calendar_features"]
+__all__ = [
+    "FeatureValues",
+    "FeatureSet",
+    "feature_from_function",
+    "combine_features",
+    "channel_features",
+    "availability_features",
+    "lag_features",
+    "lead_features",
+    "calendar_features",
+]
 
 
 @dataclass(frozen=True)
@@ -43,6 +58,7 @@ class FeatureValues:
     -----
     Численные значения копируются в буфер без права записи.
     """
+
     panel_spec: PanelSpec
     times: tuple
     names: tuple
@@ -61,9 +77,14 @@ class FeatureValues:
             raise DataContractError("feature context must be retrospective or causal")
         times = tuple(self.times)
         layout = self.panel_spec.to_dict()
-        expected = tuple(pd.date_range(clock_timestamp(layout["start"], layout),
-                         clock_timestamp(layout["stop"], layout),
-                         freq=layout["frequency"], inclusive="left"))
+        expected = tuple(
+            pd.date_range(
+                clock_timestamp(layout["start"], layout),
+                clock_timestamp(layout["stop"], layout),
+                freq=layout["frequency"],
+                inclusive="left",
+            )
+        )
         if times != expected:
             raise DataContractError("feature times must match the declared panel grid")
         shape = (len(times), len(layout["sites"]), len(names))
@@ -72,8 +93,15 @@ class FeatureValues:
             raise DataContractError(f"features require real numeric values with shape {shape}")
         values = snapshot(raw, dtype=float, shape=shape, name="features")
         if np.isinf(values).any():
-            raise DataContractError("feature values must be finite or explicitly unavailable (NaN)")
-        for key, value in (("names", names), ("units", units), ("times", times), ("values", values)):
+            raise DataContractError(
+                "feature values must be finite or explicitly unavailable (NaN)"
+            )
+        for key, value in (
+            ("names", names),
+            ("units", units),
+            ("times", times),
+            ("values", values),
+        ):
             object.__setattr__(self, key, value)
 
     @property
@@ -90,6 +118,7 @@ class FeatureValues:
 @dataclass(frozen=True)
 class _Block:
     """Хранить одну функцию признаков и её объявленные зависимости."""
+
     names: tuple
     units: tuple
     channels: tuple
@@ -120,6 +149,7 @@ class FeatureSet:
     Для создания используйте ``channel_features``, ``lag_features``,
     ``calendar_features``, ``feature_from_function`` и ``combine_features``.
     """
+
     _blocks: tuple
 
     def __post_init__(self):
@@ -175,13 +205,21 @@ class FeatureSet:
             raise DataContractError("features require every declared panel channel")
         parts = []
         for block in self._blocks:
-            units = tuple(layout["units"][u[1]] if u[0] == "channel" else u[1] for u in block.units)
-            checked = FeatureValues(inputs.spec, inputs.times, block.names, units,
-                                    block.transform(inputs), context)
+            units = tuple(
+                layout["units"][u[1]] if u[0] == "channel" else u[1] for u in block.units
+            )
+            checked = FeatureValues(
+                inputs.spec, inputs.times, block.names, units, block.transform(inputs), context
+            )
             parts.append(checked)
-        return FeatureValues(inputs.spec, inputs.times, self.names,
-                             tuple(u for p in parts for u in p.units),
-                             np.concatenate([p.values for p in parts], axis=2), context)
+        return FeatureValues(
+            inputs.spec,
+            inputs.times,
+            self.names,
+            tuple(u for p in parts for u in p.units),
+            np.concatenate([p.values for p in parts], axis=2),
+            context,
+        )
 
 
 def feature_from_function(*, names, units, transform, uses_future=None):
@@ -206,11 +244,19 @@ def feature_from_function(*, names, units, transform, uses_future=None):
     """
     names = strings(names, "feature names")
     units = tuple(units)
-    if (len(units) != len(names) or any(type(u) is not str or not u.strip() for u in units)
-            or not callable(transform) or uses_future not in (None, True, False)
-            or (uses_future is not None and type(uses_future) is not bool)):
-        raise DataContractError("features require callable transform, explicit units and dependency")
-    return FeatureSet((_Block(names, tuple(("literal", u) for u in units), (), transform, uses_future),))
+    if (
+        len(units) != len(names)
+        or any(type(u) is not str or not u.strip() for u in units)
+        or not callable(transform)
+        or uses_future not in (None, True, False)
+        or (uses_future is not None and type(uses_future) is not bool)
+    ):
+        raise DataContractError(
+            "features require callable transform, explicit units and dependency"
+        )
+    return FeatureSet(
+        (_Block(names, tuple(("literal", u) for u in units), (), transform, uses_future),)
+    )
 
 
 def combine_features(*features):
@@ -259,9 +305,17 @@ def channel_features(channels):
         Пропуски и скрытые значения сохраняют ``NaN``.
     """
     channels = _channels(channels)
-    return FeatureSet((_Block(tuple(f"{c}:value" for c in channels),
-                              tuple(("channel", c) for c in channels), channels,
-                              lambda x: _selected(x, channels), False),))
+    return FeatureSet(
+        (
+            _Block(
+                tuple(f"{c}:value" for c in channels),
+                tuple(("channel", c) for c in channels),
+                channels,
+                lambda x: _selected(x, channels),
+                False,
+            ),
+        )
+    )
 
 
 def availability_features(channels):
@@ -280,15 +334,28 @@ def availability_features(channels):
         входа, 0 для ``NaN``.
     """
     channels = _channels(channels)
-    return FeatureSet((_Block(tuple(f"{c}:available" for c in channels),
-                              tuple(("literal", "1") for _ in channels), channels,
-                              lambda x: np.isfinite(_selected(x, channels)).astype(float), False),))
+    return FeatureSet(
+        (
+            _Block(
+                tuple(f"{c}:available" for c in channels),
+                tuple(("literal", "1") for _ in channels),
+                channels,
+                lambda x: np.isfinite(_selected(x, channels)).astype(float),
+                False,
+            ),
+        )
+    )
 
 
 def _shift_features(channels, steps, *, future):
     """Создать упорядоченные сдвиги каналов в прошлое или будущее."""
     channels = _channels(channels)
-    if type(steps) not in (tuple, list) or not steps or any(type(s) is not int or s <= 0 for s in steps) or len(set(steps)) != len(steps):
+    if (
+        type(steps) not in (tuple, list)
+        or not steps
+        or any(type(s) is not int or s <= 0 for s in steps)
+        or len(set(steps)) != len(steps)
+    ):
         raise DataContractError("feature steps require ordered unique positive integers")
     steps = tuple(steps)
     role = "lead" if future else "lag"
@@ -302,13 +369,22 @@ def _shift_features(channels, steps, *, future):
             for k, step in enumerate(steps):
                 if step < len(raw):
                     if future:
-                        values[:-step, :, j*len(steps)+k] = raw[step:, :, j]
+                        values[:-step, :, j * len(steps) + k] = raw[step:, :, j]
                     else:
-                        values[step:, :, j*len(steps)+k] = raw[:-step, :, j]
+                        values[step:, :, j * len(steps) + k] = raw[:-step, :, j]
         return values
 
-    return FeatureSet((_Block(names, tuple(("channel", c) for c in channels for _ in steps),
-                              channels, transform, future),))
+    return FeatureSet(
+        (
+            _Block(
+                names,
+                tuple(("channel", c) for c in channels for _ in steps),
+                channels,
+                transform,
+                future,
+            ),
+        )
+    )
 
 
 def lag_features(channels, steps):
@@ -388,23 +464,44 @@ def calendar_features(components):
     фаза использует среднюю длину года 365.2425 дня.
     """
     components = strings(components, "calendar components")
-    allowed = {"hour", "hour_sin", "hour_cos", "dayofyear", "dayofyear_sin",
-               "dayofyear_cos", "weekday", "month"}
+    allowed = {
+        "hour",
+        "hour_sin",
+        "hour_cos",
+        "dayofyear",
+        "dayofyear_sin",
+        "dayofyear_cos",
+        "weekday",
+        "month",
+    }
     if not set(components) <= allowed:
         raise DataContractError("unsupported calendar feature")
 
     def transform(inputs):
         """Вычислить календарные столбцы и повторить их для каждого поста."""
         index = pd.DatetimeIndex(inputs.times)
-        hour = index.hour.to_numpy() + index.minute.to_numpy()/60 + index.second.to_numpy()/3600
+        hour = (
+            index.hour.to_numpy() + index.minute.to_numpy() / 60 + index.second.to_numpy() / 3600
+        )
         day = index.dayofyear.to_numpy()
-        values = {"hour": hour, "hour_sin": np.sin(2*np.pi*hour/24),
-                  "hour_cos": np.cos(2*np.pi*hour/24), "dayofyear": day,
-                  "dayofyear_sin": np.sin(2*np.pi*(day-1)/365.2425),
-                  "dayofyear_cos": np.cos(2*np.pi*(day-1)/365.2425),
-                  "weekday": index.dayofweek.to_numpy(), "month": index.month.to_numpy()}
+        values = {
+            "hour": hour,
+            "hour_sin": np.sin(2 * np.pi * hour / 24),
+            "hour_cos": np.cos(2 * np.pi * hour / 24),
+            "dayofyear": day,
+            "dayofyear_sin": np.sin(2 * np.pi * (day - 1) / 365.2425),
+            "dayofyear_cos": np.cos(2 * np.pi * (day - 1) / 365.2425),
+            "weekday": index.dayofweek.to_numpy(),
+            "month": index.month.to_numpy(),
+        }
         matrix = np.column_stack([values[c] for c in components])
-        return np.broadcast_to(matrix[:, None, :], (len(index), len(inputs.spec.to_dict()["sites"]), len(components))).copy()
+        return np.broadcast_to(
+            matrix[:, None, :], (len(index), len(inputs.spec.to_dict()["sites"]), len(components))
+        ).copy()
 
-    units = tuple(("literal", "h" if c == "hour" else "d" if c == "dayofyear" else "1") for c in components)
-    return FeatureSet((_Block(tuple(f"calendar:{c}" for c in components), units, (), transform, False),))
+    units = tuple(
+        ("literal", "h" if c == "hour" else "d" if c == "dayofyear" else "1") for c in components
+    )
+    return FeatureSet(
+        (_Block(tuple(f"calendar:{c}" for c in components), units, (), transform, False),)
+    )

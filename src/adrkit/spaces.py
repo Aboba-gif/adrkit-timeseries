@@ -1,4 +1,5 @@
 """Пространства массивов и линейные отображения в евклидовых координатах."""
+
 from dataclasses import dataclass
 from math import prod
 
@@ -60,21 +61,36 @@ class ArraySpace:
     dtype: np.dtype
     binding: str | None
 
-    def __init__(self, shape, *, axes, coordinates, units, scale=1.,
-                 pairing="euclidean", dtype=np.float64, binding=None):
+    def __init__(
+        self,
+        shape,
+        *,
+        axes,
+        coordinates,
+        units,
+        scale=1.0,
+        pairing="euclidean",
+        dtype=np.float64,
+        binding=None,
+    ):
         shape = tuple(shape)
-        if any(isinstance(n, (bool, np.bool_)) or not isinstance(n, (int, np.integer))
-               or n < 1 for n in shape):
+        if any(
+            isinstance(n, (bool, np.bool_)) or not isinstance(n, (int, np.integer)) or n < 1
+            for n in shape
+        ):
             raise ValueError("Shape entries must be positive integers")
         shape = tuple(int(n) for n in shape)
         axes = tuple(axes)
         coordinates = tuple(_coordinate(axis) for axis in coordinates)
-        if (len(axes) != len(shape) or len(set(axes)) != len(axes)
-                or any(not isinstance(a, str) or not a.strip() for a in axes)):
+        if (
+            len(axes) != len(shape)
+            or len(set(axes)) != len(axes)
+            or any(not isinstance(a, str) or not a.strip() for a in axes)
+        ):
             raise ValueError("Each axis needs a distinct nonempty name")
-        if (len(coordinates) != len(shape)
-                or any(not isinstance(c, tuple) or len(c) != n
-                       for c, n in zip(coordinates, shape))):
+        if len(coordinates) != len(shape) or any(
+            not isinstance(c, tuple) or len(c) != n for c, n in zip(coordinates, shape)
+        ):
             raise ValueError("Coordinates must match every axis length")
         if any(len(set(c)) != len(c) for c in coordinates):
             raise ValueError("Axis coordinate IDs must be unique")
@@ -89,9 +105,16 @@ class ArraySpace:
             raise ValueError("Only real floating point array spaces are supported")
         if binding is not None and (not isinstance(binding, str) or not binding):
             raise ValueError("binding must be a nonempty string or None")
-        for key, value in dict(shape=shape, axes=axes, coordinates=coordinates,
-                               units=units, scale=float(scale), pairing=pairing,
-                               dtype=dtype, binding=binding).items():
+        for key, value in dict(
+            shape=shape,
+            axes=axes,
+            coordinates=coordinates,
+            units=units,
+            scale=float(scale),
+            pairing=pairing,
+            dtype=dtype,
+            binding=binding,
+        ).items():
             object.__setattr__(self, key, value)
 
     @property
@@ -151,9 +174,9 @@ class _LinearMap:
         if domain.dtype != codomain.dtype:
             raise ValueError("A numerical map requires one explicit common dtype")
         self._domain, self._codomain = domain, codomain
-        self._operator = LinearOperator((codomain.size, domain.size),
-                                        matvec=matvec, rmatvec=rmatvec,
-                                        dtype=domain.dtype)
+        self._operator = LinearOperator(
+            (codomain.size, domain.size), matvec=matvec, rmatvec=rmatvec, dtype=domain.dtype
+        )
 
     @property
     def domain(self):
@@ -183,8 +206,9 @@ class _LinearMap:
             Результат формы codomain.shape в единицах codomain.
         """
         x = self.domain.array(x, name="input")
-        result = np.asarray(self._operator.matvec(x.ravel(order="C")),
-                            dtype=self.codomain.dtype).reshape(self.codomain.shape)
+        result = np.asarray(
+            self._operator.matvec(x.ravel(order="C")), dtype=self.codomain.dtype
+        ).reshape(self.codomain.shape)
         return self.codomain.array(result, name="prediction", copy=True)
 
     def jvp(self, at, direction):
@@ -223,8 +247,9 @@ class _LinearMap:
         """
         self.domain.array(at, name="at")
         z = self.codomain.array(cotangent, name="cotangent")
-        result = np.asarray(self._operator.rmatvec(z.ravel(order="C")),
-                            dtype=self.domain.dtype).reshape(self.domain.shape)
+        result = np.asarray(
+            self._operator.rmatvec(z.ravel(order="C")), dtype=self.domain.dtype
+        ).reshape(self.domain.shape)
         return self.domain.array(result, name="VJP output", copy=True)
 
     def linear_operator(self):
@@ -236,8 +261,12 @@ class _LinearMap:
             Оператор формы (codomain.size, domain.size); массивы
             разворачиваются в порядке C.
         """
-        return LinearOperator(self._operator.shape, matvec=self._operator.matvec,
-                              rmatvec=self._operator.rmatvec, dtype=self.domain.dtype)
+        return LinearOperator(
+            self._operator.shape,
+            matvec=self._operator.matvec,
+            rmatvec=self._operator.rmatvec,
+            dtype=self.domain.dtype,
+        )
 
 
 class MatrixMap(_LinearMap):
@@ -260,8 +289,10 @@ class MatrixMap(_LinearMap):
         if np.iscomplexobj(matrix):
             raise ValueError("Matrix must be real")
         self._matrix = np.array(matrix, dtype=domain.dtype, copy=True)
-        if (self._matrix.shape != (codomain.size, domain.size)
-                or not np.isfinite(self._matrix).all()):
+        if (
+            self._matrix.shape != (codomain.size, domain.size)
+            or not np.isfinite(self._matrix).all()
+        ):
             raise ValueError("Finite matrix must match domain/codomain")
         super().__init__(domain, codomain, self._matvec, self._rmatvec)
 

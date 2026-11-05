@@ -1,4 +1,5 @@
 """Поля коэффициентов ADR, локальная реакция и числовые слои."""
+
 from dataclasses import dataclass
 from typing import Callable
 
@@ -15,6 +16,7 @@ class ADRUnits:
         Непустые обозначения базовых единиц; численные значения не
         преобразуются.
     """
+
     length: str
     time: str
     concentration: str
@@ -75,6 +77,7 @@ class ScalarField:
         Вычислять поле в каждый момент. При False используется один
         временной слой.
     """
+
     evaluator: object
     unit: str | None = None
     time_dependent: bool = True
@@ -128,7 +131,7 @@ def is_scalar_constant(value):
     if isinstance(value, (int, float, np.integer, np.floating)):
         return True
     # Проверка скалярных массивов не вызывает __array__ произвольного объекта функции.
-    return isinstance(value, np.ndarray) and value.shape == () and value.dtype.kind in 'iuf'
+    return isinstance(value, np.ndarray) and value.shape == () and value.dtype.kind in "iuf"
 
 
 def is_vector_constant(value):
@@ -150,7 +153,11 @@ def is_vector_constant(value):
     -----
     Конечность компонентов не проверяется.
     """
-    if isinstance(value, (ScalarField, VectorField)) or callable(value) or hasattr(value, "evaluate"):
+    if (
+        isinstance(value, (ScalarField, VectorField))
+        or callable(value)
+        or hasattr(value, "evaluate")
+    ):
         return False
     try:
         array = np.asarray(value)
@@ -169,7 +176,9 @@ def _owned_values(value, count, components, name):
     if array.shape == constant_shape:
         array = np.broadcast_to(array, shape).copy()
     if array.shape != shape or not np.isfinite(array).all():
-        raise ValueError(f"{name} must return finite values with shape {shape} or {constant_shape}")
+        raise ValueError(
+            f"{name} must return finite values with shape {shape} or {constant_shape}"
+        )
     array.flags.writeable = False
     return array
 
@@ -188,6 +197,7 @@ class SampledField:
     При прямом создании массивы не копируются.
     Функция sample_field создаёт независимые массивы с запрещённой записью.
     """
+
     values: tuple
 
     def at(self, step):
@@ -207,8 +217,17 @@ class SampledField:
         return self.values[0] if len(self.values) == 1 else self.values[step]
 
 
-def sample_field(value, points, times, *, name, components=1,
-                 positive=False, nonnegative=False, expected_unit=None):
+def sample_field(
+    value,
+    points,
+    times,
+    *,
+    name,
+    components=1,
+    positive=False,
+    nonnegative=False,
+    expected_unit=None,
+):
     """Вычислить поле в точках и физических моментах.
 
     Parameters
@@ -244,8 +263,14 @@ def sample_field(value, points, times, *, name, components=1,
     """
     points = np.array(points, dtype=float, copy=True)
     times = np.asarray(times, dtype=float)
-    if (points.ndim != 2 or points.shape[1] != 2 or not np.isfinite(points).all()
-            or times.ndim != 1 or not len(times) or not np.isfinite(times).all()):
+    if (
+        points.ndim != 2
+        or points.shape[1] != 2
+        or not np.isfinite(points).all()
+        or times.ndim != 1
+        or not len(times)
+        or not np.isfinite(times).all()
+    ):
         raise ValueError("Finite two-dimensional points and times required")
     constant = is_scalar_constant(value) if components == 1 else is_vector_constant(value)
     if constant:
@@ -253,9 +278,16 @@ def sample_field(value, points, times, *, name, components=1,
     else:
         if isinstance(value, ScalarField):
             if (components == 1 and isinstance(value, VectorField)) or (
-                    components != 1 and not isinstance(value, VectorField)):
-                raise TypeError(f"{name} requires a {'scalar' if components == 1 else 'vector'} field")
-            if expected_unit is not None and value.unit is not None and value.unit != expected_unit:
+                components != 1 and not isinstance(value, VectorField)
+            ):
+                raise TypeError(
+                    f"{name} requires a {'scalar' if components == 1 else 'vector'} field"
+                )
+            if (
+                expected_unit is not None
+                and value.unit is not None
+                and value.unit != expected_unit
+            ):
                 raise ValueError(f"{name} unit {value.unit!r} does not match {expected_unit!r}")
             operation = _evaluator(value.evaluator)
             selected_times = times if value.time_dependent else times[:1]
@@ -293,6 +325,7 @@ class ReactionLaw:
     unit, derivative_unit : str or None, optional
         Метки единиц реакции и её производной по концентрации.
     """
+
     value: Callable
     derivative: Callable
     pure: bool
@@ -354,9 +387,12 @@ class ReactionLaw:
             запись запрещена.
         """
         operation = self.derivative if derivative else self.value
-        return _owned_values(operation(np.array(state, copy=True),
-                                       np.array(points, copy=True), float(time)),
-                             len(points), 1, "reaction derivative" if derivative else "reaction")
+        return _owned_values(
+            operation(np.array(state, copy=True), np.array(points, copy=True), float(time)),
+            len(points),
+            1,
+            "reaction derivative" if derivative else "reaction",
+        )
 
 
 __all__ = ["ADRUnits", "ScalarField", "VectorField", "ReactionLaw"]

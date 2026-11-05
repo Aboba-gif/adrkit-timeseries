@@ -1,4 +1,5 @@
 """Спектр локальной чувствительности в метриках коэффициентов и наблюдений."""
+
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -32,6 +33,7 @@ class CoefficientWhitening(Protocol):
 
         G=R^\mathsf{T}R.
     """
+
     domain: ArraySpace
     root: np.ndarray
 
@@ -57,6 +59,7 @@ class ObservationWhitening(Protocol):
 
     Порядок строк сохраняется.
     """
+
     layout: ArraySpace
 
     def whiten_matrix(self, matrix: np.ndarray) -> np.ndarray:
@@ -88,13 +91,16 @@ class SensitivityLimits:
     max_jvp_calls : int
         Положительный предел вызовов JVP.
     """
+
     max_columns: int
     max_entries: int
     max_jvp_calls: int
 
     def __post_init__(self):
-        if any(isinstance(v, bool) or not isinstance(v, int) or v < 1
-               for v in (self.max_columns, self.max_entries, self.max_jvp_calls)):
+        if any(
+            isinstance(v, bool) or not isinstance(v, int) or v < 1
+            for v in (self.max_columns, self.max_entries, self.max_jvp_calls)
+        ):
             raise ValueError("Positive integer dense sensitivity limits required")
 
 
@@ -126,6 +132,7 @@ class SpectrumResult:
     В фактическом результате sensitivity_spectrum массивы спектра
     и точки имеют запрещённую запись.
     """
+
     singular_values: np.ndarray
     rank: int
     nullity: int
@@ -151,12 +158,18 @@ class SpectrumResult:
             Разрешённая обусловленность; бесконечность при отсутствующей
             condition.
         """
-        return (self.singular_values.copy(), self.rank, self.nullity, self.threshold,
-                float("inf") if self.condition is None else self.condition)
+        return (
+            self.singular_values.copy(),
+            self.rank,
+            self.nullity,
+            self.threshold,
+            float("inf") if self.condition is None else self.condition,
+        )
 
 
-def sensitivity_spectrum(prediction, at, *, coefficient_metric,
-                         observation_metric, relative_threshold=1e-10, limits):
+def sensitivity_spectrum(
+    prediction, at, *, coefficient_metric, observation_metric, relative_threshold=1e-10, limits
+):
     r"""Вычислить спектр локальной чувствительности в двух метриках.
 
     Parameters
@@ -202,8 +215,9 @@ def sensitivity_spectrum(prediction, at, *, coefficient_metric,
     jvp = require_capability(prediction.jvp, operation="JVP", consumer="sensitivity")
     if not isinstance(getattr(coefficient_metric, "domain", None), ArraySpace):
         raise TypeError("Coefficient whitening must declare an ArraySpace domain")
-    if (not isinstance(getattr(observation_metric, "layout", None), ArraySpace)
-            or not callable(getattr(observation_metric, "whiten_matrix", None))):
+    if not isinstance(getattr(observation_metric, "layout", None), ArraySpace) or not callable(
+        getattr(observation_metric, "whiten_matrix", None)
+    ):
         raise CapabilityError("sensitivity requires an explicit SPD whitening metric")
     prediction.domain.require_compatible(coefficient_metric.domain)
     prediction.codomain.require_compatible(observation_metric.layout)
@@ -216,33 +230,47 @@ def sensitivity_spectrum(prediction, at, *, coefficient_metric,
     if not isinstance(limits, SensitivityLimits):
         raise TypeError("Explicit SensitivityLimits required")
     m, n = prediction.codomain.size, prediction.domain.size
-    if n > limits.max_columns or n > limits.max_jvp_calls or m*n > limits.max_entries:
+    if n > limits.max_columns or n > limits.max_jvp_calls or m * n > limits.max_entries:
         raise ValueError("Dense sensitivity exceeds caller limits")
     root = real_array(coefficient_metric.root, name="Coefficient whitening root", copy=True)
-    if (root.shape != (n, n) or not np.array_equal(root, np.triu(root))
-            or np.any(np.diag(root) <= 0)):
+    if (
+        root.shape != (n, n)
+        or not np.array_equal(root, np.triu(root))
+        or np.any(np.diag(root) <= 0)
+    ):
         raise ValueError("Coefficient whitening requires a finite positive upper-triangular root")
     matrix = np.empty((m, n), dtype=prediction.domain.dtype)
     for j in range(n):
         direction = np.zeros(prediction.domain.shape, dtype=prediction.domain.dtype)
-        direction.ravel()[j] = 1.
+        direction.ravel()[j] = 1.0
         matrix[:, j] = prediction.codomain.array(
-            jvp.jvp(point.copy(), direction), name="JVP output").ravel()
-    white = real_array(observation_metric.whiten_matrix(matrix.copy()),
-                       name="Whitened sensitivity")
+            jvp.jvp(point.copy(), direction), name="JVP output"
+        ).ravel()
+    white = real_array(
+        observation_metric.whiten_matrix(matrix.copy()), name="Whitened sensitivity"
+    )
     if white.shape != (m, n):
         raise ValueError("Observation whitening must preserve sensitivity row and column layout")
     kernel = solve_triangular(root.T, white.T, lower=True).T
     singular = np.linalg.svd(kernel, compute_uv=False)
-    threshold = float(threshold_ratio*singular[0]) if len(singular) else 0.
+    threshold = float(threshold_ratio * singular[0]) if len(singular) else 0.0
     rank = int(np.sum(singular > threshold))
-    condition = float(singular[0]/singular[rank-1]) if rank else None
+    condition = float(singular[0] / singular[rank - 1]) if rank else None
     reason = "zero resolved rank" if rank == 0 else None
     if condition is not None and not np.isfinite(condition):
         condition, reason = None, "nonfinite resolved condition"
     singular.flags.writeable = point.flags.writeable = False
-    return SpectrumResult(singular, rank, n-rank, threshold, condition, reason,
-                          point, prediction.domain, prediction.codomain)
+    return SpectrumResult(
+        singular,
+        rank,
+        n - rank,
+        threshold,
+        condition,
+        reason,
+        point,
+        prediction.domain,
+        prediction.codomain,
+    )
 
 
 def matrix_spectrum(A, Sigma, M, relative_threshold=1e-10):
@@ -270,10 +298,17 @@ def matrix_spectrum(A, Sigma, M, relative_threshold=1e-10):
     if A.ndim != 2:
         raise ValueError("A must be a finite real matrix")
     m, n = A.shape
-    domain = ArraySpace((n,), axes=("coefficient",), coordinates=(tuple(range(n)),), units="unknown")
-    layout = ArraySpace((m,), axes=("observation",), coordinates=(tuple(range(m)),), units="unknown")
-    return sensitivity_spectrum(matrix_map(A, domain=domain, codomain=layout), np.zeros(n),
+    domain = ArraySpace(
+        (n,), axes=("coefficient",), coordinates=(tuple(range(n)),), units="unknown"
+    )
+    layout = ArraySpace(
+        (m,), axes=("observation",), coordinates=(tuple(range(m)),), units="unknown"
+    )
+    return sensitivity_spectrum(
+        matrix_map(A, domain=domain, codomain=layout),
+        np.zeros(n),
         coefficient_metric=CoefficientMetric(M, domain=domain),
         observation_metric=covariance_metric(Sigma, layout=layout),
         relative_threshold=relative_threshold,
-        limits=SensitivityLimits(n, m*n, n))
+        limits=SensitivityLimits(n, m * n, n),
+    )

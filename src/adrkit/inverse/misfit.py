@@ -1,4 +1,5 @@
 """Невязка наблюдений в заданной метрике."""
+
 import numpy as np
 from scipy.linalg import cho_solve, norm, solve_triangular, svd
 
@@ -11,7 +12,9 @@ def _whitening_matrix(matrix, layout):
     """Проверить вещественную матрицу до и после смены dtype."""
     converted = real_array(matrix, name="Whitening matrix", dtype=layout.dtype)
     if converted.ndim != 2 or converted.shape[0] != layout.size:
-        raise ValueError("Whitening matrix must have finite real rows matching the selected layout")
+        raise ValueError(
+            "Whitening matrix must have finite real rows matching the selected layout"
+        )
     return converted
 
 
@@ -32,6 +35,7 @@ class CovarianceMetric:
     Преобразование whiten приводит ковариацию к единичной матрице.
     Обратная ковариация применяется к координатному вектору невязки.
     """
+
     def __init__(self, covariance, *, layout):
         if np.iscomplexobj(covariance):
             raise ValueError("Covariance must be real")
@@ -58,8 +62,9 @@ class CovarianceMetric:
             сохраняется.
         """
         r = self.layout.array(residual).ravel()
-        result = (r/self._factor**2 if self._factor.ndim == 1 else
-                  cho_solve((self._factor, True), r))
+        result = (
+            r / self._factor**2 if self._factor.ndim == 1 else cho_solve((self._factor, True), r)
+        )
         return result.reshape(self.layout.shape)
 
     def whiten(self, residual):
@@ -77,8 +82,11 @@ class CovarianceMetric:
             layout.shape сохраняется.
         """
         r = self.layout.array(residual).ravel()
-        return (r/self._factor if self._factor.ndim == 1 else
-                solve_triangular(self._factor, r, lower=True)).reshape(self.layout.shape)
+        return (
+            r / self._factor
+            if self._factor.ndim == 1
+            else solve_triangular(self._factor, r, lower=True)
+        ).reshape(self.layout.shape)
 
     def whiten_matrix(self, matrix):
         """Преобразовать матрицу в координатах наблюдений.
@@ -96,14 +104,17 @@ class CovarianceMetric:
             делятся на стандартные отклонения.
         """
         a = _whitening_matrix(matrix, self.layout)
-        return (a/self._factor[:, None] if self._factor.ndim == 1 else
-                solve_triangular(self._factor, a, lower=True))
+        return (
+            a / self._factor[:, None]
+            if self._factor.ndim == 1
+            else solve_triangular(self._factor, a, lower=True)
+        )
 
     @property
     def logdet(self):
         """Логарифм определителя фиксированной ковариации."""
         diagonal = self._factor if self._factor.ndim == 1 else np.diag(self._factor)
-        return float(2*np.log(diagonal).sum())
+        return float(2 * np.log(diagonal).sum())
 
     @property
     def covariance_factor(self):
@@ -120,8 +131,9 @@ class CovarianceMetric:
     @property
     def covariance(self):
         """Полная ковариация формы (layout.size, layout.size) в независимом массиве."""
-        return (np.diag(self._factor**2) if self._factor.ndim == 1 else
-                self._factor @ self._factor.T)
+        return (
+            np.diag(self._factor**2) if self._factor.ndim == 1 else self._factor @ self._factor.T
+        )
 
 
 def covariance_metric(covariance, *, layout):
@@ -160,6 +172,7 @@ class WorkingPrecision:
     Свойства линейности, симметрии и положительной определённости
     задаёт автор action. При вызове проверяются форма и конечность массива.
     """
+
     def __init__(self, action, *, layout):
         if not callable(action):
             raise ValueError("Fixed precision action required")
@@ -218,12 +231,13 @@ class DiagonalWorkingMetric(WorkingPrecision):
     layout : ArraySpace
         Пространство наблюдений.
     """
+
     def __init__(self, weights, *, layout):
         weights = layout.array(weights, copy=True)
         if np.any(weights <= 0):
             raise ValueError("Select active rows before constructing working precision")
         self._weights = weights
-        super().__init__(lambda r: weights*r, layout=layout)
+        super().__init__(lambda r: weights * r, layout=layout)
 
     def whiten(self, residual):
         """Привести невязку к единичной рабочей ковариации.
@@ -239,7 +253,7 @@ class DiagonalWorkingMetric(WorkingPrecision):
             Невязка, умноженная на квадратные корни диагональных весов.
             Форма layout.shape сохраняется.
         """
-        return np.sqrt(self._weights)*self.layout.array(residual)
+        return np.sqrt(self._weights) * self.layout.array(residual)
 
     def whiten_matrix(self, matrix):
         """Преобразовать матрицу в координатах наблюдений.
@@ -255,7 +269,7 @@ class DiagonalWorkingMetric(WorkingPrecision):
             Матрица, строки которой умножены на квадратные корни весов.
         """
         a = _whitening_matrix(matrix, self.layout)
-        return np.sqrt(self._weights.ravel())[:, None]*a
+        return np.sqrt(self._weights.ravel())[:, None] * a
 
 
 class QuadraticMisfit:
@@ -289,7 +303,8 @@ class QuadraticMisfit:
     `metric.apply_precision`. В формулах массивы развёрнуты в порядке C;
     :math:`dJ` обозначает координатный ковектор, без преобразования Рисса.
     """
-    def __init__(self, target, metric, *, normalization=1.):
+
+    def __init__(self, target, metric, *, normalization=1.0):
         self._domain = metric.layout
         self._target = self.domain.array(target, name="selected target", copy=True)
         self._metric = metric
@@ -318,7 +333,7 @@ class QuadraticMisfit:
         return self._target.copy()
 
     def _residual(self, x):
-        return self.domain.array(x)-self._target
+        return self.domain.array(x) - self._target
 
     def value(self, x):
         """Вычислить квадратичную невязку.
@@ -334,7 +349,11 @@ class QuadraticMisfit:
             Значение функционала с заданной нормировкой.
         """
         residual = self._residual(x)
-        return .5*float(residual.ravel() @ self.metric.apply_precision(residual).ravel())/self.normalization
+        return (
+            0.5
+            * float(residual.ravel() @ self.metric.apply_precision(residual).ravel())
+            / self.normalization
+        )
 
     def cotangent(self, x):
         """Вычислить координатный ковектор невязки.
@@ -349,7 +368,7 @@ class QuadraticMisfit:
         result : ndarray
             Производная формы domain.shape.
         """
-        return self.metric.apply_precision(self._residual(x))/self.normalization
+        return self.metric.apply_precision(self._residual(x)) / self.normalization
 
     def capabilities(self):
         """Предоставить значение и ковектор как ScalarCapabilities."""
@@ -381,11 +400,12 @@ class GaussianLikelihood(QuadraticMisfit):
     Массивы :math:`x,y` развёрнуты в порядке C. Это плотность
     наблюдений при среднем :math:`x` в выбранных численных координатах.
     """
+
     def __init__(self, target, metric):
         if not isinstance(metric, CovarianceMetric):
             raise TypeError("Gaussian density requires a covariance metric")
-        super().__init__(target, metric, normalization=1.)
-        self._constant = .5*(self.domain.size*np.log(2*np.pi)+metric.logdet)
+        super().__init__(target, metric, normalization=1.0)
+        self._constant = 0.5 * (self.domain.size * np.log(2 * np.pi) + metric.logdet)
 
     def value(self, x):
         """Вычислить отрицательный логарифм гауссовой плотности.
@@ -400,10 +420,10 @@ class GaussianLikelihood(QuadraticMisfit):
         result : float
             Значение с нормировочной константой плотности.
         """
-        return super().value(x)+self._constant
+        return super().value(x) + self._constant
 
 
-def working_quadratic(target, weights, *, layout, normalization=1.):
+def working_quadratic(target, weights, *, layout, normalization=1.0):
     """Создать квадратичную невязку с диагональными весами.
 
     Parameters
@@ -421,8 +441,10 @@ def working_quadratic(target, weights, *, layout, normalization=1.):
     misfit : QuadraticMisfit
         Невязка с фиксированной DiagonalWorkingMetric.
     """
-    return QuadraticMisfit(target, DiagonalWorkingMetric(
-        weights, layout=layout), normalization=normalization)
+    return QuadraticMisfit(
+        target, DiagonalWorkingMetric(weights, layout=layout), normalization=normalization
+    )
+
 
 def support_whitener(lift, variance):
     r"""Построить преобразование ковариации на её носителе.
@@ -509,10 +531,10 @@ def on_support(values, support, tolerance=1e-10):
     if tolerance == 0:
         outside = not np.array_equal(values, support @ (support.T @ values))
     else:
-        scale = max(1., np.max(np.abs(values), initial=0.))
+        scale = max(1.0, np.max(np.abs(values), initial=0.0))
         normalized = values / scale
         defect = norm((normalized - support @ (support.T @ normalized)).ravel())
-        outside = defect > tolerance * max(1. / scale, norm(normalized.ravel()))
+        outside = defect > tolerance * max(1.0 / scale, norm(normalized.ravel()))
     if outside:
         raise ValueError("Residual outside pushed covariance support")
     return values
@@ -533,6 +555,7 @@ class SupportWhitening:
     Входы должны принадлежать носителю; проверка выполняется
     перед умножением на сохранённую матрицу преобразования.
     """
+
     def __init__(self, lift, variance):
         self._whitener, self._support = support_whitener(lift, variance)
 

@@ -1,4 +1,5 @@
 """Ссылки на входные файлы используют явно выбранное расположение конфигурации."""
+
 from pathlib import Path
 
 import pytest
@@ -15,11 +16,14 @@ def test_source_pointers_support_another_configuration_location(csv_case, monkey
     monkeypatch.setattr(Path, "read_bytes", forbidden)
     prefix = "/datasets/sensor~1array~0raw"
     actual = source_resource_pointers(specs, prefix=prefix)
-    assert actual == tuple((f"{prefix}/{i}/path", f"{prefix}/{i}/sha256")
-                           for i in range(len(specs)))
+    assert actual == tuple(
+        (f"{prefix}/{i}/path", f"{prefix}/{i}/sha256") for i in range(len(specs))
+    )
 
 
-@pytest.mark.parametrize("prefix", [None, True, 12, "", "sources", "/source~", "/source~2", "/sources/*"])
+@pytest.mark.parametrize(
+    "prefix", [None, True, 12, "", "sources", "/source~", "/source~2", "/sources/*"]
+)
 def test_invalid_source_pointer_prefix_precedes_source_validation(prefix, monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("invalid prefix must fail before reading a source")

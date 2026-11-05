@@ -1,4 +1,5 @@
 """Семейство оператора парного усреднения."""
+
 import numpy as np
 
 from adrkit.config import integer
@@ -28,6 +29,7 @@ class PairAverage:
 
     В сопряжённой операции вклады повторяющихся индексов суммируются.
     """
+
     def __init__(self, pairs, size):
         self.pairs = np.array(pairs, dtype=int, copy=True)
         self.size = size
@@ -44,7 +46,7 @@ class PairAverage:
         """Суммировать половины ковектора по индексам каждой пары."""
         result = np.zeros(self.size)
         # add.at суммирует вклады повторяющихся входных индексов.
-        np.add.at(result, self.pairs.ravel(), np.repeat(cotangent/2, 2))
+        np.add.at(result, self.pairs.ravel(), np.repeat(cotangent / 2, 2))
         return result
 
 
@@ -67,10 +69,13 @@ def build(p, domain):
     if len(domain.shape) != 1 or max(max(pair) for pair in p["pairs"]) >= domain.size:
         raise ValueError("pair indices exceed the vector layout")
     operation = PairAverage(p["pairs"], domain.size)
-    codomain = ArraySpace((len(p["pairs"]),), axes=("pair_row",),
-                          coordinates=(list(range(len(p["pairs"]))),), units=domain.units)
+    codomain = ArraySpace(
+        (len(p["pairs"]),),
+        axes=("pair_row",),
+        coordinates=(list(range(len(p["pairs"]))),),
+        units=domain.units,
+    )
     return MapCapabilities(operation, domain, codomain, operation, operation)
 
 
 FAMILIES = {"observation": {"pair_average": Family(validate, build)}}
-

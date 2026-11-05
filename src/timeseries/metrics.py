@@ -1,4 +1,5 @@
 """Ошибки заполнения по контрольным значениям каждого канала."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,9 +10,18 @@ import numpy as np
 
 from .contracts import DataContractError, EvaluationTruth, ImputationResult, closed, text
 
-
-_RESERVED = {"requested", "known_truth", "available", "scored", "unit",
-             "metric_units", "channel", "site", "by_channel", "by_site_channel"}
+_RESERVED = {
+    "requested",
+    "known_truth",
+    "available",
+    "scored",
+    "unit",
+    "metric_units",
+    "channel",
+    "site",
+    "by_channel",
+    "by_site_channel",
+}
 
 
 @dataclass(frozen=True)
@@ -31,6 +41,7 @@ class Metric:
         ``"channel_squared"`` для её квадрата либо фиксированная строка.
         Числового преобразования единиц нет.
     """
+
     name: str
     calculate: Callable
     unit: str
@@ -99,8 +110,11 @@ class Metric:
             Единица канала, её квадрат либо фиксированное обозначение
             ``Metric.unit``. Значения данных не преобразуются.
         """
-        return (channel_unit if self.unit == "channel" else
-                f"({channel_unit})^2" if self.unit == "channel_squared" else self.unit)
+        return (
+            channel_unit
+            if self.unit == "channel"
+            else f"({channel_unit})^2" if self.unit == "channel_squared" else self.unit
+        )
 
 
 def metric_from_function(name, calculate, *, unit):
@@ -136,13 +150,19 @@ class MetricSet:
         Непустой набор метрик без повторяющихся имён. Порядок
         сохраняется в результатах.
     """
+
     metrics: tuple[Metric, ...]
 
     def __post_init__(self):
         metrics = tuple(self.metrics)
-        if (not metrics or any(not isinstance(metric, Metric) for metric in metrics) or
-                len({metric.name for metric in metrics}) != len(metrics)):
-            raise DataContractError("metrics require a nonempty sequence of uniquely named Metric objects")
+        if (
+            not metrics
+            or any(not isinstance(metric, Metric) for metric in metrics)
+            or len({metric.name for metric in metrics}) != len(metrics)
+        ):
+            raise DataContractError(
+                "metrics require a nonempty sequence of uniquely named Metric objects"
+            )
         object.__setattr__(self, "metrics", metrics)
 
     def score(self, target, prediction):
@@ -193,6 +213,7 @@ class MetricFamily:
         Функция ``constructor(parameters)``, создающая ``Metric`` из
         проверенного словаря.
     """
+
     validate: Callable
     constructor: Callable
 
@@ -261,15 +282,20 @@ def build_metrics(specs=None, *, families=None):
     except (TypeError, ValueError) as exc:
         raise DataContractError("metric specs must be finite JSON") from exc
     registry = {
-        "rmse": _builtin("rmse", lambda y, p: np.sqrt(np.mean((p-y)**2))),
-        "mae": _builtin("mae", lambda y, p: np.mean(np.abs(p-y))),
-        "bias": _builtin("bias", lambda y, p: np.mean(p-y)),
-        "mse": _builtin("mse", lambda y, p: np.mean((p-y)**2), "channel_squared"),
+        "rmse": _builtin("rmse", lambda y, p: np.sqrt(np.mean((p - y) ** 2))),
+        "mae": _builtin("mae", lambda y, p: np.mean(np.abs(p - y))),
+        "bias": _builtin("bias", lambda y, p: np.mean(p - y)),
+        "mse": _builtin("mse", lambda y, p: np.mean((p - y) ** 2), "channel_squared"),
     }
     if families is not None:
-        if (type(families) is not dict or set(families) & set(registry) or
-                any(not isinstance(family, MetricFamily) for family in families.values())):
-            raise DataContractError("custom metric families must be explicit and cannot replace built-ins")
+        if (
+            type(families) is not dict
+            or set(families) & set(registry)
+            or any(not isinstance(family, MetricFamily) for family in families.values())
+        ):
+            raise DataContractError(
+                "custom metric families must be explicit and cannot replace built-ins"
+            )
         for name in families:
             text(name, "metric family name")
         registry.update(families)
@@ -322,8 +348,11 @@ def evaluate_metrics(truth, result, *, metrics=None):
     Число ``available`` учитывает доступные прогнозы на целевых точках, включая
     точки без известного ответа; ``scored`` считает точки с обоими значениями.
     """
-    if (not isinstance(truth, EvaluationTruth) or not isinstance(result, ImputationResult) or
-            truth.values.shape != result.prediction.shape):
+    if (
+        not isinstance(truth, EvaluationTruth)
+        or not isinstance(result, ImputationResult)
+        or truth.values.shape != result.prediction.shape
+    ):
         raise DataContractError("evaluation requires bound truth and prediction layouts")
     result.require_binding(truth)
     metrics = build_metrics() if metrics is None else metrics
@@ -337,24 +366,40 @@ def evaluate_metrics(truth, result, *, metrics=None):
     def group(selection, unit):
         """Подсчитать контрольные точки и метрики выбранной группы в её единице."""
         mask = scored[selection]
-        return dict(requested=int(requested[selection].sum()),
-                    known_truth=int(known[selection].sum()),
-                    available=int((requested & result.availability)[selection].sum()),
-                    scored=int(mask.sum()), unit=unit, metric_units=metrics.units(unit),
-                    **metrics.score(truth.values[selection][mask], result.prediction[selection][mask]))
+        return dict(
+            requested=int(requested[selection].sum()),
+            known_truth=int(known[selection].sum()),
+            available=int((requested & result.availability)[selection].sum()),
+            scored=int(mask.sum()),
+            unit=unit,
+            metric_units=metrics.units(unit),
+            **metrics.score(truth.values[selection][mask], result.prediction[selection][mask]),
+        )
 
     by_channel, by_site_channel = [], []
     for channel_index, channel in enumerate(layout["channels"]):
         unit = layout["units"][channel]
-        by_channel.append(dict(channel=channel, **group((slice(None), slice(None), channel_index), unit)))
+        by_channel.append(
+            dict(channel=channel, **group((slice(None), slice(None), channel_index), unit))
+        )
         for site_index, site in enumerate(layout["sites"]):
-            by_site_channel.append(dict(site=site, channel=channel,
-                **group((slice(None), site_index, channel_index), unit)))
+            by_site_channel.append(
+                dict(
+                    site=site,
+                    channel=channel,
+                    **group((slice(None), site_index, channel_index), unit),
+                )
+            )
     if len(by_channel) == 1:
         flat = {key: value for key, value in by_channel[0].items() if key != "channel"}
     else:
-        flat = dict(requested=int(requested.sum()), known_truth=int(known.sum()),
-                    available=int((requested & result.availability).sum()), scored=int(scored.sum()),
-                    unit=None, metric_units={metric.name: None for metric in metrics.metrics},
-                    **{metric.name: None for metric in metrics.metrics})
+        flat = dict(
+            requested=int(requested.sum()),
+            known_truth=int(known.sum()),
+            available=int((requested & result.availability).sum()),
+            scored=int(scored.sum()),
+            unit=None,
+            metric_units={metric.name: None for metric in metrics.metrics},
+            **{metric.name: None for metric in metrics.metrics},
+        )
     return dict(**flat, by_channel=by_channel, by_site_channel=by_site_channel)

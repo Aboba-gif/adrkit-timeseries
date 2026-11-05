@@ -1,4 +1,5 @@
 """Отображения из пользовательских функций с проверкой форм массивов."""
+
 from dataclasses import dataclass
 
 from adrkit.contracts import MapCapabilities, require_capability
@@ -10,6 +11,7 @@ __all__ = ["map_from_functions"]
 @dataclass(frozen=True)
 class _FunctionMap:
     """Внутренний адаптер пользовательских функций к пространствам массивов."""
+
     domain: ArraySpace
     codomain: ArraySpace
     prediction: object
@@ -65,6 +67,10 @@ def map_from_functions(*, domain, codomain, predict, jvp=None, vjp=None):
         if action is not None and not callable(action):
             raise TypeError(f"{name} must be callable or None")
     operation = _FunctionMap(domain, codomain, predict, jvp, vjp)
-    return MapCapabilities(operation, domain, codomain,
-                           operation if jvp is not None else None,
-                           operation if vjp is not None else None)
+    return MapCapabilities(
+        operation,
+        domain,
+        codomain,
+        operation if jvp is not None else None,
+        operation if vjp is not None else None,
+    )

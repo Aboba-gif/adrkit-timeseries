@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 class Predict(Protocol):
     """Прогноз по аргументу отображения."""
+
     def predict(self, x: Any) -> Any:
         """Вычислить прогноз по аргументу.
 
@@ -32,6 +33,7 @@ class Predict(Protocol):
 
 class JVP(Protocol):
     """Действие производной в точке на направление."""
+
     def jvp(self, at: Any, direction: Any) -> Any:
         """Применить производную к направлению.
 
@@ -72,6 +74,7 @@ class VJP(Protocol):
 
 class ScalarValue(Protocol):
     """Значение скалярного функционала."""
+
     def value(self, x: Any) -> float:
         """Вычислить значение функционала.
 
@@ -131,6 +134,7 @@ class ScalarValueAndCotangent(Protocol):
 
 class Prox(Protocol):
     """Проксимальная операция функционала с заданным шагом."""
+
     def prox(self, x: Any, step: float) -> Any:
         """Применить проксимальную операцию с заданным шагом.
 
@@ -205,6 +209,7 @@ class MapCapabilities:
     vjp : VJP or None, optional
         Действие транспонированной производной на ковектор.
     """
+
     predict: Predict
     domain: ArraySpace
     codomain: ArraySpace
@@ -235,6 +240,7 @@ class ScalarCapabilities:
     value_and_cotangent : ScalarValueAndCotangent or None, optional
         Совместная операция; требует также явно заданный cotangent.
     """
+
     value: ScalarValue
     domain: ArraySpace
     cotangent: ScalarCotangent | None = None
@@ -281,3 +287,74 @@ def require_capability(
     if capability is None:
         raise CapabilityError(f"{consumer} requires {operation}")
     return capability
+
+
+def validate_map_capabilities(mapping: MapCapabilities, *, name: str = "mapping") -> None:
+    """Проверить пространства и объявленные операции отображения.
+
+    Parameters
+    ----------
+    mapping : MapCapabilities
+        Запись отображения; необязательные JVP и VJP могут отсутствовать.
+    name : str, optional
+        Имя компонента в сообщениях об ошибках.
+
+    Raises
+    ------
+    TypeError
+        Пространство или объявленная операция не соответствует контракту.
+
+    Notes
+    -----
+    Операции компонента не вызываются; отсутствующие операции не создаются.
+    """
+    # spaces использует MapCapabilities, поэтому импорт выполняется при проверке.
+    from adrkit.spaces import ArraySpace
+
+    if not isinstance(mapping, MapCapabilities):
+        raise TypeError(f"{name} must declare MapCapabilities")
+    if not isinstance(mapping.domain, ArraySpace) or not isinstance(mapping.codomain, ArraySpace):
+        raise TypeError(f"{name} domain and codomain must be ArraySpace records")
+    for method in ("predict", "jvp", "vjp"):
+        operation = getattr(mapping, method)
+        if method == "predict" or operation is not None:
+            if not callable(getattr(operation, method, None)):
+                label = "prediction" if method == "predict" else method.upper()
+                raise TypeError(f"{name} {label} must provide callable {method}()")
+
+
+def validate_scalar_capabilities(
+    functional: ScalarCapabilities, *, name: str = "functional"
+) -> None:
+    """Проверить пространство и объявленные операции скалярного функционала.
+
+    Parameters
+    ----------
+    functional : ScalarCapabilities
+        Запись функционала с необязательными производной, prox и совместной
+        операцией значения и производной.
+    name : str, optional
+        Имя компонента в сообщениях об ошибках.
+
+    Raises
+    ------
+    TypeError
+        Пространство или объявленная операция не соответствует контракту.
+
+    Notes
+    -----
+    Операции компонента не вызываются; отсутствующие операции не создаются.
+    """
+    from adrkit.spaces import ArraySpace
+
+    if not isinstance(functional, ScalarCapabilities):
+        raise TypeError(
+            f"{name} must declare ScalarCapabilities; use .capabilities() for built-ins"
+        )
+    if not isinstance(functional.domain, ArraySpace):
+        raise TypeError(f"{name} domain must be an ArraySpace record")
+    for method in ("value", "cotangent", "prox", "value_and_cotangent"):
+        operation = getattr(functional, method)
+        if method == "value" or operation is not None:
+            if not callable(getattr(operation, method, None)):
+                raise TypeError(f"{name} {method} must provide callable {method}()")

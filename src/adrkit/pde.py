@@ -1,4 +1,5 @@
 """Уравнение и коэффициенты двумерной адвекции, диффузии и реакции."""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
@@ -11,12 +12,12 @@ from adrkit.coefficients import ADRUnits, ReactionLaw, ScalarField, VectorField
 from adrkit.errors import CapabilityError
 from adrkit.state_residuals import StateResidual
 
-
 _Solver = TypeVar("_Solver")
 
 
-def _number(value: object, *, name: str, positive: bool = False,
-            nonnegative: bool = False) -> float:
+def _number(
+    value: object, *, name: str, positive: bool = False, nonnegative: bool = False
+) -> float:
     """Проверить конечное вещественное число и ограничения знака."""
     if isinstance(value, (bool, np.bool_)):
         raise ValueError(f"{name} must be a finite real scalar")
@@ -47,9 +48,15 @@ def _vector(value: object, *, name: str) -> tuple[float, float]:
     return tuple(_number(item, name=name) for item in value)
 
 
-def _coefficient(value: object, *, name: str, vector: bool = False,
-                 positive: bool = False, nonnegative: bool = False,
-                 expected_unit: str | None = None) -> object:
+def _coefficient(
+    value: object,
+    *,
+    name: str,
+    vector: bool = False,
+    positive: bool = False,
+    nonnegative: bool = False,
+    expected_unit: str | None = None,
+) -> object:
     if isinstance(value, ScalarField):
         if vector != isinstance(value, VectorField):
             raise TypeError(f"{name} requires a {'vector' if vector else 'scalar'} field")
@@ -96,8 +103,13 @@ class ADRProblem:
         время решателя.
     units : ADRUnits or None, optional
         Метки согласованных единиц коэффициентов и концентрации.
-    initial_state, background : {0.0}, optional
-        Нулевые начальные данные и граничный фон.
+    initial_state : float, array_like, ScalarField or callable, optional
+        Фиксированная начальная концентрация. Поле вычисляется на сетке
+        при time_origin. Одномерный массив задаётся в порядке solver.xy.
+    boundary_condition : {'dirichlet', 'neumann'}, optional
+        Однородное условие Дирихле либо нулевая нормальная производная.
+    background : {0.0}, optional
+        Нулевой граничный фон.
     diffusion_form : {'divergence'}, optional
         Дивергентная форма диффузии.
     advection_form : {'advective'}, optional
@@ -124,7 +136,9 @@ class ADRProblem:
                  \tanh\!\left(c/c_*(x,t)\right).
 
     Здесь :math:`\gamma,c_*` — `reaction_gamma,reaction_c_star`.
-    Начальные и граничные значения нулевые. Добавочный `StateResidual`
+    Начальное состояние фиксировано и не зависит от источника.
+    Условие Неймана :math:`\partial_n c=0` не означает нулевой полный
+    поток :math:`(vc-D\nabla c)\cdot n`. Добавочный `StateResidual`
     задаётся в дискретной задаче.
     """
 
@@ -139,7 +153,8 @@ class ADRProblem:
     source_position: tuple[float, float] | None = (0.0, 0.0)
     time_origin: float = 0.0
     units: ADRUnits | None = None
-    initial_state: float = 0.0
+    initial_state: object = 0.0
+    boundary_condition: str = "dirichlet"
     background: float = 0.0
     diffusion_form: str = "divergence"
     advection_form: str = "advective"
@@ -149,15 +164,29 @@ class ADRProblem:
             raise TypeError("units must be ADRUnits; labels do not convert values")
         if self.diffusion_form != "divergence" or self.advection_form != "advective":
             raise CapabilityError("ADRProblem implements -div(D grad c) + v dot grad c only")
-        for name, positive in (("horizon", True), ("time_origin", False),
-                               ("initial_state", False), ("background", False)):
-            object.__setattr__(self, name, _number(getattr(self, name), name=name,
-                                                 positive=positive))
-        if self.initial_state != 0 or self.background != 0:
-            raise CapabilityError("ADRProblem implements zero initial state and background only")
+        for name, positive in (("horizon", True), ("time_origin", False), ("background", False)):
+            object.__setattr__(
+                self, name, _number(getattr(self, name), name=name, positive=positive)
+            )
+        if self.background != 0:
+            raise CapabilityError("ADRProblem implements zero boundary background only")
+        if self.boundary_condition not in ("dirichlet", "neumann"):
+            raise CapabilityError("boundary_condition must be 'dirichlet' or 'neumann'")
+        initial = self.initial_state
+        if isinstance(initial, (tuple, list, np.ndarray)) and np.ndim(initial) != 0:
+            array = np.asarray(initial)
+            if array.ndim != 1 or array.dtype.kind not in "iuf" or not np.isfinite(array).all():
+                raise ValueError("initial_state must be a finite real one-dimensional array")
+            initial = np.array(array, dtype=float, copy=True)
+            initial.flags.writeable = False
+        else:
+            unit = None if self.units is None else self.units.concentration
+            initial = _coefficient(initial, name="initial_state", expected_unit=unit)
+        object.__setattr__(self, "initial_state", initial)
         if self.source_position is not None:
-            object.__setattr__(self, "source_position", _vector(self.source_position,
-                                                              name="source_position"))
+            object.__setattr__(
+                self, "source_position", _vector(self.source_position, name="source_position")
+            )
         declarations = (
             ("diffusion", False, True, False, "diffusion"),
             ("velocity", True, False, False, "velocity"),
@@ -167,9 +196,14 @@ class ADRProblem:
         )
         for name, vector, positive, nonnegative, unit in declarations:
             expected = None if self.units is None else getattr(self.units, unit)
-            value = _coefficient(getattr(self, name), name=name, vector=vector,
-                                 positive=positive, nonnegative=nonnegative,
-                                 expected_unit=expected)
+            value = _coefficient(
+                getattr(self, name),
+                name=name,
+                vector=vector,
+                positive=positive,
+                nonnegative=nonnegative,
+                expected_unit=expected,
+            )
             object.__setattr__(self, name, value)
         if self.reaction is not None:
             if not isinstance(self.reaction, ReactionLaw):
@@ -177,20 +211,28 @@ class ADRProblem:
             if self.reaction.pure is not True:
                 raise ValueError("reaction requires the explicit pure=True lifetime contract")
             if self.units is not None:
-                for label, expected in ((self.reaction.unit, self.units.reaction),
-                                        (self.reaction.derivative_unit, self.units.loss)):
+                for label, expected in (
+                    (self.reaction.unit, self.units.reaction),
+                    (self.reaction.derivative_unit, self.units.loss),
+                ):
                     if label is not None and label != expected:
                         raise ValueError(f"Reaction unit {label!r} does not match {expected!r}")
         if self.state_residual is not None:
             if not isinstance(self.state_residual, StateResidual):
                 raise TypeError("state_residual must be an explicit StateResidual")
             if self.state_residual.pure is not True:
-                raise ValueError("state_residual requires the explicit pure=True lifetime contract")
+                raise ValueError(
+                    "state_residual requires the explicit pure=True lifetime contract"
+                )
             if self.units is not None:
-                for label, expected in ((self.state_residual.unit, self.units.reaction),
-                                        (self.state_residual.derivative_unit, self.units.loss)):
+                for label, expected in (
+                    (self.state_residual.unit, self.units.reaction),
+                    (self.state_residual.derivative_unit, self.units.loss),
+                ):
                     if label is not None and label != expected:
-                        raise ValueError(f"StateResidual unit {label!r} does not match {expected!r}")
+                        raise ValueError(
+                            f"StateResidual unit {label!r} does not match {expected!r}"
+                        )
 
     @classmethod
     def from_model(cls, model: Mapping[str, object]) -> ADRProblem:
@@ -225,7 +267,9 @@ class ADRProblem:
         """
         return {item.name: getattr(self, item.name) for item in fields(self)}
 
-    def make_solver(self, factory: Callable[..., _Solver], /, **numerical_options: object) -> _Solver:
+    def make_solver(
+        self, factory: Callable[..., _Solver], /, **numerical_options: object
+    ) -> _Solver:
         """Создать решатель указанной фабрикой.
 
         Parameters

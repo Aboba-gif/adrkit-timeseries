@@ -1,4 +1,5 @@
 """Внешние решатели состояния и совместимость адаптеров решателя в ограниченной области."""
+
 from dataclasses import dataclass
 import threading
 
@@ -42,7 +43,7 @@ def external_solver():
         J(x)h=\cos(u)\odot Ah,\qquad
         J(x)^\mathsf{T}z=A^\mathsf{T}(\cos(u)\odot z).
     """
-    matrix = np.array([[1., 2.], [-.5, .3], [2., -.7]])
+    matrix = np.array([[1.0, 2.0], [-0.5, 0.3], [2.0, -0.7]])
     returned, calls = [], []
 
     def solve(x):
@@ -53,31 +54,39 @@ def external_solver():
         return trajectory
 
     def tangent(trajectory, h):
-        return np.cos(trajectory["u"])*(matrix @ h)
+        return np.cos(trajectory["u"]) * (matrix @ h)
 
     def pullback(trajectory, z):
-        return matrix.T @ (np.cos(trajectory["u"])*z)
+        return matrix.T @ (np.cos(trajectory["u"]) * z)
 
     domain, codomain = spaces()
-    mapping = state_map_from_solver(domain=domain, codomain=codomain,
-        solve=solve, jvp=tangent, vjp=pullback, states=lambda t: t["prediction"])
+    mapping = state_map_from_solver(
+        domain=domain,
+        codomain=codomain,
+        solve=solve,
+        jvp=tangent,
+        vjp=pullback,
+        states=lambda t: t["prediction"],
+    )
     return mapping, returned, calls
 
 
 def test_vector_state_fd_duality_and_fixed_linear_operator():
     mapping, _, calls = external_solver()
     assert not calls
-    at, h = np.array([.2, -.1]), np.array([.7, .3])
-    z = np.array([.1, .2, -.4])
+    at, h = np.array([0.2, -0.1]), np.array([0.7, 0.3])
+    z = np.array([0.1, 0.2, -0.4])
     expected = mapping.predict.predict(at)
     jh, gz = mapping.jvp.jvp(at, h), mapping.vjp.vjp(at, z)
     assert len(calls) == 1
     eps = 1e-6
-    numerical = (mapping.predict.predict(at+eps*h)-mapping.predict.predict(at-eps*h))/(2*eps)
+    numerical = (mapping.predict.predict(at + eps * h) - mapping.predict.predict(at - eps * h)) / (
+        2 * eps
+    )
     np.testing.assert_allclose(jh, numerical, rtol=2e-9, atol=2e-10)
     np.testing.assert_allclose(jh @ z, h @ gz, rtol=1e-13, atol=1e-14)
     linear = mapping.predict.linear_operator(at)
-    mapping.predict.predict(at*3)
+    mapping.predict.predict(at * 3)
     np.testing.assert_array_equal(linear.matvec(h), jh)
     np.testing.assert_array_equal(linear.rmatvec(z), gz)
     assert expected.shape == (3,)
@@ -85,20 +94,20 @@ def test_vector_state_fd_duality_and_fixed_linear_operator():
 
 def test_exact_at_cache_and_trajectory_prediction_ownership():
     mapping, returned, calls = external_solver()
-    at, h = np.array([.2, -.1]), np.array([.7, .3])
+    at, h = np.array([0.2, -0.1]), np.array([0.7, 0.3])
     prediction = mapping.predict.predict(at)
     expected = prediction.copy()
     tangent = mapping.jvp.jvp(at, h)
     linear = mapping.predict.linear_operator(at)
-    returned[0]["u"][:] = 300.
-    returned[0]["prediction"][:] = 400.
-    prediction[:] = -100.
+    returned[0]["u"][:] = 300.0
+    returned[0]["prediction"][:] = 400.0
+    prediction[:] = -100.0
     np.testing.assert_array_equal(mapping.predict.predict(at), expected)
     np.testing.assert_array_equal(mapping.jvp.jvp(at, h), tangent)
     assert len(calls) == 1
     mapping.predict.predict(np.nextafter(at, np.inf))
     assert len(calls) == 2
-    at[:] = 99.
+    at[:] = 99.0
     mapping.predict.predict(at)
     np.testing.assert_array_equal(linear.matvec(h), tangent)
 
@@ -110,8 +119,15 @@ def test_noncallable_callback_rejected_without_evaluation(name):
     def forbidden(*args):
         raise AssertionError("construction must not execute a callback")
 
-    kwargs = dict(domain=domain, codomain=codomain, solve=forbidden,
-                  jvp=forbidden, vjp=forbidden, states=forbidden, copy_trajectory=forbidden)
+    kwargs = dict(
+        domain=domain,
+        codomain=codomain,
+        solve=forbidden,
+        jvp=forbidden,
+        vjp=forbidden,
+        states=forbidden,
+        copy_trajectory=forbidden,
+    )
     kwargs[name] = "not executable"
     with pytest.raises(TypeError, match=name):
         state_map_from_solver(**kwargs)
@@ -149,45 +165,63 @@ def test_derivative_capabilities_are_independent(jvp_present, vjp_present):
 
     def solve(x):
         calls.append(True)
-        return 2*x
+        return 2 * x
 
-    tangent = (lambda trajectory, h: 2*h) if jvp_present else None
-    pullback = (lambda trajectory, z: 2*z) if vjp_present else None
-    mapping = state_map_from_solver(domain=domain, codomain=domain, solve=solve,
-        jvp=tangent, vjp=pullback, states=lambda trajectory: trajectory)
+    tangent = (lambda trajectory, h: 2 * h) if jvp_present else None
+    pullback = (lambda trajectory, z: 2 * z) if vjp_present else None
+    mapping = state_map_from_solver(
+        domain=domain,
+        codomain=domain,
+        solve=solve,
+        jvp=tangent,
+        vjp=pullback,
+        states=lambda trajectory: trajectory,
+    )
     assert (mapping.jvp is not None) == jvp_present
     assert (mapping.vjp is not None) == vjp_present
     with pytest.raises(CapabilityError):
         mapping.predict.linear_operator(np.ones(2))
     assert not calls
-    at, direction = np.array([-1., 2.]), np.array([.3, -.4])
+    at, direction = np.array([-1.0, 2.0]), np.array([0.3, -0.4])
     if jvp_present:
         result = mapping.jvp.jvp(at, direction)
     else:
         result = mapping.vjp.vjp(at, direction)
-    np.testing.assert_array_equal(result, 2*direction)
+    np.testing.assert_array_equal(result, 2 * direction)
     assert calls == [True]
 
 
-@pytest.mark.parametrize("bad", [np.ones(2), np.array([1., np.nan, 0.]), np.ones(3)*1j])
+@pytest.mark.parametrize("bad", [np.ones(2), np.array([1.0, np.nan, 0.0]), np.ones(3) * 1j])
 def test_invalid_state_extraction_is_rejected(bad):
     domain, codomain = spaces()
-    mapping = state_map_from_solver(domain=domain, codomain=codomain,
-                                   solve=lambda x: bad, states=lambda trajectory: trajectory)
+    mapping = state_map_from_solver(
+        domain=domain, codomain=codomain, solve=lambda x: bad, states=lambda trajectory: trajectory
+    )
     with pytest.raises(ValueError):
         mapping.predict.predict(np.ones(2))
 
 
-@pytest.mark.parametrize("operation,bad", [
-    ("jvp", np.ones(2)), ("jvp", np.array([1., np.nan, 0.])), ("jvp", np.ones(3)*1j),
-    ("vjp", np.ones(3)), ("vjp", np.array([1., np.inf])), ("vjp", np.ones(2)*1j),
-])
+@pytest.mark.parametrize(
+    "operation,bad",
+    [
+        ("jvp", np.ones(2)),
+        ("jvp", np.array([1.0, np.nan, 0.0])),
+        ("jvp", np.ones(3) * 1j),
+        ("vjp", np.ones(3)),
+        ("vjp", np.array([1.0, np.inf])),
+        ("vjp", np.ones(2) * 1j),
+    ],
+)
 def test_invalid_derivative_arrays_are_rejected(operation, bad):
     domain, codomain = spaces()
-    mapping = state_map_from_solver(domain=domain, codomain=codomain,
-        solve=lambda x: np.ones(3), states=lambda t: t,
+    mapping = state_map_from_solver(
+        domain=domain,
+        codomain=codomain,
+        solve=lambda x: np.ones(3),
+        states=lambda t: t,
         jvp=lambda trajectory, h: bad if operation == "jvp" else np.ones(3),
-        vjp=lambda trajectory, z: bad if operation == "vjp" else np.ones(2))
+        vjp=lambda trajectory, z: bad if operation == "vjp" else np.ones(2),
+    )
     with pytest.raises(ValueError):
         if operation == "jvp":
             mapping.jvp.jvp(np.ones(2), np.ones(2))
@@ -196,7 +230,8 @@ def test_invalid_derivative_arrays_are_rejected(operation, bad):
     linear = mapping.predict.linear_operator(np.ones(2))
     with pytest.raises(ValueError):
         (linear.matvec if operation == "jvp" else linear.rmatvec)(
-            np.ones(2 if operation == "jvp" else 3))
+            np.ones(2 if operation == "jvp" else 3)
+        )
 
 
 def test_array_arguments_and_derivative_results_are_copied():
@@ -204,23 +239,29 @@ def test_array_arguments_and_derivative_results_are_copied():
     derivative_result = np.ones(2)
 
     def solve(x):
-        x[:] = 5.
+        x[:] = 5.0
         return x
 
     def derivative(trajectory, direction):
-        direction[:] = -8.
+        direction[:] = -8.0
         return derivative_result
 
-    mapping = state_map_from_solver(domain=domain, codomain=domain, solve=solve,
-        states=lambda t: t, jvp=derivative, vjp=derivative)
-    at, h, z = np.ones(2), np.array([2., 3.]), np.array([4., 5.])
-    np.testing.assert_array_equal(mapping.predict.predict(at), [5., 5.])
+    mapping = state_map_from_solver(
+        domain=domain,
+        codomain=domain,
+        solve=solve,
+        states=lambda t: t,
+        jvp=derivative,
+        vjp=derivative,
+    )
+    at, h, z = np.ones(2), np.array([2.0, 3.0]), np.array([4.0, 5.0])
+    np.testing.assert_array_equal(mapping.predict.predict(at), [5.0, 5.0])
     tangent, pullback = mapping.jvp.jvp(at, h), mapping.vjp.vjp(at, z)
     np.testing.assert_array_equal(at, np.ones(2))
-    np.testing.assert_array_equal(h, [2., 3.])
-    np.testing.assert_array_equal(z, [4., 5.])
-    tangent[:] = 9.
-    pullback[:] = 10.
+    np.testing.assert_array_equal(h, [2.0, 3.0])
+    np.testing.assert_array_equal(z, [4.0, 5.0])
+    tangent[:] = 9.0
+    pullback[:] = 10.0
     np.testing.assert_array_equal(derivative_result, np.ones(2))
 
 
@@ -233,41 +274,58 @@ def test_explicit_copy_supports_resource_owning_trajectory_without_freezing_func
 
     domain, _ = spaces()
     copies = []
-    configuration = {"scale": 2.}
+    configuration = {"scale": 2.0}
 
     def solve(x):
-        return Trajectory(x.copy(), configuration["scale"]*x, threading.Lock())
+        return Trajectory(x.copy(), configuration["scale"] * x, threading.Lock())
 
     def copy_data(trajectory):
         copies.append(True)
         return Trajectory(trajectory.point.copy(), trajectory.states.copy(), trajectory.lock)
 
-    mapping = state_map_from_solver(domain=domain, codomain=domain, solve=solve,
-        jvp=lambda t, h: configuration["scale"]*h,
-        vjp=lambda t, z: configuration["scale"]*z, copy_trajectory=copy_data)
+    mapping = state_map_from_solver(
+        domain=domain,
+        codomain=domain,
+        solve=solve,
+        jvp=lambda t, h: configuration["scale"] * h,
+        vjp=lambda t, z: configuration["scale"] * z,
+        copy_trajectory=copy_data,
+    )
     assert not copies
-    np.testing.assert_array_equal(mapping.predict.predict(np.ones(2)), [2., 2.])
+    np.testing.assert_array_equal(mapping.predict.predict(np.ones(2)), [2.0, 2.0])
     linear = mapping.predict.linear_operator(np.ones(2))
     assert len(copies) == 2
     # Объявленные функции остаются у вызывающей стороны; данные траектории копируются.
-    configuration["scale"] = 3.
-    np.testing.assert_array_equal(linear.matvec(np.ones(2)), [3., 3.])
+    configuration["scale"] = 3.0
+    np.testing.assert_array_equal(linear.matvec(np.ones(2)), [3.0, 3.0])
 
 
 def settings(**changes):
-    values = dict(horizon=.2, diffusion=.13, velocity=(.15, -.1),
-                  linear_loss=.04, reaction_gamma=.3, reaction_c_star=.7,
-                  source_position=(0., 0.))
+    values = dict(
+        horizon=0.2,
+        diffusion=0.13,
+        velocity=(0.15, -0.1),
+        linear_loss=0.04,
+        reaction_gamma=0.3,
+        reaction_c_star=0.7,
+        source_position=(0.0, 0.0),
+    )
     values.update(changes)
     return values
 
 
 def bounded_spaces(solver, *, forcing=False):
     coordinates = (solver.times, tuple(map(tuple, solver.xy)))
-    state = ArraySpace((solver.nt+1, solver.size), axes=("time", "node"),
-                       coordinates=coordinates, units="state")
-    domain = state if forcing else ArraySpace((solver.nt+1,), axes=("time",),
-                                              coordinates=(solver.times,), units="input")
+    state = ArraySpace(
+        (solver.nt + 1, solver.size), axes=("time", "node"), coordinates=coordinates, units="state"
+    )
+    domain = (
+        state
+        if forcing
+        else ArraySpace(
+            (solver.nt + 1,), axes=("time",), coordinates=(solver.times,), units="input"
+        )
+    )
     return domain, state
 
 
@@ -291,8 +349,8 @@ def test_bounded_structural_backend_does_not_require_solver_inheritance(forcing)
     mapping = factory(backend, domain=domain, codomain=codomain)
     controls = np.ones(domain.shape)
     expected = (solver.solve_forcing if forcing else solver.solve_controls)(controls).states
-    solver.load[:] = 0.
-    solver.model["diffusion"] = 99.
+    solver.load[:] = 0.0
+    solver.model["diffusion"] = 99.0
     np.testing.assert_array_equal(mapping.predict.predict(controls), expected)
 
 
@@ -300,8 +358,9 @@ def test_bounded_solver_accepts_explicit_problem_without_changing_arithmetic():
     data = settings()
     typed = BoundedSolver(ADRProblem.from_model(data), interior_points=5, time_steps=4)
     reference_solver = BoundedSolver(data, interior_points=5, time_steps=4)
-    np.testing.assert_array_equal(typed.solve_controls(np.ones(5)).states,
-                                  reference_solver.solve_controls(np.ones(5)).states)
+    np.testing.assert_array_equal(
+        typed.solve_controls(np.ones(5)).states, reference_solver.solve_controls(np.ones(5)).states
+    )
 
 
 def test_structural_bounded_metadata_and_methods_fail_before_snapshot_or_solve():
@@ -346,8 +405,12 @@ def test_bounded_declared_units_are_preserved_in_structural_boundary():
     units = ADRUnits("km", "h", "ug/m^3")
     solver = BoundedSolver(settings(units=units), interior_points=5, time_steps=4)
     domain = ArraySpace((5,), axes=("time",), coordinates=(solver.times,), units=units.source)
-    codomain = ArraySpace((5, 25), axes=("time", "node"),
-        coordinates=(solver.times, tuple(map(tuple, solver.xy))), units=units.concentration)
+    codomain = ArraySpace(
+        (5, 25),
+        axes=("time", "node"),
+        coordinates=(solver.times, tuple(map(tuple, solver.xy))),
+        units=units.concentration,
+    )
     mapping = state_map(solver, domain=domain, codomain=codomain)
     assert mapping.domain.units == units.source
     assert mapping.codomain.units == units.concentration
@@ -356,14 +419,26 @@ def test_bounded_declared_units_are_preserved_in_structural_boundary():
 def _snapshot_spaces(solver, *, forcing):
     coordinates = (solver.times, tuple(range(solver.size)))
     units = solver.units
-    states = ArraySpace((solver.nt+1, solver.size), axes=("time", "node"),
-        coordinates=coordinates, units="state" if units is None else units.concentration)
+    states = ArraySpace(
+        (solver.nt + 1, solver.size),
+        axes=("time", "node"),
+        coordinates=coordinates,
+        units="state" if units is None else units.concentration,
+    )
     if forcing:
-        domain = ArraySpace(states.shape, axes=states.axes, coordinates=coordinates,
-                            units="input" if units is None else units.reaction)
+        domain = ArraySpace(
+            states.shape,
+            axes=states.axes,
+            coordinates=coordinates,
+            units="input" if units is None else units.reaction,
+        )
     else:
-        domain = ArraySpace((solver.nt+1,), axes=("time",), coordinates=(solver.times,),
-                            units="input" if units is None else units.source)
+        domain = ArraySpace(
+            (solver.nt + 1,),
+            axes=("time",),
+            coordinates=(solver.times,),
+            units="input" if units is None else units.source,
+        )
     return domain, states
 
 
@@ -396,7 +471,7 @@ def test_compatible_solver_private_backend_is_not_read(forcing):
     domain, codomain = bounded_spaces(solver, forcing=forcing)
     factory = forcing_state_map if forcing else state_map
     mapping = factory(model=CompatibleSolver(), domain=domain, codomain=codomain)
-    at = np.linspace(.1, .5, domain.size).reshape(domain.shape)
+    at = np.linspace(0.1, 0.5, domain.size).reshape(domain.shape)
     direction = np.cos(np.arange(domain.size)).reshape(domain.shape)
     cotangent = np.sin(np.arange(codomain.size)).reshape(codomain.shape)
     solve = solver.solve_forcing if forcing else solver.solve_controls
@@ -443,7 +518,7 @@ def test_snapshot_geometry_is_preserved_for_indexed_nodes(forcing, nested_lists,
     def changed_snapshot():
         snapshot = solver.snapshot()
         if nested_lists:
-            snapshot.xy[0][0] += 1.
+            snapshot.xy[0][0] += 1.0
             if change_original:
                 solver.xy[0][0] = snapshot.xy[0][0]
         else:
@@ -454,16 +529,18 @@ def test_snapshot_geometry_is_preserved_for_indexed_nodes(forcing, nested_lists,
 
     factory = forcing_state_map if forcing else state_map
     with pytest.raises(ValueError, match="snapshot.*geometry"):
-        factory(model=_solver_with_snapshot(solver, changed_snapshot),
-                domain=domain, codomain=codomain)
+        factory(
+            model=_solver_with_snapshot(solver, changed_snapshot), domain=domain, codomain=codomain
+        )
 
 
 @pytest.mark.parametrize("forcing", [False, True])
 @pytest.mark.parametrize("change", ["drop", "length", "declare"])
 def test_snapshot_preserves_the_original_unit_declaration(forcing, change):
     units = ADRUnits("km", "h", "ug/m^3")
-    solver = BoundedSolver(settings(units=None if change == "declare" else units),
-                           interior_points=5, time_steps=4)
+    solver = BoundedSolver(
+        settings(units=None if change == "declare" else units), interior_points=5, time_steps=4
+    )
     if change == "declare":
         declared = BoundedSolver(settings(units=units), interior_points=5, time_steps=4)
         domain, codomain = _snapshot_spaces(declared, forcing=forcing)
@@ -482,8 +559,9 @@ def test_snapshot_preserves_the_original_unit_declaration(forcing, change):
 
     factory = forcing_state_map if forcing else state_map
     with pytest.raises(ValueError, match="unit"):
-        factory(model=_solver_with_snapshot(solver, changed_snapshot),
-                domain=domain, codomain=codomain)
+        factory(
+            model=_solver_with_snapshot(solver, changed_snapshot), domain=domain, codomain=codomain
+        )
 
 
 @pytest.mark.parametrize("forcing", [False, True])
@@ -493,13 +571,14 @@ def test_snapshot_time_nodes_must_match_the_declared_spaces(forcing):
 
     def changed_snapshot():
         snapshot = solver.snapshot()
-        snapshot.times += 1.
+        snapshot.times += 1.0
         return snapshot
 
     factory = forcing_state_map if forcing else state_map
     with pytest.raises(ValueError, match="time nodes"):
-        factory(model=_solver_with_snapshot(solver, changed_snapshot),
-                domain=domain, codomain=codomain)
+        factory(
+            model=_solver_with_snapshot(solver, changed_snapshot), domain=domain, codomain=codomain
+        )
 
 
 @pytest.mark.parametrize("forcing", [False, True])
@@ -515,8 +594,9 @@ def test_indexed_snapshot_accepts_equal_independent_unit_records(forcing):
         return snapshot
 
     factory = forcing_state_map if forcing else state_map
-    mapping = factory(model=_solver_with_snapshot(solver, independent_snapshot),
-                      domain=domain, codomain=codomain)
-    values = np.linspace(.1, .5, domain.size).reshape(domain.shape)
+    mapping = factory(
+        model=_solver_with_snapshot(solver, independent_snapshot), domain=domain, codomain=codomain
+    )
+    values = np.linspace(0.1, 0.5, domain.size).reshape(domain.shape)
     expected = (solver.solve_forcing if forcing else solver.solve_controls)(values).states
     np.testing.assert_array_equal(mapping.predict.predict(values), expected)

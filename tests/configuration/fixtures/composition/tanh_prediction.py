@@ -1,4 +1,5 @@
 """Семейство tanh с явно заданными производными."""
+
 import numpy as np
 
 from adrkit.config import number
@@ -26,20 +27,21 @@ class TanhSurrogate:
 
     где :math:`g` — ``gain``. Функция ``build`` требует безразмерный вход.
     """
+
     def __init__(self, gain):
         self.gain = gain
 
     def predict(self, x):
         """Вычислить покомпонентный гиперболический тангенс."""
-        return np.tanh(self.gain*x)
+        return np.tanh(self.gain * x)
 
     def jvp(self, at, direction):
         """Умножить направление на диагональный якобиан."""
-        return self.gain * (1-self.predict(at)**2) * direction
+        return self.gain * (1 - self.predict(at) ** 2) * direction
 
     def vjp(self, at, cotangent):
         """Умножить ковектор на транспонированный диагональный якобиан."""
-        return self.gain * (1-self.predict(at)**2) * cotangent
+        return self.gain * (1 - self.predict(at) ** 2) * cotangent
 
 
 def validate(p, *, partial):
@@ -58,10 +60,13 @@ def build(p, domain):
     if domain.units != "1":
         raise ValueError("this tanh diagnostic requires dimensionless inputs")
     operation = TanhSurrogate(p["gain"])
-    return MapCapabilities(operation, domain, domain,
+    return MapCapabilities(
+        operation,
+        domain,
+        domain,
         operation if p["capabilities"] in ("jvp", "jvp_vjp") else None,
-        operation if p["capabilities"] == "jvp_vjp" else None)
+        operation if p["capabilities"] == "jvp_vjp" else None,
+    )
 
 
 FAMILIES = {"surrogate": {"tanh": Family(validate, build)}}
-

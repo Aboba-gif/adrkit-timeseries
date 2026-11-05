@@ -1,4 +1,5 @@
 """Разложения ковариаций и матриц Грама."""
+
 import numpy as np
 from scipy.linalg import cholesky, solve_triangular
 
@@ -58,9 +59,8 @@ def whiten(A, y, Sigma):
     """
     factor = _spd_factor(Sigma, A.shape[0], "Sigma")
     if factor.ndim == 1:
-        return A/factor[:, None], y/factor
-    return (solve_triangular(factor, A, lower=True),
-            solve_triangular(factor, y, lower=True))
+        return A / factor[:, None], y / factor
+    return (solve_triangular(factor, A, lower=True), solve_triangular(factor, y, lower=True))
 
 
 def gram_root(M, size):

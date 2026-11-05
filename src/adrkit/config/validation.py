@@ -12,8 +12,9 @@ from typing import Any
 from adrkit.errors import ConfigError
 
 
-def closed_object(value: Any, allowed: set[str], required: set[str] = frozenset(),
-                  *, where: str = "object") -> dict:
+def closed_object(
+    value: Any, allowed: set[str], required: set[str] = frozenset(), *, where: str = "object"
+) -> dict:
     """Проверить разрешённые и обязательные ключи JSON-объекта.
 
     Parameters
@@ -88,8 +89,9 @@ def integer(value: Any, *, minimum: int | None = None, where: str = "integer") -
     return value
 
 
-def number(value: Any, *, minimum: float | None = None,
-           positive: bool = False, where: str = "number") -> float:
+def number(
+    value: Any, *, minimum: float | None = None, positive: bool = False, where: str = "number"
+) -> float:
     """Преобразовать конечное число JSON к float.
 
     Parameters
@@ -175,8 +177,13 @@ def canonical_bytes(value: Any) -> bytes:
     Оба знака вещественного нуля нормализуются к 0.0.
     """
     try:
-        return json.dumps(_json_value(value), sort_keys=True, separators=(",", ":"),
-                          ensure_ascii=False, allow_nan=False).encode("utf-8")
+        return json.dumps(
+            _json_value(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
     except (ValueError, UnicodeError, RecursionError) as exc:
         raise ConfigError(f"invalid canonical JSON: {exc}") from exc
 
@@ -211,6 +218,7 @@ def strict_json(data: bytes | str) -> Any:
         Скаляр, список или словарь; некорректный ввод вызывает
         ConfigError.
     """
+
     def pairs(items: list[tuple[str, Any]]) -> dict:
         result = {}
         for key, val in items:

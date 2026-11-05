@@ -1,4 +1,5 @@
 """Штрафы коэффициентов и явно заданные метрики Рисса."""
+
 import numpy as np
 from scipy.linalg import cho_factor, cho_solve
 
@@ -29,8 +30,8 @@ def p1_matrices(basis):
     mass = np.zeros((basis.size, basis.size))
     stiffness = np.zeros_like(mass)
     for j, h in enumerate(np.diff(basis.knots)):
-        mass[j:j+2, j:j+2] += h/6*np.array([[2., 1.], [1., 2.]])
-        stiffness[j:j+2, j:j+2] += np.array([[1., -1.], [-1., 1.]])/h
+        mass[j : j + 2, j : j + 2] += h / 6 * np.array([[2.0, 1.0], [1.0, 2.0]])
+        stiffness[j : j + 2, j : j + 2] += np.array([[1.0, -1.0], [-1.0, 1.0]]) / h
     return mass, stiffness
 
 
@@ -63,6 +64,7 @@ class QuadraticPenalty:
     Собственные значения проверяются у симметричной части матрицы,
     определяющей квадратичную форму.
     """
+
     def __init__(self, center, gram, alpha):
         if np.iscomplexobj(center) or np.iscomplexobj(gram):
             raise ValueError("Penalty coordinates must be real")
@@ -94,7 +96,7 @@ class QuadraticPenalty:
         x = real_array(x, name="Penalty input")
         if x.shape != self._center.shape or not np.isfinite(x).all():
             raise ValueError("Penalty input must match center")
-        return x-self._center
+        return x - self._center
 
     def value(self, x):
         """Вычислить квадратичный штраф коэффициентов.
@@ -110,7 +112,7 @@ class QuadraticPenalty:
             Значение с включённым весом alpha.
         """
         d = self._difference(x)
-        return .5*self.alpha*float(d @ self._gram @ d)
+        return 0.5 * self.alpha * float(d @ self._gram @ d)
 
     def cotangent(self, x):
         """Вычислить координатный ковектор штрафа.
@@ -126,7 +128,7 @@ class QuadraticPenalty:
             Ковектор той же формы, что center.
         """
         d = self._difference(x)
-        return self.alpha*(self._gram @ d)
+        return self.alpha * (self._gram @ d)
 
     def capabilities(self, domain):
         """Объявить штраф на пространстве коэффициентов.
@@ -161,6 +163,7 @@ class CoefficientMetric:
     apply применяет матрицу метрики; solve преобразует
     координатный ковектор в градиент Рисса.
     """
+
     def __init__(self, gram, *, domain):
         if np.iscomplexobj(gram):
             raise ValueError("Coefficient metric must be real")
@@ -233,7 +236,7 @@ class CoefficientMetric:
         return cho_solve(self._factor, g.ravel()).reshape(self.domain.shape)
 
 
-def build_penalty(kind, basis, center, alpha, *, tau=0., domain):
+def build_penalty(kind, basis, center, alpha, *, tau=0.0, domain):
     r"""Построить временной штраф L² или H¹ для P1.
 
     Parameters
@@ -276,5 +279,5 @@ def build_penalty(kind, basis, center, alpha, *, tau=0., domain):
     if kind == "l2" and tau != 0:
         raise ValueError("L2 does not use a temporal derivative scale")
     mass, stiffness = p1_matrices(basis)
-    gram = mass if kind == "l2" else mass+tau**2*stiffness
+    gram = mass if kind == "l2" else mass + tau**2 * stiffness
     return QuadraticPenalty(center, gram, alpha).capabilities(domain)

@@ -11,7 +11,12 @@ from typing import Callable
 
 from adrkit.errors import ConfigError
 from .validation import (
-    JSONRecord, closed_object, digest, sha256, strict_json, string,
+    JSONRecord,
+    closed_object,
+    digest,
+    sha256,
+    strict_json,
+    string,
 )
 
 SCHEMA_VERSION = "adrkit.experiment/1"
@@ -28,6 +33,7 @@ class ValidationContext:
     complete_paths : tuple of str, optional
         JSON Pointer объектов, которые должны проверяться как полные.
     """
+
     partial: bool
     complete_paths: tuple[str, ...] = ()
 
@@ -103,6 +109,7 @@ class ConfigDocument:
     anchor : str or None
         Корень разрешения относительного исходного имени.
     """
+
     ordinal: int
     locator: str
     sha256: str
@@ -125,6 +132,7 @@ class ResourceBinding:
     sha256 : str
         Ожидаемая SHA-256 содержимого.
     """
+
     pointer: str
     locator: str
     sha256: str
@@ -177,9 +185,13 @@ class EffectiveConfig:
         record : JSONRecord
             Действующие параметры, их научная SHA-256 и provenance.
         """
-        return JSONRecord({"effective_config": self.to_dict(),
-                           "effective_science_sha256": self.effective_science_sha256,
-                           "provenance": self.provenance.to_dict()})
+        return JSONRecord(
+            {
+                "effective_config": self.to_dict(),
+                "effective_science_sha256": self.effective_science_sha256,
+                "provenance": self.provenance.to_dict(),
+            }
+        )
 
 
 def _tokens(pointer: str) -> list[str]:
@@ -304,17 +316,31 @@ def read_configs(files, *, config_root: str | Path | None = None) -> tuple[Confi
             raise ConfigError(f"cannot read config: {locator}") from exc
         tree = strict_json(data)
         _envelope(tree, first=ordinal == 0)
-        documents.append(ConfigDocument(ordinal, locator, hashlib.sha256(data).hexdigest(),
-                                        tree.get("document_role", "config"), JSONRecord(tree),
-                                        str(raw), root))
+        documents.append(
+            ConfigDocument(
+                ordinal,
+                locator,
+                hashlib.sha256(data).hexdigest(),
+                tree.get("document_role", "config"),
+                JSONRecord(tree),
+                str(raw),
+                root,
+            )
+        )
     if not documents:
         raise ConfigError("at least one config is required")
     return tuple(documents)
 
 
 def _envelope(tree: dict, *, first: bool) -> None:
-    fields = {"schema_version", "pipeline", "science_schema_version", "science",
-              "execution", "document_role"}
+    fields = {
+        "schema_version",
+        "pipeline",
+        "science_schema_version",
+        "science",
+        "execution",
+        "document_role",
+    }
     required = {"schema_version"}
     if first:
         required |= {"pipeline", "science_schema_version"}
@@ -352,8 +378,9 @@ def _leaves(value, pointer=""):
         yield pointer
 
 
-def compose_config(documents, *, schema: ScienceSchema, overrides=(), config_root=None,
-                   output_root=None) -> EffectiveConfig:
+def compose_config(
+    documents, *, schema: ScienceSchema, overrides=(), config_root=None, output_root=None
+) -> EffectiveConfig:
     """Объединить конфигурационные документы по заданной схеме.
 
     Parameters
@@ -405,8 +432,14 @@ def compose_config(documents, *, schema: ScienceSchema, overrides=(), config_roo
             origins[key] = dict(origin)
 
     def replacement(old, new, pointer, origin, *, existed):
-        history.append({"pointer": pointer, "old_sha256": digest(old) if existed else None,
-                        "new_sha256": digest(new), "origin": dict(origin)})
+        history.append(
+            {
+                "pointer": pointer,
+                "old_sha256": digest(old) if existed else None,
+                "new_sha256": digest(new),
+                "origin": dict(origin),
+            }
+        )
         assign_origin(new, pointer, origin)
         return new
 
@@ -434,8 +467,10 @@ def compose_config(documents, *, schema: ScienceSchema, overrides=(), config_roo
         _envelope(tree, first=True)
         if tree["pipeline"] != schema.pipeline or tree["science_schema_version"] != schema.version:
             raise ConfigError("pipeline/science schema mismatch or changed version")
-        science = schema.normalize(JSONRecord(tree.get("science", {})).to_dict(),
-                                   ValidationContext(partial, tuple(complete)))
+        science = schema.normalize(
+            JSONRecord(tree.get("science", {})).to_dict(),
+            ValidationContext(partial, tuple(complete)),
+        )
         if type(science) is not dict:
             raise ConfigError("science validator must return an object")
         JSONRecord(science)
@@ -449,7 +484,9 @@ def compose_config(documents, *, schema: ScienceSchema, overrides=(), config_roo
         if len({p.pointer for p in paths}) != len(paths):
             raise ConfigError("duplicate resource locator declaration")
         for item in paths:
-            if not item.pointer.startswith("/science/") or not item.sha256_pointer.startswith("/science/"):
+            if not item.pointer.startswith("/science/") or not item.sha256_pointer.startswith(
+                "/science/"
+            ):
                 raise ConfigError("science resource pointers must be within /science")
         return paths
 
@@ -475,8 +512,13 @@ def compose_config(documents, *, schema: ScienceSchema, overrides=(), config_roo
         for key in ("schema_version", "pipeline", "science_schema_version"):
             if key in content and key in tree and content[key] != tree[key]:
                 raise ConfigError(f"immutable envelope field changed: {key}")
-        origin = {"kind": "file", "ordinal": ordinal, "locator": doc.locator,
-                  "sha256": doc.sha256, "anchor": str(Path(doc.locator).parent)}
+        origin = {
+            "kind": "file",
+            "ordinal": ordinal,
+            "locator": doc.locator,
+            "sha256": doc.sha256,
+            "anchor": str(Path(doc.locator).parent),
+        }
         complete = []
         tree = merge(tree, content, "", origin, complete)
         normalize(partial=True, complete=complete)
@@ -487,8 +529,9 @@ def compose_config(documents, *, schema: ScienceSchema, overrides=(), config_roo
         for key, value in declared.items():
             ptr = _pointer(pointer, key)
             if key not in current:
-                current[key] = replacement(None, value, ptr,
-                    {"kind": "default", "anchor": None}, existed=False)
+                current[key] = replacement(
+                    None, value, ptr, {"kind": "default", "anchor": None}, existed=False
+                )
             elif type(current[key]) is dict and type(value) is dict:
                 defaults(current[key], value, ptr)
 
@@ -503,7 +546,9 @@ def compose_config(documents, *, schema: ScienceSchema, overrides=(), config_roo
         ptr, raw = spec.split("=", 1)
         tokens = _tokens(ptr)
         if tokens[0] not in ("science", "execution") or tokens[-1] == "kind":
-            raise ConfigError("override requires a science/execution field; replace the full kind spec")
+            raise ConfigError(
+                "override requires a science/execution field; replace the full kind spec"
+            )
         parsed.append((index, ptr, raw, strict_json(raw)))
     if output_root is not None and any(
         p == "/execution" or p == "/execution/output_root" for _, p, _, _ in parsed
@@ -532,8 +577,10 @@ def compose_config(documents, *, schema: ScienceSchema, overrides=(), config_roo
     normalize(partial=False)
     check_paths()
 
-    projection = {key: JSONRecord(tree[key]).to_value()
-                  for key in ("schema_version", "pipeline", "science_schema_version", "science")}
+    projection = {
+        key: JSONRecord(tree[key]).to_value()
+        for key in ("schema_version", "pipeline", "science_schema_version", "science")
+    }
     paths = locators()
     resolved, bindings = {}, []
     for path in paths:
@@ -541,7 +588,11 @@ def compose_config(documents, *, schema: ScienceSchema, overrides=(), config_roo
         raw = _get(tree, path.pointer)
         origin = origins[path.pointer]
         locator = resolve_locator(raw, anchor=origin.get("anchor"))
-        resolved[path.pointer] = {"original": raw, "anchor": origin.get("anchor"), "resolved": locator}
+        resolved[path.pointer] = {
+            "original": raw,
+            "anchor": origin.get("anchor"),
+            "resolved": locator,
+        }
         _set(tree, path.pointer, locator, arrays=True)
         if path.pointer.startswith("/science/"):
             _set(projection, path.pointer, {"content_sha256": expected}, arrays=True)
@@ -558,18 +609,41 @@ def compose_config(documents, *, schema: ScienceSchema, overrides=(), config_roo
     inputs = [d.locator for d in documents] + [b.locator for b in bindings]
     if out is not None and out in inputs:
         raise ConfigError("output_root collides with an input locator")
-    return EffectiveConfig(JSONRecord(tree), JSONRecord(projection), JSONRecord({
-        "inputs": [{"ordinal": d.ordinal, "locator": d.locator, "sha256": d.sha256,
-                    "original": d.original, "anchor": d.anchor,
-                    "document_role": d.document_role} for d in documents],
-        "overrides": cli, "origins": origins, "replacements": history, "paths": resolved,
-        "canonicalization": {"version": "adrkit-json/1", "python": platform.python_version(),
-                             "serializer": "stdlib.json", "unicode_normalization": "none"},
-    }), tuple(bindings))
+    return EffectiveConfig(
+        JSONRecord(tree),
+        JSONRecord(projection),
+        JSONRecord(
+            {
+                "inputs": [
+                    {
+                        "ordinal": d.ordinal,
+                        "locator": d.locator,
+                        "sha256": d.sha256,
+                        "original": d.original,
+                        "anchor": d.anchor,
+                        "document_role": d.document_role,
+                    }
+                    for d in documents
+                ],
+                "overrides": cli,
+                "origins": origins,
+                "replacements": history,
+                "paths": resolved,
+                "canonicalization": {
+                    "version": "adrkit-json/1",
+                    "python": platform.python_version(),
+                    "serializer": "stdlib.json",
+                    "unicode_normalization": "none",
+                },
+            }
+        ),
+        tuple(bindings),
+    )
 
 
-def load_config(files, *, schema: ScienceSchema, overrides=(), config_root=None,
-                output_root=None) -> EffectiveConfig:
+def load_config(
+    files, *, schema: ScienceSchema, overrides=(), config_root=None, output_root=None
+) -> EffectiveConfig:
     """Прочитать и объединить конфигурации заданной схемы.
 
     Parameters
@@ -592,8 +666,13 @@ def load_config(files, *, schema: ScienceSchema, overrides=(), config_root=None,
     config : EffectiveConfig
         Действующая конфигурация с происхождением и ресурсами.
     """
-    return compose_config(read_configs(files, config_root=config_root), schema=schema,
-                          overrides=overrides, config_root=config_root, output_root=output_root)
+    return compose_config(
+        read_configs(files, config_root=config_root),
+        schema=schema,
+        overrides=overrides,
+        config_root=config_root,
+        output_root=output_root,
+    )
 
 
 def verify_resources(config: EffectiveConfig) -> tuple[ResourceBinding, ...]:

@@ -1,11 +1,16 @@
 """Научные входы и каталог результатов в общей JSON-конфигурации."""
+
 import hashlib
 import json
 
 import pytest
 
 from adrkit.config import (
-    ResourcePath, ScienceSchema, closed_object, load_config, number,
+    ResourcePath,
+    ScienceSchema,
+    closed_object,
+    load_config,
+    number,
     verify_resources,
 )
 from adrkit.errors import ConfigError
@@ -19,8 +24,11 @@ def schema():
         if "gain" in result:
             result["gain"] = number(result["gain"])
         if "data" in result:
-            closed_object(result["data"], {"path", "sha256"},
-                          set() if context.partial else {"path", "sha256"})
+            closed_object(
+                result["data"],
+                {"path", "sha256"},
+                set() if context.partial else {"path", "sha256"},
+            )
         return result
 
     def resources(science):
@@ -67,20 +75,33 @@ def test_input_and_output_paths_keep_their_file_origins(tmp_path, monkeypatch):
     raw = b"time,value\n0,1\n1,2\n"
     source = base / "data.csv"
     source.write_bytes(raw)
-    path = write_config(base / "config.json", science={
-        "gain": 2, "data": {"path": "data.csv", "sha256": hashlib.sha256(raw).hexdigest()},
-    })
+    path = write_config(
+        base / "config.json",
+        science={
+            "gain": 2,
+            "data": {"path": "data.csv", "sha256": hashlib.sha256(raw).hexdigest()},
+        },
+    )
     addition = overlay / "output.json"
-    addition.write_text(json.dumps({
-        "schema_version": "adrkit.experiment/1", "document_role": "config",
-        "execution": {"output_root": "results"},
-    }), encoding="utf-8")
+    addition.write_text(
+        json.dumps(
+            {
+                "schema_version": "adrkit.experiment/1",
+                "document_role": "config",
+                "execution": {"output_root": "results"},
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.chdir(tmp_path)
     config = load_config([path, addition], schema=schema())
     assert config.resources[0].locator == str(source)
     assert config.to_dict()["execution"] == {"output_root": str(overlay / "results")}
     assert verify_resources(config) == config.resources
-    assert [d["document_role"] for d in config.provenance.to_dict()["inputs"]] == ["config", "config"]
+    assert [d["document_role"] for d in config.provenance.to_dict()["inputs"]] == [
+        "config",
+        "config",
+    ]
     source.write_bytes(b"changed source")
     with pytest.raises(ConfigError, match="resource content mismatch"):
         verify_resources(config)
@@ -89,21 +110,36 @@ def test_input_and_output_paths_keep_their_file_origins(tmp_path, monkeypatch):
 def test_output_path_cannot_replace_a_scientific_input(tmp_path):
     source = tmp_path / "data.csv"
     source.write_bytes(b"0,1\n")
-    path = write_config(tmp_path / "config.json", science={
-        "gain": 2, "data": {
-            "path": source.name, "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    path = write_config(
+        tmp_path / "config.json",
+        science={
+            "gain": 2,
+            "data": {
+                "path": source.name,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            },
         },
-    })
+    )
     with pytest.raises(ConfigError, match="collides with an input locator"):
         load_config([path], schema=schema(), output_root=source)
 
 
-@pytest.mark.parametrize("field,value", [
-    ("schema_version", "adrkit.execution/1"), ("profile", "local"),
-    ("workers", 1), ("threads", 1), ("limits", None), ("input_root", None),
-    ("replay_source", None), ("resume", None), ("environment_receipt", None),
-    ("implementation_receipt", None), ("budget_reference", None),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("schema_version", "adrkit.execution/1"),
+        ("profile", "local"),
+        ("workers", 1),
+        ("threads", 1),
+        ("limits", None),
+        ("input_root", None),
+        ("replay_source", None),
+        ("resume", None),
+        ("environment_receipt", None),
+        ("implementation_receipt", None),
+        ("budget_reference", None),
+    ],
+)
 def test_unknown_execution_fields_are_rejected(tmp_path, field, value):
     path = write_config(tmp_path / "config.json", execution={field: value})
     with pytest.raises(ConfigError, match="execution: unknown"):
@@ -126,24 +162,36 @@ def test_execution_profile_is_not_a_config_document(tmp_path):
 def test_unknown_execution_prefix_cannot_be_repaired(tmp_path):
     path = write_config(tmp_path / "config.json", execution={"workers": 1})
     overlay = tmp_path / "overlay.json"
-    overlay.write_text(json.dumps({"schema_version": "adrkit.experiment/1",
-                                   "execution": {"output_root": None}}), encoding="utf-8")
+    overlay.write_text(
+        json.dumps({"schema_version": "adrkit.experiment/1", "execution": {"output_root": None}}),
+        encoding="utf-8",
+    )
     with pytest.raises(ConfigError, match="execution: unknown"):
         load_config([path, overlay], schema=schema())
 
 
 def test_complete_output_override_and_conflict(tmp_path):
     path = write_config(tmp_path / "config.json")
-    config = load_config([path], schema=schema(), overrides=[
-        '/execution={"output_root":"results"}',
-    ], config_root=tmp_path)
+    config = load_config(
+        [path],
+        schema=schema(),
+        overrides=[
+            '/execution={"output_root":"results"}',
+        ],
+        config_root=tmp_path,
+    )
     assert config.to_dict()["execution"] == {"output_root": str(tmp_path / "results")}
     with pytest.raises(ConfigError, match="conflicts"):
-        load_config([path], schema=schema(), overrides=[
-            '/execution={"output_root":null}',
-        ], output_root=tmp_path / "another")
+        load_config(
+            [path],
+            schema=schema(),
+            overrides=[
+                '/execution={"output_root":null}',
+            ],
+            output_root=tmp_path / "another",
+        )
     with pytest.raises(ConfigError, match="missing"):
-        load_config([path], schema=schema(), overrides=['/execution={}'])
+        load_config([path], schema=schema(), overrides=["/execution={}"])
 
 
 @pytest.mark.parametrize("literal", ["$SOURCE", "~", "[ab]", "closing]"])
@@ -155,11 +203,16 @@ def test_literal_paths_keep_file_overlay_and_cli_anchors(tmp_path, monkeypatch, 
     raw = b"time,value\n0,1\n1,2\n"
     source.write_bytes(raw)
     relative_source = f"{literal}/data.csv"
-    config_path = write_config(base / "config.json", science={
-        "gain": 2, "data": {
-            "path": relative_source, "sha256": hashlib.sha256(raw).hexdigest(),
+    config_path = write_config(
+        base / "config.json",
+        science={
+            "gain": 2,
+            "data": {
+                "path": relative_source,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            },
         },
-    })
+    )
     expanded = anchor / "expanded"
     expanded.mkdir()
     write_config(expanded / "config.json", science={"gain": 99})
@@ -182,28 +235,42 @@ def test_literal_paths_keep_file_overlay_and_cli_anchors(tmp_path, monkeypatch, 
     assert anchored.resources[0].locator == str(source)
     assert verify_resources(anchored) == anchored.resources
     assert anchored.provenance.to_dict()["paths"]["/science/data/path"] == {
-        "original": relative_source, "anchor": str(base), "resolved": str(source),
+        "original": relative_source,
+        "anchor": str(base),
+        "resolved": str(source),
     }
 
     overlay = tmp_path / "overlay"
     overlay.mkdir()
     addition = overlay / "output.json"
-    addition.write_text(json.dumps({
-        "schema_version": "adrkit.experiment/1",
-        "execution": {"output_root": f"{literal}/results"},
-    }), encoding="utf-8")
+    addition.write_text(
+        json.dumps(
+            {
+                "schema_version": "adrkit.experiment/1",
+                "execution": {"output_root": f"{literal}/results"},
+            }
+        ),
+        encoding="utf-8",
+    )
     overlaid = load_config([config_path, addition], schema=schema())
     assert overlaid.to_dict()["execution"]["output_root"] == str(overlay / literal / "results")
     assert not (overlay / literal / "results").exists()
 
-    cli = load_config([config_path], schema=schema(), config_root=base,
-        overrides=['/science/data/path=' + json.dumps(relative_source)],
-        output_root=f"{literal}/cli-results")
+    cli = load_config(
+        [config_path],
+        schema=schema(),
+        config_root=base,
+        overrides=["/science/data/path=" + json.dumps(relative_source)],
+        output_root=f"{literal}/cli-results",
+    )
     assert cli.resources[0].locator == str(source)
     assert verify_resources(cli) == cli.resources
     assert cli.provenance.to_dict()["origins"]["/science/data/path"]["kind"] == "cli"
     assert cli.to_dict()["execution"]["output_root"] == str(base / literal / "cli-results")
     assert not (base / literal / "cli-results").exists()
     assert direct.effective_science_sha256 == anchored.effective_science_sha256
-    assert direct.effective_science_sha256 == overlaid.effective_science_sha256 == cli.effective_science_sha256
-
+    assert (
+        direct.effective_science_sha256
+        == overlaid.effective_science_sha256
+        == cli.effective_science_sha256
+    )

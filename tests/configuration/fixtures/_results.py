@@ -1,4 +1,5 @@
 """Запись результатов конфигурационных тестов."""
+
 import json
 from pathlib import Path
 
@@ -17,7 +18,10 @@ def write_report(config, report, destination):
     if destination is None:
         return
     payloads = {"result.json": report, "config-record.json": config.to_record().to_dict()}
-    encoded = {name: json.dumps(value, indent=2, allow_nan=False) + "\n" for name, value in payloads.items()}
+    encoded = {
+        name: json.dumps(value, indent=2, allow_nan=False) + "\n"
+        for name, value in payloads.items()
+    }
     destination.mkdir(parents=True, exist_ok=False)
     for name, content in encoded.items():
         (destination / name).write_text(content, encoding="utf-8")

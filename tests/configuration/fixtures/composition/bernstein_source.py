@@ -1,4 +1,5 @@
 """Семейство источника в базисе Бернштейна."""
+
 from math import comb
 
 import numpy as np
@@ -32,6 +33,7 @@ class BernsteinBasis:
         b_j(t) = \binom{n}{j}s^j(1-s)^{n-j},\qquad
         s = \frac{t-t_0}{t_1-t_0},\quad j=0,\ldots,n.
     """
+
     def __init__(self, degree, interval, time_unit):
         self.size = degree + 1
         self.interval = tuple(interval)
@@ -56,7 +58,7 @@ class BernsteinBasis:
         """
         t = (np.asarray(times) - self.interval[0]) / (self.interval[1] - self.interval[0])
         n = self.size - 1
-        return np.column_stack([comb(n, j) * t**j * (1-t)**(n-j) for j in range(n+1)])
+        return np.column_stack([comb(n, j) * t**j * (1 - t) ** (n - j) for j in range(n + 1)])
 
 
 class UserTruth:
@@ -70,15 +72,20 @@ class UserTruth:
 
         q(t) = 1 + t - \frac{t^2}{2}.
     """
+
     def value(self, times):
         """Вычислить заданный профиль в переданные моменты времени."""
         t = np.asarray(times)
-        return 1 + t - t*t/2
+        return 1 + t - t * t / 2
 
 
 def validate(p, *, partial):
     """Проверить параметры семейства с учётом допустимости неполной конфигурации."""
-    fields(p, {"degree", "interval", "times", "time_unit", "coefficient_unit", "value_unit", "scale"}, partial=partial)
+    fields(
+        p,
+        {"degree", "interval", "times", "time_unit", "coefficient_unit", "value_unit", "scale"},
+        partial=partial,
+    )
     p = dict(p)
     if "degree" in p:
         integer(p["degree"], minimum=1)
@@ -90,7 +97,9 @@ def validate(p, *, partial):
     if "times" in p:
         if any(a >= b for a, b in zip(p["times"], p["times"][1:])):
             raise ValueError("times must be strictly increasing")
-        if "interval" in p and (p["times"][0] < p["interval"][0] or p["times"][-1] > p["interval"][1]):
+        if "interval" in p and (
+            p["times"][0] < p["interval"][0] or p["times"][-1] > p["interval"][1]
+        ):
             raise ValueError("times outside Bernstein interval")
     for key in ("time_unit", "coefficient_unit", "value_unit"):
         if key in p:
@@ -103,11 +112,18 @@ def validate(p, *, partial):
 def build(p):
     """Собрать базис Бернштейна и отображение его значений в заданные моменты."""
     basis = BernsteinBasis(p["degree"], p["interval"], p["time_unit"])
-    domain = ArraySpace((basis.size,), axes=("bernstein_coefficient",),
-                        coordinates=(tuple(range(basis.size)),), units=p["coefficient_unit"])
-    codomain = ArraySpace((len(p["times"]),), axes=("time",), coordinates=(p["times"],), units=p["value_unit"])
-    return basis, sampled_source_map(basis, p["times"], scale=p["scale"], domain=domain, codomain=codomain)
+    domain = ArraySpace(
+        (basis.size,),
+        axes=("bernstein_coefficient",),
+        coordinates=(tuple(range(basis.size)),),
+        units=p["coefficient_unit"],
+    )
+    codomain = ArraySpace(
+        (len(p["times"]),), axes=("time",), coordinates=(p["times"],), units=p["value_unit"]
+    )
+    return basis, sampled_source_map(
+        basis, p["times"], scale=p["scale"], domain=domain, codomain=codomain
+    )
 
 
 FAMILIES = {"source": {"bernstein": Family(validate, build)}}
-

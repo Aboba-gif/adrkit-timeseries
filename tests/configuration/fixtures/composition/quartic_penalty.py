@@ -1,4 +1,5 @@
 """Семейство четвертичного штрафа."""
+
 import numpy as np
 
 from adrkit.config import number
@@ -26,17 +27,18 @@ class QuarticPenalty:
         R(x) = \frac{\alpha}{4}\sum_{i=0}^{n-1}(x_i-c_i)^4,
         \qquad (dR(x))_i = \alpha(x_i-c_i)^3.
     """
+
     def __init__(self, center, alpha):
         self.center = np.array(center, copy=True)
         self.alpha = alpha
 
     def value(self, x):
         """Вычислить значение четвертичного штрафа."""
-        return self.alpha * float(np.sum((x-self.center)**4)) / 4
+        return self.alpha * float(np.sum((x - self.center) ** 4)) / 4
 
     def cotangent(self, x):
         """Вычислить координатный ковектор четвертичного штрафа."""
-        return self.alpha * (x-self.center)**3
+        return self.alpha * (x - self.center) ** 3
 
 
 def validate(p, *, partial):
@@ -57,4 +59,3 @@ def build(p, basis, domain):
 
 
 FAMILIES = {"regularizer": {"quartic": Family(validate, build)}}
-

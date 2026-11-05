@@ -1,10 +1,178 @@
-"""Базис источника P1 и линейные отображения коэффициентов."""
+"""Временные базисы источника и линейные отображения коэффициентов."""
+
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.special import erf
 
 from adrkit.coefficients import is_scalar_constant
 from adrkit.spaces import matrix_map
+
+
+def _integration_endpoints(left, right):
+    if np.iscomplexobj(left) or np.iscomplexobj(right):
+        raise ValueError("Integration endpoints must be real")
+    left, right = np.broadcast_arrays(
+        np.asarray(left, dtype=float), np.asarray(right, dtype=float)
+    )
+    if not np.isfinite(left).all() or not np.isfinite(right).all() or np.any(left > right):
+        raise ValueError("Integration endpoints must be finite and ordered")
+    return left, right
+
+
+@dataclass(frozen=True, init=False)
+class GaussianBasis:
+    r"""Гауссовы функции с общей шириной и необязательной постоянной частью.
+
+    Parameters
+    ----------
+    centers : array_like, shape (n,)
+        Конечные центры базисных функций в time_unit.
+    width : float
+        Конечная положительная ширина в time_unit.
+    time_unit : str
+        Непустое обозначение единицы времени.
+    include_constant : bool, optional
+        Добавить первым столбцом функцию, равную единице.
+
+    Notes
+    -----
+    Для центра mu и ширины w базисная функция равна
+    exp(-(t-mu)^2/(2w^2)). Функции определены на всей временной оси.
+    Интегралы и грамова матрица вычисляются аналитически.
+    """
+
+    _centers: tuple[float, ...]
+    width: float
+    time_unit: str
+    include_constant: bool
+
+    def __init__(self, centers, width, *, time_unit, include_constant=True):
+        if np.iscomplexobj(centers):
+            raise ValueError("Gaussian centers must be real")
+        centers = np.asarray(centers, dtype=float)
+        if centers.ndim != 1 or not np.isfinite(centers).all():
+            raise ValueError("Gaussian centers must be a finite vector")
+        if not is_scalar_constant(width) or not np.isfinite(width) or width <= 0:
+            raise ValueError("Gaussian width must be finite and positive")
+        if not isinstance(time_unit, str) or not time_unit.strip():
+            raise ValueError("Gaussian basis requires an explicit time unit")
+        if not isinstance(include_constant, bool):
+            raise ValueError("include_constant must be a bool")
+        object.__setattr__(self, "_centers", tuple(centers.tolist()))
+        object.__setattr__(self, "width", float(width))
+        object.__setattr__(self, "time_unit", time_unit)
+        object.__setattr__(self, "include_constant", include_constant)
+
+    @property
+    def centers(self):
+        """Независимая копия центров в единицах времени базиса."""
+        return np.asarray(self._centers)
+
+    @property
+    def size(self):
+        """Число функций, включая постоянную часть при её наличии."""
+        return len(self._centers) + int(self.include_constant)
+
+    def values(self, times):
+        """Вычислить значения функций базиса.
+
+        Parameters
+        ----------
+        times : array_like, shape (m,)
+            Конечные вещественные моменты в time_unit.
+
+        Returns
+        -------
+        values : ndarray, shape (m, size)
+            Безразмерные значения в порядке центров.
+        """
+        if np.iscomplexobj(times):
+            raise ValueError("Sample times must be real")
+        times = np.asarray(times, dtype=float)
+        if times.ndim != 1 or not np.isfinite(times).all():
+            raise ValueError("Sample times must be a finite vector")
+        values = np.exp(-0.5 * ((times[:, None] - self.centers) / self.width) ** 2)
+        if self.include_constant:
+            values = np.column_stack((np.ones(len(times)), values))
+        return values
+
+    def integrals(self, left, right):
+        """Интегрировать функции базиса по совместимым интервалам.
+
+        Parameters
+        ----------
+        left, right : array_like
+            Конечные упорядоченные концы интервалов в time_unit.
+
+        Returns
+        -------
+        integrals : ndarray, shape (..., size)
+            Интегралы в time_unit; последняя ось следует функциям базиса.
+        """
+        left, right = _integration_endpoints(left, right)
+        scale = np.sqrt(2) * self.width
+        values = (
+            self.width
+            * np.sqrt(np.pi / 2)
+            * (
+                erf((right[..., None] - self.centers) / scale)
+                - erf((left[..., None] - self.centers) / scale)
+            )
+        )
+        if self.include_constant:
+            values = np.concatenate(((right - left)[..., None], values), axis=-1)
+        return values
+
+    def gram(self, left, right):
+        r"""Интегрировать попарные произведения функций на одном интервале.
+
+        Parameters
+        ----------
+        left, right : float
+            Конечные упорядоченные концы интервала в time_unit.
+
+        Returns
+        -------
+        gram : ndarray, shape (size, size)
+            Симметричная матрица интегралов в time_unit.
+
+        Notes
+        -----
+        Произведение гауссиан с центрами mu_i и mu_j имеет центр
+        (mu_i+mu_j)/2, ширину w/sqrt(2) и множитель
+        exp(-(mu_i-mu_j)^2/(4w^2)).
+        """
+        left, right = _integration_endpoints(left, right)
+        if left.ndim or right.ndim:
+            raise ValueError("Gram endpoints must be scalars")
+        centers = self.centers
+        difference = centers[:, None] - centers[None, :]
+        midpoints = centers[:, None] / 2 + centers[None, :] / 2
+        products = GaussianBasis(
+            midpoints.ravel(),
+            self.width / np.sqrt(2),
+            time_unit=self.time_unit,
+            include_constant=False,
+        )
+        result = np.empty((self.size, self.size))
+        offset = int(self.include_constant)
+        result[offset:, offset:] = np.exp(
+            -(difference**2) / (4 * self.width**2)
+        ) * products.integrals(left, right).reshape(midpoints.shape)
+        if self.include_constant:
+            result[:, 0] = result[0, :] = self.integrals(left, right)
+        return result
+
+    def to_record(self):
+        """Вернуть численные настройки базиса и единицу времени."""
+        return {
+            "type": "gaussian",
+            "centers": list(self._centers),
+            "width": self.width,
+            "time_unit": self.time_unit,
+            "include_constant": self.include_constant,
+        }
 
 
 def hat_matrix(times, knots):
@@ -36,8 +204,12 @@ def _p1_knots(knots):
     if np.iscomplexobj(knots):
         raise ValueError("P1 knots must be real")
     knots = np.asarray(knots, dtype=float)
-    if (knots.ndim != 1 or len(knots) < 2 or not np.isfinite(knots).all()
-            or np.any(np.diff(knots) <= 0)):
+    if (
+        knots.ndim != 1
+        or len(knots) < 2
+        or not np.isfinite(knots).all()
+        or np.any(np.diff(knots) <= 0)
+    ):
         raise ValueError("P1 requires at least two finite increasing knots")
     return knots
 
@@ -77,9 +249,9 @@ def h1_gram(knots, time_scale):
         raise ValueError("time_scale must be a finite real scalar")
     result = np.zeros((len(knots), len(knots)))
     for j, length in enumerate(np.diff(knots)):
-        local = length / 6 * np.array([[2., 1.], [1., 2.]])
-        local += time_scale**2 / length * np.array([[1., -1.], [-1., 1.]])
-        result[j:j + 2, j:j + 2] += local
+        local = length / 6 * np.array([[2.0, 1.0], [1.0, 2.0]])
+        local += time_scale**2 / length * np.array([[1.0, -1.0], [-1.0, 1.0]])
+        result[j : j + 2, j : j + 2] += local
     return result
 
 
@@ -102,6 +274,7 @@ class P1Basis:
     Во внутреннем узле используется правая производная,
     в первом узле — правая, в последнем — левая.
     """
+
     _knots: tuple
     time_unit: str
     endpoint: str
@@ -130,12 +303,15 @@ class P1Basis:
         if np.iscomplexobj(times):
             raise ValueError("Sample times must be real")
         times = np.asarray(times, dtype=float)
-        if (times.ndim != 1 or not np.isfinite(times).all()
-                or np.any(times < self._knots[0]) or np.any(times > self._knots[-1])):
+        if (
+            times.ndim != 1
+            or not np.isfinite(times).all()
+            or np.any(times < self._knots[0])
+            or np.any(times > self._knots[-1])
+        ):
             raise ValueError("Sample times must lie in the closed P1 interval")
         knots = self.knots
-        indices = np.minimum(np.searchsorted(knots, times, side="right")-1,
-                             self.size-2)
+        indices = np.minimum(np.searchsorted(knots, times, side="right") - 1, self.size - 2)
         return times, knots, indices
 
     def values(self, times):
@@ -153,11 +329,11 @@ class P1Basis:
             Безразмерные значения; столбцы следуют узлам базиса.
         """
         times, knots, indices = self._intervals(times)
-        fraction = (times-knots[indices])/(knots[indices+1]-knots[indices])
+        fraction = (times - knots[indices]) / (knots[indices + 1] - knots[indices])
         values = np.zeros((len(times), self.size))
         rows = np.arange(len(times))
-        values[rows, indices] = 1-fraction
-        values[rows, indices+1] = fraction
+        values[rows, indices] = 1 - fraction
+        values[rows, indices + 1] = fraction
         return values
 
     def derivatives(self, times):
@@ -180,12 +356,76 @@ class P1Basis:
         в последнем узле — левая.
         """
         times, knots, indices = self._intervals(times)
-        slope = 1/(knots[indices+1]-knots[indices])
+        slope = 1 / (knots[indices + 1] - knots[indices])
         values = np.zeros((len(times), self.size))
         rows = np.arange(len(times))
         values[rows, indices] = -slope
-        values[rows, indices+1] = slope
+        values[rows, indices + 1] = slope
         return values
+
+    def integrals(self, left, right):
+        """Интегрировать P1-функции с нулевым продолжением за узлами.
+
+        Parameters
+        ----------
+        left, right : array_like
+            Конечные упорядоченные концы интервалов в time_unit.
+
+        Returns
+        -------
+        integrals : ndarray, shape (..., size)
+            Интегралы в time_unit; последняя ось следует узлам.
+        """
+        left, right = _integration_endpoints(left, right)
+        result = np.zeros((*left.shape, self.size))
+        knots = self.knots
+        for j, (start, end) in enumerate(zip(knots[:-1], knots[1:])):
+            a, b = np.clip(left, start, end), np.clip(right, start, end)
+            width = b - a
+            fraction = ((a - start) + (b - start)) / (2 * (end - start))
+            result[..., j] += width * (1 - fraction)
+            result[..., j + 1] += width * fraction
+        return result
+
+    def gram(self, left, right):
+        """Интегрировать попарные произведения P1-функций.
+
+        Parameters
+        ----------
+        left, right : float
+            Конечные упорядоченные концы интервала в time_unit.
+
+        Returns
+        -------
+        gram : ndarray, shape (size, size)
+            Грамова матрица в time_unit с нулевым продолжением за узлами.
+        """
+        left, right = _integration_endpoints(left, right)
+        if left.ndim or right.ndim:
+            raise ValueError("Gram endpoints must be scalars")
+        result = np.zeros((self.size, self.size))
+        for j, (start, end) in enumerate(zip(self._knots[:-1], self._knots[1:])):
+            a, b = max(float(left), start), min(float(right), end)
+            if a < b:
+                x, y = (a - start) / (end - start), (b - start) / (end - start)
+                first = y - x
+                second = (y**2 - x**2) / 2
+                third = (y**3 - x**3) / 3
+                result[j, j] += (end - start) * (first - 2 * second + third)
+                result[j + 1, j + 1] += (end - start) * third
+                mixed = (end - start) * (second - third)
+                result[j, j + 1] += mixed
+                result[j + 1, j] += mixed
+        return result
+
+    def to_record(self):
+        """Вернуть временные узлы, единицу времени и условия на концах."""
+        return {
+            "type": "p1",
+            "knots": list(self._knots),
+            "time_unit": self.time_unit,
+            "endpoint": self.endpoint,
+        }
 
 
 def matrix_source_map(matrix, *, scale, domain, codomain):
@@ -224,8 +464,9 @@ def matrix_source_map(matrix, *, scale, domain, codomain):
         raise ValueError("Source maps require coefficient and control vectors")
     if np.iscomplexobj(matrix):
         raise ValueError("Source matrix must be real")
-    return matrix_map(float(scale)*np.asarray(matrix, dtype=domain.dtype),
-                      domain=domain, codomain=codomain)
+    return matrix_map(
+        float(scale) * np.asarray(matrix, dtype=domain.dtype), domain=domain, codomain=codomain
+    )
 
 
 def sampled_source_map(basis, times, *, scale, domain, codomain):
@@ -257,5 +498,4 @@ def sampled_source_map(basis, times, *, scale, domain, codomain):
         raise ValueError("Sampling times must be a finite vector")
     if codomain.coordinates != (tuple(times.tolist()),):
         raise ValueError("Control coordinates must match the supplied sampling times")
-    return matrix_source_map(basis.values(times), scale=scale,
-                             domain=domain, codomain=codomain)
+    return matrix_source_map(basis.values(times), scale=scale, domain=domain, codomain=codomain)

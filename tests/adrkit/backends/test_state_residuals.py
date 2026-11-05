@@ -1,4 +1,5 @@
 """Полные якобианы нелинейной невязки состояния для аддитивного входа ADR."""
+
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -19,9 +20,15 @@ from adrkit.state_residuals import StateResidual
 
 
 def settings(**changes):
-    result = dict(horizon=.2, diffusion=.13, velocity=(.15, -.1),
-                  linear_loss=.04, reaction_gamma=0., reaction_c_star=.7,
-                  source_position=(0., 0.))
+    result = dict(
+        horizon=0.2,
+        diffusion=0.13,
+        velocity=(0.15, -0.1),
+        linear_loss=0.04,
+        reaction_gamma=0.0,
+        reaction_c_star=0.7,
+        source_position=(0.0, 0.0),
+    )
     result.update(changes)
     return result
 
@@ -57,18 +64,18 @@ def nonlinear_coefficient(beta=1.5, *, representation="dense", unit=None, deriva
 
     Главная, верхняя и нижняя диагонали :math:`K` равны 4, −1 и −0.3.
     """
-    weights = np.arange(1., 10.)/45.
-    matrix = np.diag(np.full(9, 4.))
-    matrix += np.diag(np.full(8, -1.), 1)+np.diag(np.full(8, -.3), -1)
+    weights = np.arange(1.0, 10.0) / 45.0
+    matrix = np.diag(np.full(9, 4.0))
+    matrix += np.diag(np.full(8, -1.0), 1) + np.diag(np.full(8, -0.3), -1)
     weights.flags.writeable = matrix.flags.writeable = False
 
     def value(state, points, time):
         moment = weights @ state
-        return beta*moment**2*(matrix @ state)
+        return beta * moment**2 * (matrix @ state)
 
     def jacobian(state, points, time):
         moment = weights @ state
-        result = beta*(moment**2*matrix+2*moment*np.outer(matrix @ state, weights))
+        result = beta * (moment**2 * matrix + 2 * moment * np.outer(matrix @ state, weights))
         if representation == "csr":
             return sparse.csr_matrix(result)
         if representation == "array":
@@ -80,97 +87,128 @@ def nonlinear_coefficient(beta=1.5, *, representation="dense", unit=None, deriva
 
 def layouts(solver, *, forcing):
     coordinates = (solver.times, tuple(map(tuple, solver.xy)))
-    states = ArraySpace((solver.nt+1, solver.size), axes=("time", "node"),
-                        coordinates=coordinates, units="concentration")
-    domain = (ArraySpace(states.shape, axes=states.axes, coordinates=coordinates,
-                          units="concentration/time") if forcing else
-              ArraySpace((solver.nt+1,), axes=("time",), coordinates=(solver.times,),
-                         units="source/time"))
+    states = ArraySpace(
+        (solver.nt + 1, solver.size),
+        axes=("time", "node"),
+        coordinates=coordinates,
+        units="concentration",
+    )
+    domain = (
+        ArraySpace(
+            states.shape, axes=states.axes, coordinates=coordinates, units="concentration/time"
+        )
+        if forcing
+        else ArraySpace(
+            (solver.nt + 1,), axes=("time",), coordinates=(solver.times,), units="source/time"
+        )
+    )
     return domain, states
 
 
 @pytest.mark.parametrize("representation", ["dense", "csr", "array"])
 def test_full_nonsymmetric_state_jacobian_matches_residual_derivative(representation):
     law = nonlinear_coefficient(representation=representation)
-    solver = BoundedSolver(settings(state_residual=law), interior_points=3, time_steps=4,
-                           half_width=1.)
+    solver = BoundedSolver(
+        settings(state_residual=law), interior_points=3, time_steps=4, half_width=1.0
+    )
     assert solver.linear_lu is None  # При gamma=0 член N(c) также должен вычисляться.
-    at, h = np.linspace(.2, 1.1, 9), np.sin(np.arange(9)+.1)
+    at, h = np.linspace(0.2, 1.1, 9), np.sin(np.arange(9) + 0.1)
     step = 2
     jacobian = solver.jacobian(at, time_index=step)
     eps = 1e-6
-    derivative = (solver.residual_forcing(at+eps*h, np.zeros(9), np.ones(9), step)
-                  -solver.residual_forcing(at-eps*h, np.zeros(9), np.ones(9), step))/(2*eps)
+    derivative = (
+        solver.residual_forcing(at + eps * h, np.zeros(9), np.ones(9), step)
+        - solver.residual_forcing(at - eps * h, np.zeros(9), np.ones(9), step)
+    ) / (2 * eps)
     np.testing.assert_allclose(jacobian @ h, derivative, rtol=3e-9, atol=5e-10)
-    full = law.evaluate(at, solver.xy, solver.times[step+1], derivative=True).toarray()
-    assert np.linalg.norm(full-np.diag(np.diag(full))) > .1
-    assert np.linalg.norm(full-full.T) > .1
-    np.testing.assert_allclose(jacobian.toarray(), solver._base_at(step).toarray()+solver.dt*full,
-                               rtol=2e-15, atol=2e-15)
+    full = law.evaluate(at, solver.xy, solver.times[step + 1], derivative=True).toarray()
+    assert np.linalg.norm(full - np.diag(np.diag(full))) > 0.1
+    assert np.linalg.norm(full - full.T) > 0.1
+    np.testing.assert_allclose(
+        jacobian.toarray(),
+        solver._base_at(step).toarray() + solver.dt * full,
+        rtol=2e-15,
+        atol=2e-15,
+    )
 
 
 @pytest.mark.parametrize("forcing", [False, True])
 @pytest.mark.parametrize("representation", ["dense", "csr"])
 def test_nonlinear_nonlocal_forward_jvp_vjp_and_fixed_operator(forcing, representation):
-    solver = BoundedSolver(settings(state_residual=nonlinear_coefficient(representation=representation)),
-                           interior_points=3, time_steps=7, half_width=1.)
+    solver = BoundedSolver(
+        settings(state_residual=nonlinear_coefficient(representation=representation)),
+        interior_points=3,
+        time_steps=7,
+        half_width=1.0,
+    )
     domain, codomain = layouts(solver, forcing=forcing)
-    mapping = (forcing_state_map if forcing else state_map)(solver, domain=domain, codomain=codomain)
+    mapping = (forcing_state_map if forcing else state_map)(
+        solver, domain=domain, codomain=codomain
+    )
     rng = np.random.default_rng(813)
-    at = 1.+rng.random(domain.shape)
+    at = 1.0 + rng.random(domain.shape)
     h, z = rng.normal(size=domain.shape), rng.normal(size=codomain.shape)
     tangent, pullback = mapping.jvp.jvp(at, h), mapping.vjp.vjp(at, z)
     eps = 3e-6
-    numerical = (mapping.predict.predict(at+eps*h)-mapping.predict.predict(at-eps*h))/(2*eps)
+    numerical = (mapping.predict.predict(at + eps * h) - mapping.predict.predict(at - eps * h)) / (
+        2 * eps
+    )
     np.testing.assert_allclose(tangent, numerical, rtol=4e-7, atol=2e-9)
     np.testing.assert_allclose(np.vdot(tangent, z), np.vdot(h, pullback), rtol=2e-12, atol=2e-12)
     linear = mapping.predict.linear_operator(at)
-    mapping.predict.predict(at*1.7)
+    mapping.predict.predict(at * 1.7)
     np.testing.assert_array_equal(linear.matvec(h.ravel()).reshape(codomain.shape), tangent)
     np.testing.assert_array_equal(linear.rmatvec(z.ravel()).reshape(domain.shape), pullback)
     trajectory = solver.solve_forcing(at) if forcing else solver.solve_controls(at)
     assert trajectory.max_scaled_residual <= 1e-11
-    assert np.all(pullback[0] == 0.)
+    assert np.all(pullback[0] == 0.0)
 
 
 def test_additive_term_composes_with_local_reaction_and_prescribed_fields():
-    local = ReactionLaw(lambda c, xy, t: .04*c**3, lambda c, xy, t: .12*c**2, pure=True)
-    problem = ADRProblem.from_model(settings(diffusion=ScalarField(
-        lambda xy, t: .13+.01*xy[:, 0]**2, time_dependent=False),
-        reaction=local, state_residual=nonlinear_coefficient()))
+    local = ReactionLaw(lambda c, xy, t: 0.04 * c**3, lambda c, xy, t: 0.12 * c**2, pure=True)
+    problem = ADRProblem.from_model(
+        settings(
+            diffusion=ScalarField(lambda xy, t: 0.13 + 0.01 * xy[:, 0] ** 2, time_dependent=False),
+            reaction=local,
+            state_residual=nonlinear_coefficient(),
+        )
+    )
     assert problem.to_model()["state_residual"] is problem.state_residual
-    solver = problem.make_solver(BoundedSolver, interior_points=3, time_steps=4, half_width=1.)
-    at = np.linspace(.1, .9, 9)
-    expected = .04*at**3+problem.state_residual.evaluate(at, solver.xy, solver.times[1])
+    solver = problem.make_solver(BoundedSolver, interior_points=3, time_steps=4, half_width=1.0)
+    at = np.linspace(0.1, 0.9, 9)
+    expected = 0.04 * at**3 + problem.state_residual.evaluate(at, solver.xy, solver.times[1])
     np.testing.assert_array_equal(solver.reaction(at, 0), expected)
-    matrix = solver._base_at(0)+sparse.diags(solver.dt*.12*at**2)
-    matrix += solver.dt*problem.state_residual.evaluate(at, solver.xy, solver.times[1], derivative=True)
-    np.testing.assert_allclose(solver.jacobian(at, time_index=0).toarray(), matrix.toarray(),
-                               rtol=2e-15, atol=2e-15)
+    matrix = solver._base_at(0) + sparse.diags(solver.dt * 0.12 * at**2)
+    matrix += solver.dt * problem.state_residual.evaluate(
+        at, solver.xy, solver.times[1], derivative=True
+    )
+    np.testing.assert_allclose(
+        solver.jacobian(at, time_index=0).toarray(), matrix.toarray(), rtol=2e-15, atol=2e-15
+    )
 
 
 def test_callback_arguments_and_value_jacobian_results_have_independent_ownership():
     state, points = np.ones(3), np.zeros((3, 2))
-    vector, matrix = np.arange(3.), sparse.eye(3, format="csc")
+    vector, matrix = np.arange(3.0), sparse.eye(3, format="csc")
 
     def value(c, xy, t):
-        c[:] = 12.
-        xy[:] = 13.
+        c[:] = 12.0
+        xy[:] = 13.0
         return vector
 
     def jacobian(c, xy, t):
-        c[:] = 14.
-        xy[:] = 15.
+        c[:] = 14.0
+        xy[:] = 15.0
         return matrix
 
     law = StateResidual(value, jacobian, pure=True)
-    actual_vector = law.evaluate(state, points, .5)
-    actual_matrix = law.evaluate(state, points, .5, derivative=True)
+    actual_vector = law.evaluate(state, points, 0.5)
+    actual_matrix = law.evaluate(state, points, 0.5, derivative=True)
     np.testing.assert_array_equal(state, np.ones(3))
     np.testing.assert_array_equal(points, np.zeros((3, 2)))
-    actual_vector[:] = 99.
-    actual_matrix.data[:] = 100.
-    np.testing.assert_array_equal(vector, np.arange(3.))
+    actual_vector[:] = 99.0
+    actual_matrix.data[:] = 100.0
+    np.testing.assert_array_equal(vector, np.arange(3.0))
     np.testing.assert_array_equal(matrix.toarray(), np.eye(3))
 
 
@@ -186,7 +224,7 @@ def test_user_snapshot_freezes_numeric_setup_and_retains_nondeepcopyable_resourc
         class LockedValue:
             def __init__(self):
                 self.lock = lock  # Вызов deepcopy для этого функционального объекта завершается
-                                  # ошибкой.
+                # ошибкой.
 
             def __call__(self, c, xy, t):
                 with self.lock:
@@ -194,20 +232,24 @@ def test_user_snapshot_freezes_numeric_setup_and_retains_nondeepcopyable_resourc
 
         return StateResidual(LockedValue(), fixed.jacobian, pure=True)
 
-    law = StateResidual(lambda c, xy, t: nonlinear_coefficient(outside["beta"]).value(c, xy, t),
+    law = StateResidual(
+        lambda c, xy, t: nonlinear_coefficient(outside["beta"]).value(c, xy, t),
         lambda c, xy, t: nonlinear_coefficient(outside["beta"]).jacobian(c, xy, t),
-        pure=True, snapshot_factory=snapshot)
+        pure=True,
+        snapshot_factory=snapshot,
+    )
     problem = ADRProblem.from_model(settings(state_residual=law))
     assert not calls
-    solver = BoundedSolver(problem, interior_points=3, time_steps=4, half_width=1.)
+    solver = BoundedSolver(problem, interior_points=3, time_steps=4, half_width=1.0)
     assert calls == [1.5]
     domain, codomain = layouts(solver, forcing=False)
     mapping = state_map(solver, domain=domain, codomain=codomain)
     # Снимок решателя не должен вызывать deepcopy ресурса добавочного члена невязки.
     expected = mapping.predict.predict(np.ones(5))
-    outside["beta"] = 20.
-    np.testing.assert_array_equal(mapping.predict.predict(np.ones(5)*1.1),
-                                  solver.solve_controls(np.ones(5)*1.1).states)
+    outside["beta"] = 20.0
+    np.testing.assert_array_equal(
+        mapping.predict.predict(np.ones(5) * 1.1), solver.solve_controls(np.ones(5) * 1.1).states
+    )
     np.testing.assert_array_equal(mapping.predict.predict(np.ones(5)), expected)
 
 
@@ -222,44 +264,82 @@ def test_cached_rejects_full_law_before_value_jacobian_or_snapshot():
 
 @pytest.mark.parametrize("backend", [BoundedSolver, CachedSolver])
 def test_constant_transport_without_state_residual_preserves_solution(backend):
-    spec = json.loads(((Path(__file__).resolve().parent.parent / "fixtures/constant_transport.json")).read_text(encoding="utf-8"))
-    names = ("diffusion", "velocity", "linear_loss", "reaction_c_star",
-             "source_position", "background", "horizon", "reaction_gamma")
+    spec = json.loads(
+        ((Path(__file__).resolve().parent.parent / "fixtures/constant_transport.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    names = (
+        "diffusion",
+        "velocity",
+        "linear_loss",
+        "reaction_c_star",
+        "source_position",
+        "background",
+        "horizon",
+        "reaction_gamma",
+    )
     model = {name: spec[name] for name in names}
     reference_solver = backend(model, interior_points=3, time_steps=4)
     explicit = backend(ADRProblem.from_model(model), interior_points=3, time_steps=4)
     assert explicit._state_residual_law is None and not explicit._variable_fields
-    controls = np.linspace(.1, 1., 5)
+    controls = np.linspace(0.1, 1.0, 5)
     expected, actual = reference_solver.solve_controls(controls), explicit.solve_controls(controls)
-    np.testing.assert_array_equal(explicit.base_matrix.toarray(), reference_solver.base_matrix.toarray())
+    np.testing.assert_array_equal(
+        explicit.base_matrix.toarray(), reference_solver.base_matrix.toarray()
+    )
     np.testing.assert_array_equal(actual.states, expected.states)
     assert actual.nonlinear_iterations == expected.nonlinear_iterations
     assert actual.max_scaled_residual == expected.max_scaled_residual
 
 
-@pytest.mark.parametrize("bad", [1., np.ones(2), np.ones((3, 1)),
-                                  np.array([0., np.nan, 0.]), np.ones(3)*1j, np.ones(3, dtype=bool)])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        1.0,
+        np.ones(2),
+        np.ones((3, 1)),
+        np.array([0.0, np.nan, 0.0]),
+        np.ones(3) * 1j,
+        np.ones(3, dtype=bool),
+    ],
+)
 def test_invalid_value_shape_or_numeric_data_are_rejected(bad):
     law = StateResidual(lambda c, xy, t: bad, lambda c, xy, t: np.eye(3), pure=True)
     with pytest.raises(ValueError, match="value"):
-        law.evaluate(np.ones(3), np.zeros((3, 2)), 0.)
+        law.evaluate(np.ones(3), np.zeros((3, 2)), 0.0)
 
 
-@pytest.mark.parametrize("bad", [np.ones(3), np.ones((2, 2)), np.full((3, 3), np.inf),
-    np.eye(3, dtype=complex), np.eye(3, dtype=bool), sparse.eye(2),
-    sparse.eye(3, dtype=complex), sparse.eye(3, dtype=bool),
-    sparse.csr_matrix(np.full((3, 3), np.nan))])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        np.ones(3),
+        np.ones((2, 2)),
+        np.full((3, 3), np.inf),
+        np.eye(3, dtype=complex),
+        np.eye(3, dtype=bool),
+        sparse.eye(2),
+        sparse.eye(3, dtype=complex),
+        sparse.eye(3, dtype=bool),
+        sparse.csr_matrix(np.full((3, 3), np.nan)),
+    ],
+)
 def test_invalid_full_jacobian_is_rejected(bad):
     law = StateResidual(lambda c, xy, t: c, lambda c, xy, t: bad, pure=True)
     with pytest.raises(ValueError, match="Jacobian"):
-        law.evaluate(np.ones(3), np.zeros((3, 2)), 0., derivative=True)
+        law.evaluate(np.ones(3), np.zeros((3, 2)), 0.0, derivative=True)
 
 
-@pytest.mark.parametrize("state,points,time", [
-    (np.ones(2), np.zeros((3, 2)), 0.), (np.ones(3), np.zeros((3, 3)), 0.),
-    (np.ones(3)*1j, np.zeros((3, 2)), 0.), (np.ones(3), np.zeros((3, 2)), np.inf),
-    (np.ones(3), np.zeros((3, 2)), True),
-])
+@pytest.mark.parametrize(
+    "state,points,time",
+    [
+        (np.ones(2), np.zeros((3, 2)), 0.0),
+        (np.ones(3), np.zeros((3, 3)), 0.0),
+        (np.ones(3) * 1j, np.zeros((3, 2)), 0.0),
+        (np.ones(3), np.zeros((3, 2)), np.inf),
+        (np.ones(3), np.zeros((3, 2)), True),
+    ],
+)
 def test_invalid_arguments_fail_before_calling_law(state, points, time):
     def forbidden(*args):
         raise AssertionError("arguments must be validated before callbacks")
