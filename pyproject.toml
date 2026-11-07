@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adrkit-timeseries"
-version = "0.1.0"
+version = "0.2.0"
 description = "Численные задачи переноса, обратные задачи и обработка временных рядов"
 readme = "README.md"
 requires-python = ">=3.12"

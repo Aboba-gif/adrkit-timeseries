@@ -1,6 +1,8 @@
 """Временные базисы источника и линейные отображения коэффициентов."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from importlib.metadata import entry_points
 
 import numpy as np
 from scipy.special import erf
@@ -426,6 +428,108 @@ class P1Basis:
             "time_unit": self.time_unit,
             "endpoint": self.endpoint,
         }
+
+
+_SOURCE_BASIS_FACTORIES = {"gaussian": GaussianBasis, "p1": P1Basis}
+_SOURCE_BASIS_ENTRY_POINT_GROUP = "adrkit_timeseries.source_bases"
+
+
+def _source_basis_name(name):
+    if not isinstance(name, str) or not name or name != name.strip():
+        raise ValueError("Source basis name must be a nonempty string without surrounding spaces")
+
+
+def register_source_basis(name, factory):
+    """Зарегистрировать фабрику временного базиса в текущем процессе.
+
+    Parameters
+    ----------
+    name : str
+        Непустое имя, совпадающее с полем type сохранённого базиса.
+    factory : callable
+        Конструктор или функция, принимающая остальные поля записи
+        как именованные аргументы и возвращающая объект базиса.
+
+    Returns
+    -------
+    None
+        Фабрика доступна последующим вызовам source_basis_from_record.
+
+    Raises
+    ------
+    ValueError
+        Имя пусто, содержит пробелы по краям либо занято другой
+        локальной или установленной фабрикой.
+    TypeError
+        factory не является вызываемым объектом.
+
+    Notes
+    -----
+    Повторная регистрация той же фабрики допустима. Другая фабрика
+    под занятым именем отклоняется. Для независимых процессов фабрику
+    публикуют точкой входа группы adrkit_timeseries.source_bases
+    установленного Python-пакета; локальная регистрация не наследуется
+    процессами, запущенными методом spawn.
+    """
+    _source_basis_name(name)
+    if not callable(factory):
+        raise TypeError("Source basis factory must be callable")
+    installed = entry_points(group=_SOURCE_BASIS_ENTRY_POINT_GROUP, name=name)
+    if installed:
+        raise ValueError(f"Source basis name is already registered: {name!r}")
+    current = _SOURCE_BASIS_FACTORIES.setdefault(name, factory)
+    if current is not factory:
+        raise ValueError(f"Source basis name is already registered: {name!r}")
+
+
+def source_basis_from_record(record):
+    """Создать временной базис по зарегистрированному имени и параметрам.
+
+    Parameters
+    ----------
+    record : Mapping
+        Поле type выбирает фабрику; остальные поля передаются ей
+        без изменения как именованные аргументы.
+
+    Returns
+    -------
+    object
+        Объект выбранного базиса. Для расчётов источника он предоставляет
+        size, time_unit и values(times); интегральная нагрузка и штраф
+        дополнительно используют integrals(left, right) и gram(left, right).
+
+    Raises
+    ------
+    KeyError
+        В записи отсутствует поле type.
+    ValueError
+        Имя некорректно, неизвестно либо имеет нескольких поставщиков.
+    TypeError
+        Запись не является Mapping или фабрика не является вызываемой.
+
+    Notes
+    -----
+    Встроенные и локально зарегистрированные фабрики дополняются точками
+    входа группы adrkit_timeseries.source_bases. Загружается только
+    запрошенная фабрика. Несколько поставщиков одного имени отклоняются;
+    ошибки загрузки и конструктора передаются вызывающему коду.
+    """
+    if not isinstance(record, Mapping):
+        raise TypeError("Source basis record must be a mapping")
+    parameters = dict(record)
+    name = parameters.pop("type")
+    _source_basis_name(name)
+    factory = _SOURCE_BASIS_FACTORIES.get(name)
+    installed = tuple(entry_points(group=_SOURCE_BASIS_ENTRY_POINT_GROUP, name=name))
+    if len(installed) + int(factory is not None) > 1:
+        raise ValueError(f"Multiple source basis factories are registered: {name!r}")
+    if installed:
+        factory = installed[0].load()
+    if factory is None:
+        raise ValueError(f"Unknown source basis: {name!r}")
+    if not callable(factory):
+        raise TypeError(f"Source basis factory must be callable: {name!r}")
+    return factory(**parameters)
 
 
 def matrix_source_map(matrix, *, scale, domain, codomain):

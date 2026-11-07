@@ -3,7 +3,14 @@
 import numpy as np
 import pytest
 
-from adrkit.sources import GaussianBasis, P1Basis, sampled_source_map
+import adrkit.sources as source_module
+from adrkit.sources import (
+    GaussianBasis,
+    P1Basis,
+    register_source_basis,
+    sampled_source_map,
+    source_basis_from_record,
+)
 from adrkit.spaces import ArraySpace
 
 
@@ -135,3 +142,156 @@ def test_p1_integrals_and_gram_match_piecewise_quadrature_and_interval_loads():
 def test_invalid_gaussian_settings_are_rejected(centers, width):
     with pytest.raises(ValueError):
         GaussianBasis(centers, width, time_unit="s")
+
+
+@pytest.fixture
+def source_registry(monkeypatch):
+    monkeypatch.setattr(
+        source_module, "_SOURCE_BASIS_FACTORIES", dict(source_module._SOURCE_BASIS_FACTORIES)
+    )
+    monkeypatch.setattr(source_module, "entry_points", lambda **filters: ())
+
+
+@pytest.mark.parametrize(
+    "basis",
+    [
+        GaussianBasis([-0.2, 0.5, 1.3], 0.27, time_unit="s"),
+        GaussianBasis([0.3, 0.8], 0.2, time_unit="min", include_constant=False),
+        P1Basis([0.0, 0.5, 2.0], time_unit="s"),
+    ],
+)
+def test_builtin_source_record_preserves_basis(basis, source_registry):
+    record = basis.to_record()
+    restored = source_basis_from_record(record)
+    assert restored.to_record() == record
+    assert type(restored) is type(basis)
+    times = np.linspace(0.0, 1.0, 11)
+    np.testing.assert_array_equal(restored.values(times), basis.values(times))
+    np.testing.assert_array_equal(restored.integrals(0.1, 0.9), basis.integrals(0.1, 0.9))
+    np.testing.assert_array_equal(restored.gram(0.1, 0.9), basis.gram(0.1, 0.9))
+
+
+def test_custom_source_factory_receives_parameters_without_mutating_record(source_registry):
+    received = {}
+
+    def factory(*, nodes, time_unit, label):
+        received.update(nodes=nodes, time_unit=time_unit, label=label)
+        return P1Basis(nodes, time_unit=time_unit)
+
+    register_source_basis("custom", factory)
+    register_source_basis("custom", factory)
+    record = {"type": "custom", "nodes": [0.0, 0.5, 2.0], "time_unit": "min", "label": "test"}
+    basis = source_basis_from_record(record)
+    assert received == {key: value for key, value in record.items() if key != "type"}
+    assert record["type"] == "custom"
+    assert basis.time_unit == "min"
+    np.testing.assert_array_equal(basis.values([0.0, 0.5, 2.0]), np.eye(3))
+
+
+@pytest.mark.parametrize("name", ["", " ", " custom", "custom ", None, 3])
+def test_source_factory_name_is_explicit(name, source_registry):
+    with pytest.raises(ValueError, match="name"):
+        register_source_basis(name, P1Basis)
+    with pytest.raises(ValueError, match="name"):
+        source_basis_from_record({"type": name})
+
+
+def test_invalid_source_factory_and_record_are_rejected(source_registry):
+    with pytest.raises(TypeError, match="callable"):
+        register_source_basis("custom", 3)
+    with pytest.raises(TypeError, match="mapping"):
+        source_basis_from_record([])
+    with pytest.raises(KeyError, match="type"):
+        source_basis_from_record({"knots": [0.0, 1.0]})
+    with pytest.raises(ValueError, match="Unknown source basis"):
+        source_basis_from_record({"type": "missing"})
+
+
+def test_local_and_builtin_source_names_cannot_be_replaced(source_registry):
+    with pytest.raises(ValueError, match="already registered"):
+        register_source_basis("gaussian", P1Basis)
+    register_source_basis("custom", P1Basis)
+    with pytest.raises(ValueError, match="already registered"):
+        register_source_basis("custom", GaussianBasis)
+
+
+def _installed_factories(monkeypatch, providers):
+    def selected_entry_points(*, group, name):
+        assert group == "adrkit_timeseries.source_bases"
+        return tuple(provider for provider in providers if provider.name == name)
+
+    monkeypatch.setattr(source_module, "entry_points", selected_entry_points)
+
+
+class _FactoryEntryPoint:
+    def __init__(self, name, factory):
+        self.name = name
+        self.factory = factory
+        self.loaded = False
+
+    def load(self):
+        self.loaded = True
+        return self.factory
+
+
+def test_only_requested_installed_source_factory_is_loaded(monkeypatch, source_registry):
+    selected = _FactoryEntryPoint("installed", P1Basis)
+    unrelated = _FactoryEntryPoint("unrelated", object())
+    _installed_factories(monkeypatch, [selected, unrelated])
+    basis = source_basis_from_record(
+        {"type": "installed", "knots": [0.0, 0.5, 2.0], "time_unit": "h"}
+    )
+    assert selected.loaded
+    assert not unrelated.loaded
+    assert basis.size == 3
+    assert basis.time_unit == "h"
+
+
+@pytest.mark.parametrize("name", ["gaussian", "custom", "installed"])
+def test_source_provider_collisions_are_reported_before_loading(
+    name, monkeypatch, source_registry
+):
+    if name == "custom":
+        register_source_basis(name, P1Basis)
+    providers = [_FactoryEntryPoint(name, P1Basis)]
+    if name == "installed":
+        providers.append(_FactoryEntryPoint(name, GaussianBasis))
+    _installed_factories(monkeypatch, providers)
+    with pytest.raises(ValueError, match="Multiple source basis factories"):
+        source_basis_from_record({"type": name})
+    assert not any(provider.loaded for provider in providers)
+    with pytest.raises(ValueError, match="already registered"):
+        register_source_basis(name, P1Basis)
+
+
+def test_installed_source_factory_must_be_callable(monkeypatch, source_registry):
+    _installed_factories(monkeypatch, [_FactoryEntryPoint("invalid", object())])
+    with pytest.raises(TypeError, match="callable"):
+        source_basis_from_record({"type": "invalid"})
+
+
+def test_source_factory_constructor_errors_are_preserved(source_registry):
+    failure = RuntimeError("the custom constructor failed")
+
+    def factory(**parameters):
+        raise failure
+
+    register_source_basis("broken", factory)
+    with pytest.raises(RuntimeError) as caught:
+        source_basis_from_record({"type": "broken", "custom_argument": [1, 2]})
+    assert caught.value is failure
+
+
+def test_source_entry_point_load_errors_are_preserved(monkeypatch, source_registry):
+    failure = ImportError("the installed module failed")
+
+    class BrokenEntryPoint:
+        name = "broken"
+
+        def load(self):
+            raise failure
+
+    _installed_factories(monkeypatch, [BrokenEntryPoint()])
+    with pytest.raises(ImportError) as caught:
+        source_basis_from_record({"type": "broken"})
+    assert caught.value is failure
