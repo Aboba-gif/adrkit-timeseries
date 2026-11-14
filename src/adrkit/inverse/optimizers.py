@@ -191,7 +191,8 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
     Parameters
     ----------
     residual : MapCapabilities
-        Отображение невязки с predict и JVP между ArraySpace.
+        Отображение невязки с predict и Jacobian либо JVP между ArraySpace.
+        Явно объявленный Jacobian используется вместо отдельных JVP.
         Вес и нормировка должны входить в невязку и её производную.
     initial : array_like
         Конечная допустимая точка формы residual.domain.shape.
@@ -217,7 +218,8 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
         x и градиент jac — плоские массивы в порядке C; fun — J,
         residual — вектор невязки, optimality — бесконечная норма
         отображения проекционного градиента. nit считает принятые шаги,
-        nfev — прогнозы, njev — сборки якобиана, njvp — действия JVP.
+        nfev — прогнозы, njev — сборки якобиана, njvp — отдельные вызовы JVP.
+        При объявленном Jacobian отдельные вызовы JVP не выполняются.
         step_size и damping относятся к последней подзадаче;
         damping_rule содержит выбранное правило сдвига.
         status: 1 — нулевая невязка; 2 — стационарность; 0 — maxiter;
@@ -227,8 +229,9 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
 
     Notes
     -----
-    При :math:`J=\frac12\|r\|^2>0` матрица :math:`A=Dr(x)` собирается
-    по столбцам JVP. Метод BVLS с плотным QR/SVD решает
+    При :math:`J=\frac12\|r\|^2>0` матрица :math:`A=Dr(x)` получается
+    объявленной операцией Jacobian либо собирается по столбцам JVP.
+    Метод BVLS с плотным QR/SVD решает
 
     .. math::
 
@@ -252,8 +255,18 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
         residual.codomain, ArraySpace
     ):
         raise TypeError("residual spaces must be ArraySpace records")
-    derivative = require_capability(residual.jvp, operation="JVP", consumer="damped Gauss-Newton")
-    for operation, method in ((residual.predict, "predict"), (derivative, "jvp")):
+    derivative, matrix_derivative = residual.jvp, residual.jacobian
+    if matrix_derivative is None:
+        derivative = require_capability(
+            derivative, operation="JVP", consumer="damped Gauss-Newton"
+        )
+    operations = [(residual.predict, "predict")]
+    operations += (
+        [(matrix_derivative, "jacobian")]
+        if matrix_derivative is not None
+        else [(derivative, "jvp")]
+    )
+    for operation, method in operations:
         if not callable(getattr(operation, method, None)):
             raise TypeError(f"Residual {method} operation must provide callable {method}()")
     if callback is not None and not callable(callback):
@@ -320,6 +333,20 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
     def linearize(point, values):
         nonlocal njev, njvp
         njev += 1
+        if matrix_derivative is not None:
+            raw = np.asarray(
+                matrix_derivative.jacobian(domain.array(point.reshape(domain.shape), copy=True))
+            )
+            if (
+                raw.dtype.kind not in "iuf"
+                or raw.shape != (codomain.size, domain.size)
+                or not np.isfinite(raw).all()
+            ):
+                raise ValueError(
+                    "Residual Jacobian must be a finite real matrix of the declared shape"
+                )
+            matrix = np.array(raw, dtype=float, copy=True)
+            return matrix, matrix.T @ values
         columns = []
         for j in range(domain.size):
             direction = np.zeros(domain.size)

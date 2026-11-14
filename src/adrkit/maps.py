@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from adrkit.contracts import MapCapabilities, require_capability
 from adrkit.spaces import ArraySpace
 
@@ -17,6 +19,7 @@ class _FunctionMap:
     prediction: object
     tangent: object | None
     pullback: object | None
+    matrix_derivative: object | None
 
     def predict(self, x):
         x = self.domain.array(x, name="input", copy=True)
@@ -34,8 +37,30 @@ class _FunctionMap:
         cotangent = self.codomain.array(cotangent, name="cotangent", copy=True)
         return self.domain.array(action(at, cotangent), name="VJP output", copy=True)
 
+    def jacobian(self, at):
+        action = require_capability(
+            self.matrix_derivative, operation="Jacobian", consumer="function map"
+        )
+        at = self.domain.array(at, name="at", copy=True)
+        raw = np.asarray(action(at))
+        if (
+            raw.dtype.kind not in "iuf"
+            or raw.shape != (self.codomain.size, self.domain.size)
+            or not np.isfinite(raw).all()
+        ):
+            raise ValueError(
+                "Jacobian must be a finite real matrix of shape (codomain.size, domain.size)"
+            )
+        with np.errstate(over="ignore", invalid="ignore"):
+            matrix = np.array(
+                raw, dtype=np.result_type(self.domain.dtype, self.codomain.dtype), copy=True
+            )
+        if not np.isfinite(matrix).all():
+            raise ValueError("Jacobian must remain finite in the declared dtype")
+        return matrix
 
-def map_from_functions(*, domain, codomain, predict, jvp=None, vjp=None):
+
+def map_from_functions(*, domain, codomain, predict, jvp=None, vjp=None, jacobian=None):
     """Задать прогноз и его производные пользовательскими функциями.
 
     Parameters
@@ -52,6 +77,10 @@ def map_from_functions(*, domain, codomain, predict, jvp=None, vjp=None):
         Перенос ковектора: принимает точку формы domain.shape и
         ковектор формы codomain.shape; возвращает ковектор формы
         domain.shape.
+    jacobian : callable or None, optional
+        Принимает точку формы domain.shape и возвращает матрицу формы
+        (codomain.size, domain.size) в координатном порядке C. Адаптер
+        использует общий тип np.result_type(domain.dtype, codomain.dtype).
 
     Returns
     -------
@@ -63,14 +92,15 @@ def map_from_functions(*, domain, codomain, predict, jvp=None, vjp=None):
         raise TypeError("domain and codomain must be ArraySpace records")
     if not callable(predict):
         raise TypeError("predict must be callable")
-    for name, action in (("jvp", jvp), ("vjp", vjp)):
+    for name, action in (("jvp", jvp), ("vjp", vjp), ("jacobian", jacobian)):
         if action is not None and not callable(action):
             raise TypeError(f"{name} must be callable or None")
-    operation = _FunctionMap(domain, codomain, predict, jvp, vjp)
+    operation = _FunctionMap(domain, codomain, predict, jvp, vjp, jacobian)
     return MapCapabilities(
         operation,
         domain,
         codomain,
         operation if jvp is not None else None,
         operation if vjp is not None else None,
+        operation if jacobian is not None else None,
     )

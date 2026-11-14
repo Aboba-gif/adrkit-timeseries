@@ -47,6 +47,29 @@ class _Composition:
             g = stage.domain.array(operation.vjp(x.copy(), g.copy()), copy=True)
         return g
 
+    def jacobian(self, at):
+        values = self._trace(at)
+        result = None
+        for stage, point in zip(self.stages, values):
+            operation = require_capability(
+                stage.jacobian, operation="Jacobian", consumer="composition"
+            )
+            matrix = np.asarray(operation.jacobian(point.copy()))
+            if (
+                matrix.dtype.kind not in "iuf"
+                or matrix.shape != (stage.codomain.size, stage.domain.size)
+                or not np.isfinite(matrix).all()
+            ):
+                raise ValueError("A composition stage returned an invalid Jacobian")
+            with np.errstate(over="ignore", invalid="ignore"):
+                matrix = np.asarray(
+                    matrix, dtype=np.result_type(stage.domain.dtype, stage.codomain.dtype)
+                )
+                result = matrix.copy() if result is None else matrix @ result
+            if not np.isfinite(result).all():
+                raise FloatingPointError("The composed Jacobian is not representable")
+        return result
+
 
 def compose_maps(*stages):
     r"""Составить отображения в порядке применения.
@@ -60,8 +83,9 @@ def compose_maps(*stages):
     Returns
     -------
     mapping : MapCapabilities
-        Композиция от domain первого этапа к codomain последнего; JVP
-        или VJP доступны при наличии на всех этапах.
+        Композиция от domain первого этапа к codomain последнего; JVP,
+        VJP и Jacobian доступны при наличии соответствующей способности
+        на всех этапах. Отсутствующая матрица не собирается скрыто по JVP.
 
     Notes
     -----
@@ -87,6 +111,7 @@ def compose_maps(*stages):
         stages[-1].codomain,
         operation if all(s.jvp is not None for s in stages) else None,
         operation if all(s.vjp is not None for s in stages) else None,
+        operation if all(s.jacobian is not None for s in stages) else None,
     )
 
 

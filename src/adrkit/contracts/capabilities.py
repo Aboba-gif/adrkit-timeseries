@@ -72,6 +72,26 @@ class VJP(Protocol):
         ...
 
 
+class Jacobian(Protocol):
+    """Полная матрица производной в координатном порядке C."""
+
+    def jacobian(self, at: Any) -> Any:
+        """Вычислить матрицу формы (codomain.size, domain.size).
+
+        Parameters
+        ----------
+        at : object
+            Точка пространства аргументов.
+
+        Returns
+        -------
+        matrix : array_like
+            Конечная вещественная матрица: строки следуют выходным,
+            столбцы входным координатам в порядке C.
+        """
+        ...
+
+
 class ScalarValue(Protocol):
     """Значение скалярного функционала."""
 
@@ -208,6 +228,9 @@ class MapCapabilities:
         Действие производной на направление.
     vjp : VJP or None, optional
         Действие транспонированной производной на ковектор.
+    jacobian : Jacobian or None, optional
+        Явно предоставленная полная матрица производной в порядке C.
+        Наличие одноимённого метода само по себе способность не объявляет.
     """
 
     predict: Predict
@@ -215,6 +238,7 @@ class MapCapabilities:
     codomain: ArraySpace
     jvp: JVP | None = None
     vjp: VJP | None = None
+    jacobian: Jacobian | None = None
 
     def __post_init__(self) -> None:
         require_capability(self.predict, operation="predict", consumer="map")
@@ -295,7 +319,7 @@ def validate_map_capabilities(mapping: MapCapabilities, *, name: str = "mapping"
     Parameters
     ----------
     mapping : MapCapabilities
-        Запись отображения; необязательные JVP и VJP могут отсутствовать.
+        Запись отображения; необязательные JVP, VJP и Jacobian могут отсутствовать.
     name : str, optional
         Имя компонента в сообщениях об ошибках.
 
@@ -315,7 +339,7 @@ def validate_map_capabilities(mapping: MapCapabilities, *, name: str = "mapping"
         raise TypeError(f"{name} must declare MapCapabilities")
     if not isinstance(mapping.domain, ArraySpace) or not isinstance(mapping.codomain, ArraySpace):
         raise TypeError(f"{name} domain and codomain must be ArraySpace records")
-    for method in ("predict", "jvp", "vjp"):
+    for method in ("predict", "jvp", "vjp", "jacobian"):
         operation = getattr(mapping, method)
         if method == "predict" or operation is not None:
             if not callable(getattr(operation, method, None)):

@@ -55,6 +55,19 @@ def _matrix(value, name, size=None):
     return matrix
 
 
+def _operator_directions(partials, directions, count, size, rate):
+    partials = tuple((partials or {}).values())
+    matrices = tuple(_matrix(value, "operator partial", size) / rate for value in partials)
+    if directions is None:
+        if matrices:
+            raise ValueError("Operator partials require explicit operator_directions")
+        coefficients = np.zeros((0, count))
+    else:
+        coefficients = _owned(directions, "operator_directions", shape=(len(matrices), count))
+    active = [j for j, matrix in enumerate(matrices) if matrix.nnz and np.any(coefficients[j])]
+    return tuple(matrices[j] for j in active), coefficients[active]
+
+
 def _decay(u, beta, step):
     if beta == 0.0 or step == 0.0:
         return u.copy()
@@ -358,17 +371,36 @@ class PositiveAffineAction:
         return value
 
     def _tangent(self, powers, du, df, dP, dalpha):
+        partials = () if dP is None else (dP,)
+        directions = np.ones((len(partials), 1))
+        return self._tangent_many(
+            powers, du[:, None], df[:, None], partials, directions, np.array([dalpha])
+        )[:, 0]
+
+    def _tangent_many(self, powers, du, df, partials, directions, dalpha):
         up, fp = powers
-        result = np.zeros(self.size)
+        result = np.zeros_like(du)
+        varying_alpha = np.any(dalpha)
+        active = np.flatnonzero(np.any(directions, axis=0))
+        selected = slice(None) if active.size == du.shape[1] else active
+        operator_coefficients = directions[:, selected]
         for k in range(self.degree + 1):
-            result += (
-                self._growth * self._a[k] * (du + self.step * dalpha * up[k])
-                + self._b[k] * df
-                + dalpha * self._db[k] * fp[k]
-            )
+            result += self._growth * self._a[k] * du + self._b[k] * df
+            if varying_alpha:
+                result += np.multiply.outer(
+                    self.step * self._growth * self._a[k] * up[k] + self._db[k] * fp[k], dalpha
+                )
             if k < self.degree:
-                du = self._transition @ du + (dP @ up[k] if dP is not None else 0.0)
-                df = self._transition @ df + (dP @ fp[k] if dP is not None else 0.0)
+                du, df = self._transition @ du, self._transition @ df
+                if partials:
+                    du[:, selected] += (
+                        np.column_stack([matrix @ up[k] for matrix in partials])
+                        @ operator_coefficients
+                    )
+                    df[:, selected] += (
+                        np.column_stack([matrix @ fp[k] for matrix in partials])
+                        @ operator_coefficients
+                    )
         return result
 
     def _pullback(self, powers, cotangent, partials):
@@ -474,6 +506,46 @@ class PositiveAffineAction:
             self._powers(u, f), _owned(cotangent, "cotangent", shape=(self.size,)), partials
         )
 
+    def jvp_many(
+        self, u, f, du, df=None, *, operator_partials=None, operator_directions=None, dalpha=None
+    ):
+        """Применить производную аффинного подшага к нескольким направлениям.
+
+        Parameters
+        ----------
+        u, f : array_like, shape (N,)
+            Неотрицательные исходные состояние и распределённая нагрузка.
+        du, df : array_like, shape (N, K)
+            Направления по столбцам. du обязателен и задаёт K; df=None
+            означает нулевые направления нагрузки.
+        operator_partials : Mapping, optional
+            Именованные sparse-матрицы частных производных Q.
+        operator_directions : array_like, shape (len(operator_partials), K)
+            Коэффициенты линейных комбинаций частных производных в каждом
+            направлении; порядок строк совпадает с порядком Mapping.
+        dalpha : array_like, shape (K,), optional
+            Направления коэффициента линейного роста; None означает нуль.
+
+        Returns
+        -------
+        tangent : ndarray, shape (N, K)
+            Те же производные, что отдельные JVP при фиксированных rate,
+            degree и весах. Базовые степени P общие для всех столбцов.
+        """
+        u, f = _owned(u, "u", shape=(self.size,), nonnegative=True), _owned(
+            f, "f", shape=(self.size,), nonnegative=True
+        )
+        du = _owned(du, "du")
+        if du.ndim != 2 or du.shape[0] != self.size or du.shape[1] < 1:
+            raise ValueError("du must have shape (N,K) with K>=1")
+        count = du.shape[1]
+        df = np.zeros_like(du) if df is None else _owned(df, "df", shape=du.shape)
+        dalpha = np.zeros(count) if dalpha is None else _owned(dalpha, "dalpha", shape=(count,))
+        partials, directions = _operator_directions(
+            operator_partials, operator_directions, count, self.size, self.rate
+        )
+        return self._tangent_many(self._powers(u, f), du, df, partials, directions, dalpha)
+
 
 @dataclass(frozen=True)
 class StrangTrajectory:
@@ -523,28 +595,139 @@ class StrangTrajectory:
         tangent : ndarray, shape (nt+1, N)
             Касательная траектория. Пространственный load фиксирован.
         """
-        affine, half = self.affine, self.affine.step / 2
-        states = np.zeros_like(self.states)
-        if d_initial is not None:
-            states[0] = _owned(d_initial, "d_initial", shape=(affine.size,))
-        direction = (
-            np.zeros_like(self._forcing)
-            if d_forcing is None
-            else _owned(d_forcing, "d_forcing", shape=self._forcing.shape)
+        initial = (
+            np.zeros(self.affine.size)
+            if d_initial is None
+            else _owned(d_initial, "d_initial", shape=(self.affine.size,))
         )
-        dP = None if dQ is None else _matrix(dQ, "dQ", affine.size) / affine.rate
-        dalpha, dbeta = _scalar(dalpha, "dalpha"), _scalar(dbeta, "dbeta")
-        for n in range(len(states) - 1):
+        forcing = (
+            None
+            if d_forcing is None
+            else _owned(d_forcing, "d_forcing", shape=self._forcing.shape)[..., None]
+        )
+        partials = None if dQ is None else {"direction": dQ}
+        directions = None if dQ is None else np.ones((1, 1))
+        return np.stack(
+            [
+                value[:, 0]
+                for value in self.iter_jvp_many(
+                    initial[:, None],
+                    forcing,
+                    operator_partials=partials,
+                    operator_directions=directions,
+                    dalpha=[_scalar(dalpha, "dalpha")],
+                    dbeta=[_scalar(dbeta, "dbeta")],
+                )
+            ]
+        )
+
+    def iter_jvp_many(
+        self,
+        d_initial,
+        d_forcing=None,
+        *,
+        operator_partials=None,
+        operator_directions=None,
+        dalpha=None,
+        dbeta=None,
+    ):
+        """Выдавать матричные чувствительности по времени одним проходом.
+
+        Parameters
+        ----------
+        d_initial : array_like, shape (N, K)
+            Начальные направления; для фиксированного начального поля —
+            нулевая матрица. Число K>=1 определяется её столбцами.
+        d_forcing : array_like, optional
+            Направления формы (*forcing.shape, K). При скалярной нагрузке
+            с фиксированным load это (nt,K), при распределённой — (nt,N,K).
+        operator_partials : Mapping, optional
+            Частные производные Q, общие для всех временных шагов.
+        operator_directions : array_like, shape (len(operator_partials), K)
+            Коэффициенты операторных направлений в порядке Mapping.
+        dalpha, dbeta : array_like, shape (K,), optional
+            Направления коэффициентов; None означает нули.
+
+        Yields
+        ------
+        sensitivities : ndarray, shape (N, K)
+            Собственные неизменяемые матрицы для начального и последующих
+            временных узлов. Если потребитель не хранит прежние матрицы,
+            память не растёт как nt*N*K. Прямой шаг не изменяется.
+        """
+        affine, half = self.affine, self.affine.step / 2
+        current = _owned(d_initial, "d_initial")
+        if current.ndim != 2 or current.shape[0] != affine.size or current.shape[1] < 1:
+            raise ValueError("d_initial must have shape (N,K) with K>=1")
+        count = current.shape[1]
+        forcing = (
+            None
+            if d_forcing is None
+            else _owned(d_forcing, "d_forcing", shape=(*self._forcing.shape, count))
+        )
+        dalpha = np.zeros(count) if dalpha is None else _owned(dalpha, "dalpha", shape=(count,))
+        dbeta = np.zeros(count) if dbeta is None else _owned(dbeta, "dbeta", shape=(count,))
+        partials, directions = _operator_directions(
+            operator_partials, operator_directions, count, affine.size, affine.rate
+        )
+        yield current
+        for n in range(len(self.states) - 1):
             first = _decay(self.states[n], self.beta, half)
             du, db = _decay_partials(self.states[n], first, half)
             powers = affine._powers(first, self._frame(n))
             middle = affine._value(powers)
-            tangent = affine._tangent(
-                powers, du * states[n] + db * dbeta, self._frame(n, direction), dP, dalpha
+            first_direction = du[:, None] * current + np.multiply.outer(db, dbeta)
+            if forcing is None:
+                forcing_direction = np.zeros_like(current)
+            else:
+                forcing_direction = (
+                    forcing[n] if self._load is None else np.multiply.outer(self._load, forcing[n])
+                )
+            tangent = affine._tangent_many(
+                powers, first_direction, forcing_direction, partials, directions, dalpha
             )
             du, db = _decay_partials(middle, self.states[n + 1], half)
-            states[n + 1] = du * tangent + db * dbeta
-        return states
+            current = du[:, None] * tangent + np.multiply.outer(db, dbeta)
+            if not np.isfinite(current).all():
+                raise FloatingPointError("The batched tangent is not representable")
+            current.flags.writeable = False
+            yield current
+
+    def jvp_many(
+        self,
+        d_initial,
+        d_forcing=None,
+        *,
+        operator_partials=None,
+        operator_directions=None,
+        dalpha=None,
+        dbeta=None,
+    ):
+        """Собрать iter_jvp_many в массив формы (nt+1,N,K).
+
+        Parameters
+        ----------
+        d_initial, d_forcing, operator_partials, operator_directions, dalpha, dbeta
+            Те же аргументы и единицы, что у iter_jvp_many.
+
+        Returns
+        -------
+        states : ndarray, shape (nt+1, N, K)
+            Все чувствительности. Для наблюдений без хранения этого
+            тензора следует непосредственно использовать iterator.
+        """
+        return np.stack(
+            list(
+                self.iter_jvp_many(
+                    d_initial,
+                    d_forcing,
+                    operator_partials=operator_partials,
+                    operator_directions=operator_directions,
+                    dalpha=dalpha,
+                    dbeta=dbeta,
+                )
+            )
+        )
 
     def vjp(self, cotangent, operator_partials=None):
         """Перенести ковектор всей траектории к её входам.

@@ -24,6 +24,99 @@ def generator():
     return sparse.csr_matrix([[-2.0, 2.0, 0.0], [1.0, -4.0, 3.0], [0.0, 2.0, -2.0]])
 
 
+@pytest.mark.parametrize("distributed", [False, True])
+def test_many_tangents_match_finite_differences_scalar_actions_and_pullback(distributed):
+    rng = np.random.default_rng(501)
+    count, intervals = 4, 5
+    q = generator()
+    partials = {"scale": q, "edge": sparse.csr_matrix([[-1, 1, 0], [0, 0, 0], [0, 0, 0]])}
+    coefficients = rng.normal(scale=0.1, size=(len(partials), count))
+    initial = np.array([0.3, 0.1, 0.4])
+    forcing = np.full((intervals, 3) if distributed else (intervals,), 0.3)
+    load = None if distributed else np.array([0.4, 0.0, 0.2])
+    di = rng.normal(scale=0.1, size=(3, count))
+    df = rng.normal(scale=0.1, size=(*forcing.shape, count))
+    da, db = rng.normal(scale=0.1, size=count), rng.normal(scale=0.1, size=count)
+    action = PositiveAffineAction(q, -0.2, step=0.1, rate=5, degree=14)
+    trajectory = solve_strang(action, initial, forcing, beta=0.3, load=load)
+    batch = trajectory.jvp_many(
+        di, df, operator_partials=partials, operator_directions=coefficients, dalpha=da, dbeta=db
+    )
+    streamed = list(
+        trajectory.iter_jvp_many(
+            di,
+            df,
+            operator_partials=partials,
+            operator_directions=coefficients,
+            dalpha=da,
+            dbeta=db,
+        )
+    )
+    assert all(not value.flags.writeable for value in streamed)
+    np.testing.assert_array_equal(np.stack(streamed), batch)
+    cotangent = rng.normal(size=trajectory.states.shape)
+    pulled = trajectory.vjp(cotangent, partials)
+    step = 1e-5
+    for j in range(count):
+        dq = sum(coefficients[i, j] * matrix for i, matrix in enumerate(partials.values()))
+        scalar = trajectory.jvp(di[:, j], df[..., j], dQ=dq, dalpha=da[j], dbeta=db[j])
+        np.testing.assert_allclose(batch[..., j], scalar, rtol=3e-14, atol=3e-15)
+        varied = [
+            solve_strang(
+                PositiveAffineAction(
+                    q + sign * step * dq, -0.2 + sign * step * da[j], step=0.1, rate=5, degree=14
+                ),
+                initial + sign * step * di[:, j],
+                forcing + sign * step * df[..., j],
+                beta=0.3 + sign * step * db[j],
+                load=load,
+            ).states
+            for sign in (1, -1)
+        ]
+        np.testing.assert_allclose(
+            batch[..., j], (varied[0] - varied[1]) / (2 * step), rtol=3e-8, atol=3e-11
+        )
+        right = (
+            di[:, j] @ pulled["initial"]
+            + np.sum(df[..., j] * pulled["forcing"])
+            + da[j] * pulled["alpha"]
+            + db[j] * pulled["beta"]
+            + sum(coefficients[i, j] * pulled["operator"][name] for i, name in enumerate(partials))
+        )
+        np.testing.assert_allclose(
+            np.sum(cotangent * batch[..., j]), right, rtol=3e-13, atol=3e-14
+        )
+    np.testing.assert_array_equal(action.transport_weights, trajectory.affine.transport_weights)
+
+
+def test_affine_many_tangent_shares_the_same_fixed_polynomial_action():
+    q = generator()
+    action = PositiveAffineAction(q, 0.2, step=0.1, rate=5, degree=12)
+    u, f = np.array([0.3, 0.1, 0.4]), np.array([0.1, 0.2, 0.1])
+    du, df = np.arange(9).reshape(3, 3) / 20, np.eye(3) / 10
+    coefficients = np.array([[0.1, -0.2, 0.0]])
+    da = np.array([0.2, -0.1, 0.0])
+    actual = action.jvp_many(
+        u, f, du, df, operator_partials={"scale": q}, operator_directions=coefficients, dalpha=da
+    )
+    expected = np.column_stack(
+        [
+            action.jvp(u, f, du[:, j], df[:, j], dQ=coefficients[0, j] * q, dalpha=da[j])
+            for j in range(3)
+        ]
+    )
+    np.testing.assert_allclose(actual, expected, rtol=3e-14, atol=3e-15)
+
+
+def test_many_tangent_requires_declared_operator_direction_dimensions():
+    action = PositiveAffineAction(generator(), 0.0, step=0.1, rate=5, degree=12)
+    trajectory = solve_strang(action, [0.3, 0.1, 0.4], [0.3, 0.3], load=[1, 0, 0])
+    with pytest.raises(ValueError, match="operator_directions"):
+        list(trajectory.iter_jvp_many(np.zeros((3, 2)), operator_partials={"one": generator()}))
+    with pytest.raises(ValueError, match="shape"):
+        list(trajectory.iter_jvp_many(np.zeros((3, 2)), np.zeros((2, 3))))
+
+
 @pytest.mark.parametrize("alpha", [-0.7, 0.0, 0.8, 5.0, 6.0])
 def test_integral_weights_and_alpha_derivatives_match_independent_quadrature(alpha):
     step, rate, degree = 0.2, 5.0, 8

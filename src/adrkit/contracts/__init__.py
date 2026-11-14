@@ -2,6 +2,7 @@
 
 from .capabilities import (
     JVP,
+    Jacobian,
     VJP,
     MapCapabilities,
     Predict,
@@ -20,6 +21,7 @@ from .capabilities import (
 __all__ = [
     "Predict",
     "JVP",
+    "Jacobian",
     "VJP",
     "ScalarValue",
     "ScalarCotangent",

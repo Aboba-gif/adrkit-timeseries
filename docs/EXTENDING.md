@@ -361,14 +361,15 @@ $N_h$ имели единицы C/T, а элементы якобиана — 1/
 
 ## Отображения и внешний решатель
 
-`adrkit.maps.map_from_functions(domain=..., codomain=..., predict=..., jvp=..., vjp=...)`
+`adrkit.maps.map_from_functions(domain=..., codomain=..., predict=..., jvp=..., vjp=..., jacobian=...)`
 создаёт отображение из функций; `adrkit.spaces.matrix_map` — из матрицы. `ArraySpace`
-задаёт форму, оси, координаты и единицы. JVP и VJP объявляются независимо.
+задаёт форму, оси, координаты и единицы. JVP, VJP и полный Jacobian объявляются независимо.
 VJP возвращает ковектор в евклидовой координатной паре; метрика пространства
 задаётся отдельно.
 
 `matrix_map` возвращает `MapCapabilities`: объекты операций доступны как
-`predict`, `jvp` и `vjp` этой записи. `adrkit.spaces.MatrixMap` предоставляет
+`predict`, `jvp`, `vjp` и `jacobian` этой записи. Полная матрица производной имеет
+форму `(codomain.size, domain.size)` в порядке C. `adrkit.spaces.MatrixMap` предоставляет
 те же операции непосредственными методами. Матрица копируется при создании;
 копия отображения независимо владеет её данными и сохраняет тип наследника.
 
@@ -465,15 +466,18 @@ python -B examples/custom_inverse_problem.py
 
 `solve_damped_gauss_newton(residual, initial, bounds=..., options=..., callback=...)`
 из `adrkit.inverse.optimizers` принимает `MapCapabilities` невязки
-$r:\mathbb R^n\to\mathbb R^m$ с операциями `predict` и `JVP`.
+$r:\mathbb R^n\to\mathbb R^m$ с `predict` и явно объявленной операцией
+`jacobian` либо `jvp`.
 Он минимизирует $J(x)=\frac12\|r(x)\|_2^2$, где $x\in\mathbb R^n$ —
 координаты параметров, $r(x)\in\mathbb R^m$ — вектор невязки.
 Например, для среднего квадрата ошибок нужно задать
 $r(x)=\sqrt{2/m}\,(F(x)-y)$ и умножить JVP на тот же множитель.
 Веса и преобразование координат задаёт автор задачи.
 
-Якобиан $A=Dr(x)\in\mathbb R^{m\times n}$ собирается плотной матрицей
-по JVP координатных направлений. При $J>0$ шаг решает задачу
+Якобиан $A=Dr(x)\in\mathbb R^{m\times n}$ получается явно объявленной
+операцией `jacobian`; если она отсутствует, матрица собирается по JVP
+координатных направлений. Все производные включают ту же нормировку,
+что и невязка. При $J>0$ шаг решает задачу
 
 $$
  \min_{l-x\le p\le u-x}\;

@@ -380,8 +380,8 @@ class GridPrediction:
         return tuple(matrices)
 
     def capabilities(self):
-        """Предоставить прогноз и JVP/VJP как MapCapabilities."""
-        return MapCapabilities(self, self.domain, self.codomain, self, self)
+        """Предоставить прогноз, JVP/VJP и существующий полный Jacobian."""
+        return MapCapabilities(self, self.domain, self.codomain, self, self, self)
 
 
 class SelectedPrediction:

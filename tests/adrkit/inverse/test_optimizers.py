@@ -26,6 +26,46 @@ def linear_residual(matrix, target):
     )
 
 
+def test_declared_full_jacobian_avoids_scalar_jvp_and_keeps_the_same_problem():
+    matrix, target = np.array([[1.0, 1.0], [0.0, 1.0]]), np.array([2.0, 0.0])
+    fallback = linear_residual(matrix, target)
+
+    def forbidden_jvp(point, direction):
+        raise AssertionError("The declared Jacobian must replace scalar JVP calls")
+
+    accelerated = map_from_functions(
+        domain=fallback.domain,
+        codomain=fallback.codomain,
+        predict=lambda x: matrix @ x - target,
+        jvp=forbidden_jvp,
+        jacobian=lambda x: matrix,
+    )
+    options = {"gtol": 1e-8, "maxiter": 100}
+    direct = optimizers.solve_damped_gauss_newton(
+        accelerated, [0.2, 0.2], bounds=[(0, 1), (0, 1)], options=options
+    )
+    scalar = optimizers.solve_damped_gauss_newton(
+        fallback, [0.2, 0.2], bounds=[(0, 1), (0, 1)], options=options
+    )
+    np.testing.assert_allclose(direct.x, scalar.x, rtol=0, atol=1e-13)
+    np.testing.assert_allclose(direct.fun, scalar.fun, rtol=3e-14)
+    assert direct.success and direct.njvp == 0 and direct.njev > 0
+    assert scalar.njvp > 0
+
+
+def test_bad_declared_jacobian_does_not_silently_fall_back_to_jvp():
+    domain = space(2, "parameter")
+    residual = map_from_functions(
+        domain=domain,
+        codomain=domain,
+        predict=lambda x: x - 1,
+        jvp=lambda x, h: h,
+        jacobian=lambda x: np.ones((1, 2)),
+    )
+    with pytest.raises(ValueError, match="Jacobian"):
+        optimizers.solve_damped_gauss_newton(residual, [0.0, 0.0])
+
+
 def test_coupled_box_step_is_not_a_clipped_unconstrained_step():
     matrix = np.array([[1.0, 1.0], [0.0, 1.0]])
     target = np.array([2.0, 0.0])

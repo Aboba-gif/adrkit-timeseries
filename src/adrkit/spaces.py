@@ -302,6 +302,15 @@ class MatrixMap(_LinearMap):
     def _rmatvec(self, z):
         return self._matrix.T @ z
 
+    def jacobian(self, at):
+        """Вернуть собственную копию матрицы в порядке C в допустимой точке."""
+        self.domain.array(at, name="at")
+        return self._matrix.copy()
+
+    def capabilities(self):
+        """Предоставить прямое действие, JVP/VJP и явно заданную матрицу."""
+        return MapCapabilities(self, self.domain, self.codomain, self, self, self)
+
     @property
     def matrix(self):
         """Независимая копия матрицы формы (codomain.size, domain.size)."""
