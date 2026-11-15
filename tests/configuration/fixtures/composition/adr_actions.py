@@ -72,7 +72,7 @@ def run(config, *, mode, inputs=None, output_root=None):
     assembled = assemble(config, inputs=inputs)
     report = {
         "effective_config": config.to_dict(),
-        "effective_science_sha256": config.effective_science_sha256,
+        "science_identity": config.science_identity.to_value(),
     }
     if mode == "validate":
         report["validated"] = True

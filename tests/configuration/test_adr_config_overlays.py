@@ -28,7 +28,7 @@ def test_full_and_overlays_have_same_identity_and_outputs(tmp_path, composition_
         },
     )
     direct, merged = load([full]), load([basefile, overlay])
-    assert direct.effective_science_sha256 == merged.effective_science_sha256
+    assert direct.science_identity.to_value() == merged.science_identity.to_value()
     assert direct.to_dict() == merged.to_dict()
     assert direct.provenance.to_dict() != merged.provenance.to_dict()
     assert run(direct, mode="smoke") == run(merged, mode="run")

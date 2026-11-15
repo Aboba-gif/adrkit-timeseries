@@ -161,7 +161,7 @@ def load_sources(specs, *, panel_spec, anchor=None):
 
     Notes
     -----
-    Проверяется SHA-256 прочитанных байтов и структура CSV. Дубли
+    Проверяется структура CSV. Дубли
     времени, поста и канала проверяются до попадания времени на сетку.
     Маршрут ``strict`` отклоняет неподходящее время; ``quarantine`` сохраняет
     исходный адрес и причину исключения до разбора числа. У принятых
@@ -170,7 +170,6 @@ def load_sources(specs, *, panel_spec, anchor=None):
     Порядок постов и каналов задаёт ``PanelSpec``.
     """
     import csv
-    import hashlib
     import io
     from math import isfinite
 
@@ -183,7 +182,6 @@ def load_sources(specs, *, panel_spec, anchor=None):
         NetworkPanel,
         QuarantinedValue,
         RowLocator,
-        SourceIntegrityError,
         SourceProvenance,
         clock_timestamp,
     )
@@ -219,9 +217,6 @@ def load_sources(specs, *, panel_spec, anchor=None):
             content = path.read_bytes()
         except (FileNotFoundError, IsADirectoryError) as exc:
             raise MissingInputError(f"missing input file: {path}") from exc
-        actual_hash = hashlib.sha256(content).hexdigest()
-        if actual_hash != source["sha256"]:
-            raise SourceIntegrityError(f"{source['id']}: source SHA256 mismatch")
         fmt = source["format"]["parameters"]
         try:
             reader = csv.reader(
@@ -282,7 +277,7 @@ def load_sources(specs, *, panel_spec, anchor=None):
 
             for channel, header in columns["values"].items():
                 locator = RowLocator(
-                    source["id"], actual_hash, row_number, site, channel, raw_time, row[header]
+                    source["id"], row_number, site, channel, raw_time, row[header]
                 )
                 reason = None
                 if missing_stamp:

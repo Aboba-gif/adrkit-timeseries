@@ -1,8 +1,6 @@
-"""Интерполяция без обучения и проверка исходных байтов."""
+"""Интерполяция без обучения и проверка исходных значений."""
 
 import copy
-
-import hashlib
 
 import importlib.util
 
@@ -45,7 +43,6 @@ def data_config(tmp_path):
     source = dict(
         id="tiny",
         path="tiny.csv",
-        sha256=hashlib.sha256(raw).hexdigest(),
         format={"kind": "csv", "parameters": {"separator": ",", "encoding": "utf-8"}},
         columns={"time": ["time"], "values": {"x": "value"}},
         time={
@@ -76,7 +73,7 @@ def data_config(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["linear", "pchip"])
-def test_imputation_caller_and_hash(tmp_path, kind):
+def test_imputation_caller_reads_current_source_values(tmp_path, kind):
     cfg = data_config(tmp_path)
     if kind == "pchip":
         cfg = load(
@@ -86,9 +83,11 @@ def test_imputation_caller_and_hash(tmp_path, kind):
     result = run(cfg, mode="smoke")["result"]
     np.testing.assert_array_equal(result["prediction"], [[[1]], [[2]], [[3]]])
     assert result["fit"] is False
-    (tmp_path / "tiny.csv").write_text("changed bytes")
-    with pytest.raises(ConfigError, match="mismatch"):
-        run(cfg, mode="smoke")
+    (tmp_path / "tiny.csv").write_text(
+        "time,value\n2020-01-01 00:00:00,5\n2020-01-01 01:00:00,\n2020-01-01 02:00:00,7\n"
+    )
+    changed = run(cfg, mode="smoke")["result"]
+    np.testing.assert_array_equal(changed["prediction"], [[[5]], [[6]], [[7]]])
 
 
 def test_validation_before_data_io_or_outputs(tmp_path):

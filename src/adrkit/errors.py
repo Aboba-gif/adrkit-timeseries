@@ -6,4 +6,4 @@ class CapabilityError(ValueError):
 
 
 class ConfigError(ValueError):
-    """Ошибка параметров конфигурации, пути или контрольной суммы."""
+    """Ошибка параметров конфигурации или пути ресурса."""

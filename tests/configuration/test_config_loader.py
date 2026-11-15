@@ -1,6 +1,5 @@
 """Научные входы и каталог результатов в общей JSON-конфигурации."""
 
-import hashlib
 import json
 
 import pytest
@@ -26,14 +25,14 @@ def schema():
         if "data" in result:
             closed_object(
                 result["data"],
-                {"path", "sha256"},
-                set() if context.partial else {"path", "sha256"},
+                {"path"},
+                set() if context.partial else {"path"},
             )
         return result
 
     def resources(science):
         if "path" in science.get("data", {}):
-            return (ResourcePath("/science/data/path", "/science/data/sha256"),)
+            return (ResourcePath("/science/data/path"),)
         return ()
 
     return ScienceSchema("test", "test/1", normalize, resources)
@@ -62,7 +61,7 @@ def test_output_destination_keeps_scientific_identity(tmp_path):
     assert direct.to_dict()["execution"] == {"output_root": None}
     assert redirected.to_dict()["execution"] == {"output_root": str(destination)}
     assert direct.science_identity.to_dict() == redirected.science_identity.to_dict()
-    assert direct.effective_science_sha256 == redirected.effective_science_sha256
+    assert direct.to_record().to_dict()["science_identity"] == direct.science_identity.to_value()
     assert redirected.provenance.to_dict()["overrides"][0]["pointer"] == "/execution/output_root"
     assert not destination.exists()
 
@@ -79,7 +78,7 @@ def test_input_and_output_paths_keep_their_file_origins(tmp_path, monkeypatch):
         base / "config.json",
         science={
             "gain": 2,
-            "data": {"path": "data.csv", "sha256": hashlib.sha256(raw).hexdigest()},
+            "data": {"path": "data.csv"},
         },
     )
     addition = overlay / "output.json"
@@ -103,7 +102,9 @@ def test_input_and_output_paths_keep_their_file_origins(tmp_path, monkeypatch):
         "config",
     ]
     source.write_bytes(b"changed source")
-    with pytest.raises(ConfigError, match="resource content mismatch"):
+    assert verify_resources(config) == config.resources
+    source.unlink()
+    with pytest.raises(ConfigError, match="missing/unreadable resource"):
         verify_resources(config)
 
 
@@ -116,7 +117,6 @@ def test_output_path_cannot_replace_a_scientific_input(tmp_path):
             "gain": 2,
             "data": {
                 "path": source.name,
-                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             },
         },
     )
@@ -209,7 +209,6 @@ def test_literal_paths_keep_file_overlay_and_cli_anchors(tmp_path, monkeypatch, 
             "gain": 2,
             "data": {
                 "path": relative_source,
-                "sha256": hashlib.sha256(raw).hexdigest(),
             },
         },
     )
@@ -268,9 +267,51 @@ def test_literal_paths_keep_file_overlay_and_cli_anchors(tmp_path, monkeypatch, 
     assert cli.provenance.to_dict()["origins"]["/science/data/path"]["kind"] == "cli"
     assert cli.to_dict()["execution"]["output_root"] == str(base / literal / "cli-results")
     assert not (base / literal / "cli-results").exists()
-    assert direct.effective_science_sha256 == anchored.effective_science_sha256
+    assert direct.science_identity.to_value() == anchored.science_identity.to_value()
     assert (
-        direct.effective_science_sha256
-        == overlaid.effective_science_sha256
-        == cli.effective_science_sha256
+        direct.science_identity.to_value()
+        == overlaid.science_identity.to_value()
+        == cli.science_identity.to_value()
     )
+
+
+def test_scientific_identity_compares_values_versions_and_resource_paths(tmp_path):
+    path = write_config(
+        tmp_path / "config.json", science={"gain": 2, "data": {"path": "first.csv"}}
+    )
+    direct = load_config([path], schema=schema())
+    identity = direct.science_identity.to_value()
+    assert identity == {
+        "schema_version": "adrkit.experiment/1",
+        "pipeline": "test",
+        "science_schema_version": "test/1",
+        "science": {"gain": 2.0, "data": {"path": str(tmp_path / "first.csv")}},
+    }
+    changed = load_config(
+        [path],
+        schema=schema(),
+        config_root=tmp_path,
+        overrides=['/science/data/path="second.csv"'],
+    )
+    assert changed.science_identity.to_value() != identity
+
+
+def test_replacement_history_preserves_values_before_path_resolution(tmp_path):
+    path = write_config(
+        tmp_path / "config.json", science={"gain": 2, "data": {"path": "first.csv"}}
+    )
+    config = load_config(
+        [path],
+        schema=schema(),
+        config_root=tmp_path,
+        overrides=['/science/data/path="second.csv"'],
+    )
+    history = config.provenance.to_dict()["replacements"]
+    inserted = next(row for row in history if row["pointer"] == "/science")
+    assert inserted["existed"] is False and inserted["old_value"] is None
+    assert inserted["new_value"] == {"gain": 2, "data": {"path": "first.csv"}}
+    replaced = next(row for row in history if row["pointer"] == "/science/data/path")
+    assert replaced["existed"] is True
+    assert replaced["old_value"] == "first.csv"
+    assert replaced["new_value"] == "second.csv"
+    assert config.to_dict()["science"]["data"]["path"] == str(tmp_path / "second.csv")

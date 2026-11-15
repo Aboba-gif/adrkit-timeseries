@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from timeseries.contracts import DataContractError, DuplicateObservationError, SourceIntegrityError
+from timeseries.contracts import DataContractError, DuplicateObservationError
 from timeseries.data import build_data
 
 
@@ -30,17 +30,22 @@ def test_csv_partition_order_does_not_change_panel(csv_case, shards, reverse):
         with Path(source["path"]).open(newline="") as stream:
             raw = list(csv.reader(stream))[entry.row.row_number - 1]
         assert raw == [entry.row.raw_time, entry.row.site, entry.row.raw_value]
-        assert entry.row.sha256 == source["sha256"]
 
 
-def test_inert_data_builder_then_exact_bytes_validation(csv_case):
+def test_inert_data_builder_reads_current_csv_and_keeps_its_own_spec(csv_case):
     specs, panel = csv_case()
     assembly = build_data(specs, panel_spec=panel)
     specs[0]["units"]["x"] = "changed"
     path = Path(assembly.specs[0].to_dict()["path"])
-    path.write_bytes(path.read_bytes() + b"\n")
-    with pytest.raises(SourceIntegrityError):
-        assembly.load()
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "2020-01-01 00:00:00,A,1", "2020-01-01 00:00:00,A,2"
+        ),
+        encoding="utf-8",
+    )
+    result = assembly.load()
+    assert result.panel.values[0, 1, 0] == 2.0
+    assert assembly.specs[0].to_dict()["units"]["x"] == "ug/m3"
 
 
 @pytest.mark.parametrize("failure", ["duplicate_id", "units", "clock", "unknown"])

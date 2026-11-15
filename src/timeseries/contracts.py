@@ -18,10 +18,6 @@ class MissingInputError(DataContractError):
     """Отсутствующий обязательный файл, столбец, пост или канал."""
 
 
-class SourceIntegrityError(DataContractError):
-    """Несовпадение SHA-256 файла с указанной контрольной суммой."""
-
-
 class DuplicateObservationError(DataContractError):
     """Повторное значение для одной точки времени, поста и канала."""
 
@@ -158,7 +154,7 @@ class InputSourceSpec(_JSONSpec):
     Parameters
     ----------
     value : dict
-        Описание с полями ``id``, ``path``, ``sha256``, ``format``,
+        Описание с полями ``id``, ``path``, ``format``,
         ``columns``, ``time``, ``site``,
         ``units``, ``missing_values`` и ``route``. ``columns.time`` содержит один
         заголовок времени либо пару даты и времени; ``columns.values``
@@ -171,8 +167,6 @@ class InputSourceSpec(_JSONSpec):
     разбор локального времени, часы, календарь, зону, DST, шаг и ``origin``.
     Разбор ``pandas_infer``, а также DST ``shift``/``drop`` допускаются только при
     ``route='quarantine'``. ``missing_values`` содержит буквальные CSV-токены.
-    SHA-256 задаётся 64 строчными шестнадцатеричными цифрами.
-
     Относительный ``path`` разрешается от абсолютного ``anchor`` в ``build_data``.
     Создание записи не читает файл; ``to_dict`` возвращает независимую копию.
     """
@@ -183,7 +177,6 @@ class InputSourceSpec(_JSONSpec):
         fields = {
             "id",
             "path",
-            "sha256",
             "format",
             "columns",
             "time",
@@ -195,8 +188,6 @@ class InputSourceSpec(_JSONSpec):
         closed(value, fields, where="source")
         for key in ("id", "path"):
             text(value[key], "source." + key)
-        if type(value["sha256"]) is not str or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"]):
-            raise DataContractError("source.sha256: expected lowercase SHA256")
         fmt = closed(value["format"], {"kind", "parameters"}, where="format")
         choice(fmt["kind"], {"csv"}, "format.kind")
         params = closed(fmt["parameters"], {"separator", "encoding"}, where="csv.parameters")
@@ -330,7 +321,7 @@ class PanelSpec(_JSONSpec):
 
 
 def source_resource_pointers(specs, *, prefix):
-    """Вернуть адреса пути и контрольной суммы источников в JSON.
+    """Вернуть адреса путей источников в JSON.
 
     Parameters
     ----------
@@ -342,9 +333,8 @@ def source_resource_pointers(specs, *, prefix):
 
     Returns
     -------
-    pointers : tuple of tuple of str
-        Пары JSON Pointer к ``path`` и ``sha256`` для каждого источника в
-        исходном порядке.
+    pointers : tuple of str
+        JSON Pointer к ``path`` для каждого источника в исходном порядке.
     """
     if (
         type(prefix) is not str
@@ -358,7 +348,7 @@ def source_resource_pointers(specs, *, prefix):
     for spec in specs:
         if not isinstance(spec, InputSourceSpec):
             InputSourceSpec(spec)
-    return tuple((f"{prefix}/{i}/path", f"{prefix}/{i}/sha256") for i in range(len(specs)))
+    return tuple(f"{prefix}/{i}/path" for i in range(len(specs)))
 
 
 def snapshot(value, *, dtype, shape, name):
@@ -403,8 +393,6 @@ class RowLocator:
     ----------
     source_id : str
         Идентификатор источника.
-    sha256 : str
-        SHA-256 прочитанных байтов файла.
     row_number : int
         Номер CSV-записи: заголовок имеет номер 1, данные начинаются с
         2.
@@ -415,7 +403,6 @@ class RowLocator:
     """
 
     source_id: str
-    sha256: str
     row_number: int
     site: str
     channel: str

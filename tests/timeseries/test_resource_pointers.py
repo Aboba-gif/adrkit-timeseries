@@ -16,9 +16,7 @@ def test_source_pointers_support_another_configuration_location(csv_case, monkey
     monkeypatch.setattr(Path, "read_bytes", forbidden)
     prefix = "/datasets/sensor~1array~0raw"
     actual = source_resource_pointers(specs, prefix=prefix)
-    assert actual == tuple(
-        (f"{prefix}/{i}/path", f"{prefix}/{i}/sha256") for i in range(len(specs))
-    )
+    assert actual == tuple(f"{prefix}/{i}/path" for i in range(len(specs)))
 
 
 @pytest.mark.parametrize(

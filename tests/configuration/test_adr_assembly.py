@@ -2,8 +2,6 @@
 
 import copy
 
-import hashlib
-
 import importlib.util
 
 import json
@@ -55,7 +53,7 @@ def test_full_overlay_and_independent_solution():
     full = config()
     merged = load([str(CONFIGS / (n + ".json")) for n in ("base", "overlay")])
     assert full.to_dict() == merged.to_dict()
-    assert full.effective_science_sha256 == merged.effective_science_sha256
+    assert full.science_identity.to_value() == merged.science_identity.to_value()
     a, b = run(full, mode="smoke"), run(merged, mode="run")
     assert a == b
     assert full.provenance.to_dict() != merged.provenance.to_dict()

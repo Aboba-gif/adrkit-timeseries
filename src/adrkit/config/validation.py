@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -125,26 +123,6 @@ def number(
     return 0.0 if result == 0 else result
 
 
-def sha256(value: Any, *, where: str = "sha256") -> str:
-    """Проверить запись контрольной суммы SHA-256.
-
-    Parameters
-    ----------
-    value : str
-        64 шестнадцатеричных символа в нижнем регистре.
-    where : str, optional
-        Имя поля в сообщении об ошибке.
-
-    Returns
-    -------
-    digest : str
-        Проверенная исходная строка.
-    """
-    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
-        raise ConfigError(f"{where}: expected lowercase SHA256")
-    return value
-
-
 def _json_value(value: Any) -> Any:
     if value is None or type(value) in (str, bool, int):
         return value
@@ -186,22 +164,6 @@ def canonical_bytes(value: Any) -> bytes:
         ).encode("utf-8")
     except (ValueError, UnicodeError, RecursionError) as exc:
         raise ConfigError(f"invalid canonical JSON: {exc}") from exc
-
-
-def digest(value: Any) -> str:
-    """Вычислить SHA-256 нормализованного JSON-значения.
-
-    Parameters
-    ----------
-    value : JSON value
-        Значение, допустимое для canonical_bytes.
-
-    Returns
-    -------
-    digest : str
-        Шестнадцатеричная контрольная сумма нормализованных байтов.
-    """
-    return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
 def strict_json(data: bytes | str) -> Any:
@@ -296,8 +258,3 @@ class JSONRecord:
             Сохранённое неизменяемое UTF-8 представление.
         """
         return self._bytes
-
-    @property
-    def sha256(self) -> str:
-        """Шестнадцатеричная SHA-256 сохранённых нормализованных байтов."""
-        return hashlib.sha256(self._bytes).hexdigest()

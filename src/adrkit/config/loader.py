@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import platform
 import re
 from dataclasses import dataclass, field
@@ -13,8 +12,6 @@ from adrkit.errors import ConfigError
 from .validation import (
     JSONRecord,
     closed_object,
-    digest,
-    sha256,
     strict_json,
     string,
 )
@@ -40,18 +37,15 @@ class ValidationContext:
 
 @dataclass(frozen=True)
 class ResourcePath:
-    """Пути ресурса и ожидаемой контрольной суммы в JSON.
+    """Путь ресурса в JSON.
 
     Parameters
     ----------
     pointer : str
         JSON Pointer имени файла ресурса.
-    sha256_pointer : str
-        JSON Pointer ожидаемой SHA-256 его содержимого.
     """
 
     pointer: str
-    sha256_pointer: str
 
 
 @dataclass(frozen=True)
@@ -98,8 +92,6 @@ class ConfigDocument:
         Индекс документа в порядке чтения, начиная с нуля.
     locator : str
         Абсолютный путь прочитанного файла.
-    sha256 : str
-        SHA-256 исходных байтов файла.
     document_role : str
         Роль документа; загрузчик поддерживает config.
     tree : JSONRecord
@@ -112,7 +104,6 @@ class ConfigDocument:
 
     ordinal: int
     locator: str
-    sha256: str
     document_role: str
     tree: JSONRecord
     original: str
@@ -121,7 +112,7 @@ class ConfigDocument:
 
 @dataclass(frozen=True)
 class ResourceBinding:
-    """Файл ресурса с ожидаемой контрольной суммой.
+    """Разрешённый путь объявленного ресурса.
 
     Parameters
     ----------
@@ -129,13 +120,10 @@ class ResourceBinding:
         JSON Pointer ресурса в конфигурации.
     locator : str
         Абсолютный разрешённый путь файла.
-    sha256 : str
-        Ожидаемая SHA-256 содержимого.
     """
 
     pointer: str
     locator: str
-    sha256: str
 
 
 @dataclass(frozen=True)
@@ -147,25 +135,19 @@ class EffectiveConfig:
     config : JSONRecord
         Действующая конфигурация с разрешёнными путями.
     science_identity : JSONRecord
-        Научные параметры без параметров выполнения; пути ресурсов
-        заменены ожидаемыми контрольными суммами.
+        Нормализованные научные параметры и версии схем без параметров
+        выполнения, с разрешёнными путями ресурсов. Сравниваются сами значения.
     provenance : JSONRecord
         Происхождение значений, входные документы и
         последовательность замен.
     resources : tuple of ResourceBinding
-        Объявленные внешние файлы; проверка содержимого выполняется
-        отдельно.
+        Объявленные внешние файлы; проверка доступности выполняется отдельно.
     """
 
     config: JSONRecord
     science_identity: JSONRecord
     provenance: JSONRecord
     resources: tuple[ResourceBinding, ...]
-
-    @property
-    def effective_science_sha256(self) -> str:
-        """SHA-256 нормализованной записи science_identity."""
-        return self.science_identity.sha256
 
     def to_dict(self) -> dict:
         """Получить действующую конфигурацию словарём.
@@ -183,12 +165,12 @@ class EffectiveConfig:
         Returns
         -------
         record : JSONRecord
-            Действующие параметры, их научная SHA-256 и provenance.
+            Действующие параметры, научная постановка и provenance.
         """
         return JSONRecord(
             {
                 "effective_config": self.to_dict(),
-                "effective_science_sha256": self.effective_science_sha256,
+                "science_identity": self.science_identity.to_value(),
                 "provenance": self.provenance.to_dict(),
             }
         )
@@ -302,7 +284,7 @@ def read_configs(files, *, config_root: str | Path | None = None) -> tuple[Confi
     Returns
     -------
     documents : tuple of ConfigDocument
-        Документы с SHA-256 исходных байтов в порядке files.
+        Документы с нормализованными значениями в порядке files.
     """
     root = _root(config_root)
     if isinstance(files, (str, bytes, Path)):
@@ -320,7 +302,6 @@ def read_configs(files, *, config_root: str | Path | None = None) -> tuple[Confi
             ConfigDocument(
                 ordinal,
                 locator,
-                hashlib.sha256(data).hexdigest(),
                 tree.get("document_role", "config"),
                 JSONRecord(tree),
                 str(raw),
@@ -408,7 +389,7 @@ def compose_config(
     Поздние значения заменяют ранние; словари объединяются, списки
     заменяются целиком. При смене kind нужен полный объект. Значения
     по умолчанию применяются к отсутствующим ключам. Явный null
-    сохраняется. Содержимое ресурсов проверяет verify_resources.
+    сохраняется. Доступность ресурсов проверяет verify_resources.
     """
     root = _root(config_root)
     documents = tuple(documents)
@@ -435,8 +416,9 @@ def compose_config(
         history.append(
             {
                 "pointer": pointer,
-                "old_sha256": digest(old) if existed else None,
-                "new_sha256": digest(new),
+                "existed": existed,
+                "old_value": JSONRecord(old).to_value() if existed else None,
+                "new_value": JSONRecord(new).to_value(),
                 "origin": dict(origin),
             }
         )
@@ -484,9 +466,7 @@ def compose_config(
         if len({p.pointer for p in paths}) != len(paths):
             raise ConfigError("duplicate resource locator declaration")
         for item in paths:
-            if not item.pointer.startswith("/science/") or not item.sha256_pointer.startswith(
-                "/science/"
-            ):
+            if not item.pointer.startswith("/science/"):
                 raise ConfigError("science resource pointers must be within /science")
         return paths
 
@@ -502,7 +482,6 @@ def compose_config(
     for ordinal, doc in enumerate(documents):
         if not isinstance(doc, ConfigDocument) or doc.ordinal != ordinal:
             raise ConfigError("config documents must retain their ordered ordinals")
-        sha256(doc.sha256, where="config content hash")
         if not Path(doc.locator).is_absolute():
             raise ConfigError("config document locator must be absolute")
         content = doc.tree.to_dict()
@@ -516,7 +495,6 @@ def compose_config(
             "kind": "file",
             "ordinal": ordinal,
             "locator": doc.locator,
-            "sha256": doc.sha256,
             "anchor": str(Path(doc.locator).parent),
         }
         complete = []
@@ -577,14 +555,9 @@ def compose_config(
     normalize(partial=False)
     check_paths()
 
-    projection = {
-        key: JSONRecord(tree[key]).to_value()
-        for key in ("schema_version", "pipeline", "science_schema_version", "science")
-    }
     paths = locators()
     resolved, bindings = {}, []
     for path in paths:
-        expected = sha256(_get(tree, path.sha256_pointer), where=path.sha256_pointer)
         raw = _get(tree, path.pointer)
         origin = origins[path.pointer]
         locator = resolve_locator(raw, anchor=origin.get("anchor"))
@@ -594,9 +567,7 @@ def compose_config(
             "resolved": locator,
         }
         _set(tree, path.pointer, locator, arrays=True)
-        if path.pointer.startswith("/science/"):
-            _set(projection, path.pointer, {"content_sha256": expected}, arrays=True)
-        bindings.append(ResourceBinding(path.pointer, locator, expected))
+        bindings.append(ResourceBinding(path.pointer, locator))
     ptr = "/execution/output_root"
     raw = tree["execution"]["output_root"]
     if raw is not None:
@@ -611,14 +582,18 @@ def compose_config(
         raise ConfigError("output_root collides with an input locator")
     return EffectiveConfig(
         JSONRecord(tree),
-        JSONRecord(projection),
+        JSONRecord(
+            {
+                key: tree[key]
+                for key in ("schema_version", "pipeline", "science_schema_version", "science")
+            }
+        ),
         JSONRecord(
             {
                 "inputs": [
                     {
                         "ordinal": d.ordinal,
                         "locator": d.locator,
-                        "sha256": d.sha256,
                         "original": d.original,
                         "anchor": d.anchor,
                         "document_role": d.document_role,
@@ -676,12 +651,12 @@ def load_config(
 
 
 def verify_resources(config: EffectiveConfig) -> tuple[ResourceBinding, ...]:
-    """Проверить контрольные суммы объявленных ресурсов.
+    """Проверить доступность объявленных файлов ресурсов для чтения.
 
     Parameters
     ----------
     config : EffectiveConfig
-        Конфигурация с абсолютными путями и ожидаемыми SHA-256.
+        Конфигурация с абсолютными путями ресурсов.
 
     Returns
     -------
@@ -690,16 +665,13 @@ def verify_resources(config: EffectiveConfig) -> tuple[ResourceBinding, ...]:
 
     Notes
     -----
-    Несовпадение суммы или ошибка чтения вызывает ConfigError.
+    Отсутствующий или недоступный файл вызывает ConfigError. Содержимое
+    файла здесь не читается; формат и значения проверяет потребитель ресурса.
     """
     for binding in config.resources:
-        hasher = hashlib.sha256()
         try:
-            with open(binding.locator, "rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    hasher.update(chunk)
+            with open(binding.locator, "rb"):
+                pass
         except OSError as exc:
             raise ConfigError(f"missing/unreadable resource: {binding.pointer}") from exc
-        if hasher.hexdigest() != binding.sha256:
-            raise ConfigError(f"resource content mismatch: {binding.pointer}")
     return config.resources

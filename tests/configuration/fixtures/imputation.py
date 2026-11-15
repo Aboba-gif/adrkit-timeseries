@@ -75,7 +75,7 @@ def imputation_schema():
             ()
             if specs is None
             else tuple(
-                ResourcePath(*p)
+                ResourcePath(p)
                 for p in source_resource_pointers(specs, prefix="/science/data/sources")
             )
         )
@@ -108,7 +108,7 @@ def predict_export(assembled):
     from timeseries.contracts import conceal
 
     data, imputer = assembled.data, assembled.imputer
-    loaded = data.load()  # При загрузке проверяется контрольная сумма прочитанных байтов.
+    loaded = data.load()  # При загрузке проверяются структура и значения CSV.
     panel = loaded.panel
     empty = np.zeros(panel.values.shape, dtype=bool)
     inputs, _truth = conceal(
@@ -137,7 +137,7 @@ def run(config, *, mode, inputs=None, output_root=None):
     assembled = assemble(config, inputs=inputs)
     report = {
         "effective_config": config.to_dict(),
-        "effective_science_sha256": config.effective_science_sha256,
+        "science_identity": config.science_identity.to_value(),
     }
     if mode == "validate":
         report["validated"] = True

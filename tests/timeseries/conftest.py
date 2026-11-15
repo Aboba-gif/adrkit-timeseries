@@ -1,7 +1,6 @@
 """Малые сгенерированные входы, без копирования научных данных."""
 
 import csv
-import hashlib
 import pytest
 
 
@@ -43,7 +42,6 @@ def csv_case(tmp_path):
                 dict(
                     id=f"part-{i}",
                     path=str(path),
-                    sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                     format={"kind": "csv", "parameters": {"separator": ",", "encoding": "utf-8"}},
                     columns={"time": ["time"], "values": {"x": "value"}},
                     time={

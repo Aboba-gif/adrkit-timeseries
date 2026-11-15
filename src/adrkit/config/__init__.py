@@ -17,10 +17,8 @@ from .validation import (
     JSONRecord,
     canonical_bytes,
     closed_object,
-    digest,
     integer,
     number,
-    sha256,
     strict_json,
     string,
 )
@@ -40,10 +38,8 @@ __all__ = [
     "JSONRecord",
     "canonical_bytes",
     "closed_object",
-    "digest",
     "integer",
     "number",
-    "sha256",
     "strict_json",
     "string",
 ]
