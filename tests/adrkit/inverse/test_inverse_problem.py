@@ -6,6 +6,7 @@ import pytest
 from adrkit.contracts import MapCapabilities, ScalarCapabilities
 from adrkit.errors import CapabilityError
 from adrkit.inverse import InverseProblem
+from adrkit.inverse.constraints import project_nonnegative_equalities
 from adrkit.selection import Selection
 from adrkit.spaces import ArraySpace
 
@@ -446,3 +447,82 @@ def test_malformed_selection_rejected_before_forward(malformed_part):
             ScalarCapabilities(operation, domain, operation),
             selection=SimpleNamespace(**values),
         )
+
+
+def test_weighted_nonnegative_projection_matches_unconstrained_analytic_solution():
+    reference = np.ones(3)
+    h, mass = np.ones((1, 3)), np.array([1.0, 2.0, 4.0])
+    result = project_nonnegative_equalities(reference, h, [6.0], mass)
+    np.testing.assert_allclose(result.x, np.array([19.0, 13.0, 10.0]) / 7, atol=1e-12)
+    np.testing.assert_allclose(h @ result.x, [6.0], atol=1e-12)
+    assert result.success and result.diagnostics["active_count"] == 0
+    np.testing.assert_array_equal(reference, np.ones(3))
+
+
+def test_nonnegative_projection_resolves_active_bound_without_clipping_equalities():
+    result = project_nonnegative_equalities([2.0, 0.0], [[1.0, 1.0]], [1.0], [1.0, 3.0])
+    # Unconstrained projection is (1.25,-0.25); clipping would violate H U = 1.
+    np.testing.assert_allclose(result.x, [1.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(result.equality_multipliers, [1.0], atol=1e-12)
+    np.testing.assert_allclose(result.lower_multipliers, [0.0, 1.0], atol=1e-12)
+    assert result.fun == pytest.approx(0.5)
+    assert result.diagnostics["equality_residual_inf"] < 1e-12
+    assert result.diagnostics["kkt_residual_inf"] < 1e-12
+
+
+def test_nonnegative_projection_accepts_signed_redundant_observations():
+    result = project_nonnegative_equalities(
+        [0.0, 0.0], [[1.0, -1.0], [2.0, -2.0]], [1.0, 2.0], [2.0, 1.0]
+    )
+    np.testing.assert_allclose(result.x, [1.0, 0.0], atol=1e-12)
+    assert result.diagnostics["kkt_residual_inf"] < 1e-12
+
+
+def test_nonnegative_projection_recovers_independently_constructed_kkt_point():
+    h = np.array([[1, -2, 3, 1, 2], [0.5, 1, -1, 2, 3]], dtype=float)
+    mass = np.array([1.0, 2.0, 0.5, 3.0, 4.0])
+    solution = np.array([1.0, 0.0, 0.3, 0.0, 2.0])
+    mu, lower = np.array([0.2, -0.3]), np.array([0.0, 0.2, 0.0, 1.0, 0.0])
+    reference = solution + (h.T @ mu - lower) / mass
+    result = project_nonnegative_equalities(reference, h, h @ solution, mass)
+    np.testing.assert_allclose(result.x, solution, atol=1e-10)
+    assert result.diagnostics["equality_residual_inf"] <= 1e-10
+    assert result.diagnostics["kkt_residual_inf"] <= 1e-10
+
+
+def test_nonnegative_projection_distinguishes_infeasibility_from_iteration_limit():
+    with pytest.raises(ValueError, match="infeasible.*separation"):
+        project_nonnegative_equalities([1.0, 1.0], [[1.0, 1.0]], [-1.0], [1.0, 1.0])
+    with pytest.raises(RuntimeError, match="uncertified"):
+        project_nonnegative_equalities(
+            [3.0, 2.0, 0.0], [[1.0, 1.0, 1.0]], [0.5], np.ones(3), maxiter=1
+        )
+
+
+def test_feasible_ill_scaled_nonnegative_projection_is_never_labelled_infeasible():
+    # U=(1e12,1) is feasible. A Gram least-squares solve or LP tolerance may
+    # discard the small first row, but a negative H.T@w is no Farkas vector.
+    try:
+        result = project_nonnegative_equalities(
+            [0.0, 0.0], np.diag([1e-12, 1.0]), [1.0, 1.0], [1.0, 1.0], maxiter=3
+        )
+    except RuntimeError as error:
+        assert "uncertified" in str(error)
+    else:
+        np.testing.assert_allclose(np.diag([1e-12, 1.0]) @ result.x, [1.0, 1.0], atol=1e-10)
+
+
+@pytest.mark.parametrize(
+    "reference,observation,mass", [([-2.0], [[0.0]], [1e308]), ([1e100], [[1e100]], [1e300])]
+)
+def test_nonnegative_projection_rejects_nonfinite_certificate_from_finite_inputs(
+    reference, observation, mass
+):
+    with pytest.raises(RuntimeError, match="uncertified.*nonfinite KKT"):
+        project_nonnegative_equalities(reference, observation, [0.0], mass)
+
+
+@pytest.mark.parametrize("mass", [[0.0, 1.0], [-1.0, 1.0], [[1.0, 0.0], [0.0, 1.0]]])
+def test_nonnegative_projection_requires_strictly_positive_diagonal_metric(mass):
+    with pytest.raises(ValueError, match="positive diagonal mass"):
+        project_nonnegative_equalities([1.0, 1.0], [[1.0, 1.0]], [1.0], mass)
