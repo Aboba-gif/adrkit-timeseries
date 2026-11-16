@@ -6,7 +6,10 @@ import pytest
 from adrkit.contracts import MapCapabilities, ScalarCapabilities
 from adrkit.errors import CapabilityError
 from adrkit.inverse import InverseProblem
-from adrkit.inverse.constraints import project_nonnegative_equalities
+from adrkit.inverse.constraints import (
+    analyze_nonnegative_observations,
+    project_nonnegative_equalities,
+)
 from adrkit.selection import Selection
 from adrkit.spaces import ArraySpace
 
@@ -526,3 +529,107 @@ def test_nonnegative_projection_rejects_nonfinite_certificate_from_finite_inputs
 def test_nonnegative_projection_requires_strictly_positive_diagonal_metric(mass):
     with pytest.raises(ValueError, match="positive diagonal mass"):
         project_nonnegative_equalities([1.0, 1.0], [[1.0, 1.0]], [1.0], mass)
+
+
+def test_nonnegative_observation_analysis_matches_gaussian_linear_update():
+    reference = np.array([1.0, 2.0, 3.0])
+    h = np.array([[1.0, 0.5, 0.0], [0.0, 1.0, 1.0]])
+    target, mass = np.array([2.3, 5.4]), np.array([2.0, 3.0, 4.0])
+    covariance = np.array([[0.4, 0.1], [0.1, 0.8]])
+    expected = reference + (h.T / mass[:, None]) @ np.linalg.solve(
+        (h / mass) @ h.T + covariance, target - h @ reference
+    )
+    result = analyze_nonnegative_observations(reference, h, target, mass, covariance)
+    np.testing.assert_allclose(result.x, expected, atol=1e-12)
+    assert result.success and result.diagnostics["active_count"] == 0
+    assert result.diagnostics["kkt_residual_inf"] < 1e-11
+    np.testing.assert_array_equal(reference, [1.0, 2.0, 3.0])
+
+
+def test_nonnegative_observation_analysis_solves_active_bound_without_post_clipping():
+    result = analyze_nonnegative_observations([2.0, 0.0], [[1.0, 1.0]], [0.1], [1.0, 3.0], [0.2])
+    np.testing.assert_allclose(result.x, [5 / 12, 0.0], atol=1e-12)
+    np.testing.assert_allclose(result.observation_multipliers, [19 / 12], atol=1e-12)
+    np.testing.assert_allclose(result.lower_multipliers, [0.0, 19 / 12], atol=1e-12)
+    assert result.diagnostics["active_count"] == 1
+    assert result.diagnostics["kkt_residual_inf"] < 1e-11
+
+
+def test_nonnegative_observation_analysis_recovers_independent_full_covariance_kkt_point():
+    h = np.array([[1, -2, 3, 1, 2], [0.5, 1, -1, 2, 3]], dtype=float)
+    mass = np.array([1.0, 2.0, 0.5, 3.0, 4.0])
+    covariance = np.array([[0.3, -0.1], [-0.1, 0.2]])
+    solution = np.array([1.0, 0.0, 0.3, 0.0, 2.0])
+    mu = np.array([0.2, -0.3])
+    lower = np.array([0.0, 0.2, 0.0, 1.0, 0.0])
+    reference = solution + (h.T @ mu - lower) / mass
+    target = h @ solution - covariance @ mu
+    result = analyze_nonnegative_observations(reference, h, target, mass, covariance)
+    np.testing.assert_allclose(result.x, solution, atol=1e-10)
+    np.testing.assert_allclose(result.observation_multipliers, mu, atol=1e-10)
+    np.testing.assert_allclose(result.lower_multipliers, lower, atol=1e-10)
+    assert result.diagnostics["kkt_residual_inf"] <= 1e-10
+
+
+@pytest.mark.parametrize("covariance", [[], np.empty((0, 0))])
+def test_nonnegative_observation_analysis_without_observations(covariance):
+    result = analyze_nonnegative_observations(
+        [-2.0, 3.0, 0.0], np.empty((0, 3)), [], [2.0, 4.0, 1.0], covariance
+    )
+    np.testing.assert_array_equal(result.x, [0.0, 3.0, 0.0])
+    np.testing.assert_array_equal(result.lower_multipliers, [4.0, 0.0, 0.0])
+    assert result.fun == pytest.approx(4.0)
+    assert result.nit == 0 and result.success
+    assert result.observation_multipliers.shape == (0,)
+    assert result.diagnostics["kkt_residual_inf"] == 0
+
+
+def test_nonnegative_observation_analysis_accepts_negative_noisy_observation():
+    result = analyze_nonnegative_observations([0.0], [[1.0]], [-1.0], [1.0], [0.5])
+    np.testing.assert_array_equal(result.x, [0.0])
+    assert result.lower_multipliers[0] == pytest.approx(2.0)
+    assert result.fun == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "covariance",
+    [[0.0], [-1.0], [True], [complex(1.0)], [[1.0, 0.2], [0.0, 1.0]], [[1.0, 2.0], [2.0, 1.0]]],
+)
+def test_nonnegative_observation_analysis_requires_positive_covariance(covariance):
+    size = 2 if np.ndim(covariance) == 2 else 1
+    with pytest.raises(ValueError, match="covariance"):
+        analyze_nonnegative_observations(
+            np.ones(size), np.eye(size), np.ones(size), np.ones(size), covariance
+        )
+
+
+@pytest.mark.parametrize("mass", [[0.0], [-1.0], [[1.0]], [True]])
+def test_nonnegative_observation_analysis_requires_positive_diagonal_precision(mass):
+    with pytest.raises(ValueError, match="mass"):
+        analyze_nonnegative_observations([1.0], [[1.0]], [1.0], mass, [1.0])
+
+
+@pytest.mark.parametrize(
+    "reference,observation,mass,exception",
+    [
+        ([1.0], [[1e308]], [1.0], ValueError),
+        ([-2.0], [[0.0]], [1e308], RuntimeError),
+    ],
+)
+def test_nonnegative_observation_analysis_rejects_nonfinite_arithmetic(
+    reference, observation, mass, exception
+):
+    with pytest.raises(exception, match="overflows|uncertified.*nonfinite"):
+        analyze_nonnegative_observations(reference, observation, [0.0], mass, [1.0])
+
+
+def test_nonnegative_observation_analysis_reports_iteration_limit_as_uncertified():
+    with pytest.raises(RuntimeError, match="uncertified"):
+        analyze_nonnegative_observations(
+            [3.0, 2.0, 0.0],
+            [[1.0, 1.0, 1.0]],
+            [0.5],
+            [1.0, 1.0, 1.0],
+            [0.01],
+            maxiter=1,
+        )

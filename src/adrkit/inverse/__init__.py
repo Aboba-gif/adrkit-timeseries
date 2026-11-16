@@ -5,7 +5,7 @@ from .misfit import QuadraticMisfit, GaussianLikelihood, covariance_metric, work
 from .regularization import QuadraticPenalty, CoefficientMetric, p1_matrices, build_penalty
 from .optimizers import solve_lbfgsb
 from .problem import InverseProblem
-from .constraints import project_nonnegative_equalities
+from .constraints import analyze_nonnegative_observations, project_nonnegative_equalities
 from .functionals import (
     scalar_from_functions,
     sum_functionals,
@@ -28,6 +28,7 @@ __all__ = [
     "solve_lbfgsb",
     "InverseProblem",
     "project_nonnegative_equalities",
+    "analyze_nonnegative_observations",
     "scalar_from_functions",
     "sum_functionals",
     "scale_functional",
