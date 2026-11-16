@@ -66,7 +66,10 @@ def _matrix(value, name, size=None, *, xp=np):
         raise ValueError(f"{name} must be real")
     matrix = matrix_module.csr_matrix(value, dtype=float, copy=True)
     matrix.sum_duplicates()
-    matrix.eliminate_zeros()
+    if xp is np:
+        matrix.eliminate_zeros()
+    # Explicit zeros do not change a device matrix's action. Keep its signed
+    # entries intact without an unnecessary device compression operation.
     if (
         matrix.shape[0] != matrix.shape[1]
         or not matrix.shape[0]
