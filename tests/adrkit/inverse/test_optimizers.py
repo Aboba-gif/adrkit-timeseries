@@ -202,12 +202,16 @@ def test_roundoff_terminal_check_rejects_wrong_active_sign_in_a_narrow_box():
         return np.array([[-1.0 + 2 * point[0] / width, 0.0], [0.0, slope], [0.0, 0.0]])
 
     residual = map_from_functions(
-        domain=space(2, "parameter"), codomain=space(3, "residual"),
-        predict=predict, jacobian=jacobian,
+        domain=space(2, "parameter"),
+        codomain=space(3, "residual"),
+        predict=predict,
+        jacobian=jacobian,
     )
     tolerance = 1e-8
     result = optimizers.solve_damped_gauss_newton(
-        residual, start, bounds=[(0.0, width), (None, None)],
+        residual,
+        start,
+        bounds=[(0.0, width), (None, None)],
         options={"gtol": tolerance, "damping_rule": "projected-gradient", "max_backtracks": 0},
     )
     assert len(trial_points) == 2
