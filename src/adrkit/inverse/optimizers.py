@@ -185,6 +185,42 @@ def solve_trust_constr(
     )
 
 
+def _squared_norm_roundoff(values, value):
+    """Bound only the outer FP64 evaluation of 0.5*values.T@values.
+
+    The gamma_n model is from Higham (2002), ch. 3,
+    doi:10.1137/1.9780898718027. Bounds are rounded outward. No bound on the
+    computation of values is supplied. Nonzero subnormal products or a
+    subnormal cost disable this relative-error bound.
+
+    For m entries, 2*m counts m products, m-1 additions and the final
+    multiplication by 1/2. This total-operation bound is conservative;
+    it does not assume a particular BLAS reduction tree or FMA policy.
+    """
+    limits = np.finfo(float)
+    magnitudes = np.abs(values)
+    if (
+        not np.isfinite(value)
+        or value < limits.tiny
+        or not np.isfinite(magnitudes).all()
+        or np.any((magnitudes > 0) & (magnitudes < np.sqrt(limits.tiny)))
+    ):
+        return None
+    unit_roundoff = limits.eps / 2
+    count_error = np.nextafter((2 * values.size) * unit_roundoff, np.inf)
+    denominator = np.nextafter(1.0 - count_error, -np.inf)
+    if denominator <= 0:
+        return None
+    gamma = np.nextafter(count_error / denominator, np.inf)
+    if gamma >= 1:
+        return None
+    denominator = np.nextafter(1.0 - gamma, -np.inf)
+    relative = np.nextafter(gamma / denominator, np.inf)
+    with np.errstate(over="ignore", under="ignore"):
+        bound = np.nextafter(relative * value, np.inf)
+    return float(bound) if np.isfinite(bound) else None
+
+
 def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, callback=None):
     r"""Минимизировать половину квадрата нормы невязки с границами.
 
@@ -222,6 +258,8 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
         При объявленном Jacobian отдельные вызовы JVP не выполняются.
         step_size и damping относятся к последней подзадаче;
         damping_rule содержит выбранное правило сдвига.
+        step_acceptance — None до первого шага, 'armijo' либо
+        'stationary_trial'; step_acceptance_reason поясняет последний переход.
         status: 1 — нулевая невязка; 2 — стационарность; 0 — maxiter;
         -1 — не подтверждён шаг подзадачи; -2 — не выполнено Армихо;
         -3 — численный застой; 99 — остановка callback.
@@ -243,6 +281,16 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
     положительны. Для её точного ненулевого решения вариационное неравенство
     даёт :math:`\nabla J^Tp\le-\|Ap\|^2-\mu\|p\|^2<0`.
     Затем длина шага выбирается по условию Армихо для J, начиная с единицы.
+    Если Армихо не подтверждено, но вычисленные стоимости близки в пределах
+    оценки округления внешнего 0.5*r.T@r, допустимая пробная точка отдельно
+    проверяется по исходному gtol. Только при выполнении и проекционного,
+    и свободного градиентных допусков, а также допустимых знаков активного
+    градиента в том же допуске она становится терминальной точкой.
+    Нестационарный шаг таким правилом не принимается. Это не подтверждение
+    Армихо, глобального минимума или точности всего оператора невязки.
+    Зависимость проверки убывания от округления обсуждается у Hager–Zhang
+    (2005), §4, doi:10.1137/030601880; здесь используется только дополнительная
+    проверка исходной стационарности, а не их approximate-Wolfe line search.
     Допуск проверки KKT равен qp_tolerance плюс оценка округления плотных
     произведений; вариационное неравенство проверяется с соответствующей
     ошибкой. Проекция устраняет только округление допустимого шага на границе.
@@ -319,6 +367,8 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
     nfev = njev = njvp = 0
     step_size = damping = 0.0
     qp_optimality = qp_error_bound = directional_derivative = step_curvature = None
+    step_acceptance = step_acceptance_reason = None
+    next_linearization = None
 
     def evaluate(point):
         nonlocal nfev
@@ -385,12 +435,17 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
             qp_error_bound=qp_error_bound,
             directional_derivative=directional_derivative,
             step_curvature=step_curvature,
+            step_acceptance=step_acceptance,
+            step_acceptance_reason=step_acceptance_reason,
         )
 
     r, fun = evaluate(x)
     for iteration in range(settings["maxiter"] + 1):
         if np.all(r == 0):
             gradient = np.zeros_like(x)
+        elif next_linearization is not None:
+            matrix, gradient = next_linearization
+            next_linearization = None
         else:
             matrix, gradient = linearize(x, r)
         projected = np.where(
@@ -405,6 +460,12 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
         if np.all(r == 0):
             return result(1, "Zero residual")
         if optimality <= settings["gtol"]:
+            if step_acceptance == "stationary_trial":
+                return result(
+                    2,
+                    "Trial satisfies original projected/free gradient tolerance; "
+                    "Armijo not certified within the outer dot-product roundoff envelope",
+                )
             return result(2, "Projected-gradient stationarity; residual may be nonzero")
         if iteration == settings["maxiter"]:
             return result(0, "Maximum number of iterations reached")
@@ -498,7 +559,49 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
                     <= fun + settings["armijo_coefficient"] * step_size * directional_derivative
                 ):
                     x, r, fun = trial, trial_r, trial_fun
+                    step_acceptance = "armijo"
+                    step_acceptance_reason = "Armijo sufficient decrease"
                     break
+                current_error = _squared_norm_roundoff(r, fun)
+                trial_error = _squared_norm_roundoff(trial_r, trial_fun)
+                if current_error is not None and trial_error is not None:
+                    with np.errstate(over="ignore"):
+                        envelope = np.nextafter(current_error + trial_error, np.inf)
+                        upper_cost = np.nextafter(fun + envelope, np.inf)
+                    if (
+                        np.isfinite(upper_cost)
+                        and trial_fun <= upper_cost
+                        and np.isfinite(trial).all()
+                        and np.all(trial >= lower)
+                        and np.all(trial <= upper)
+                    ):
+                        trial_matrix, trial_gradient = linearize(trial, trial_r)
+                        projected = np.where(
+                            trial_gradient > 0,
+                            np.minimum(trial_gradient, trial - lower),
+                            np.maximum(trial_gradient, trial - upper),
+                        )
+                        interior = (trial > lower) & (trial < upper)
+                        trial_lower = (trial == lower) & free
+                        trial_upper = (trial == upper) & free
+                        if (
+                            np.isfinite(trial_gradient).all()
+                            and np.max(np.abs(projected)) <= settings["gtol"]
+                            and np.max(np.abs(trial_gradient[interior]), initial=0.0)
+                            <= settings["gtol"]
+                            and np.min(trial_gradient[trial_lower], initial=0.0)
+                            >= -settings["gtol"]
+                            and np.max(trial_gradient[trial_upper], initial=0.0)
+                            <= settings["gtol"]
+                        ):
+                            x, r, fun = trial, trial_r, trial_fun
+                            next_linearization = trial_matrix, trial_gradient
+                            step_acceptance = "stationary_trial"
+                            step_acceptance_reason = (
+                                "Original projected/free KKT tolerance at feasible trial; "
+                                "Armijo not certified"
+                            )
+                            break
             if backtrack == settings["max_backtracks"]:
                 return result(-2, "Armijo backtracking exhausted")
             step_size *= settings["backtrack_factor"]

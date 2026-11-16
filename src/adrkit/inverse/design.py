@@ -97,6 +97,79 @@ def _right_factor(matrix, factor):
 
 
 @dataclass(frozen=True)
+class JointMomentRisk:
+    """Средняя ошибка и два слагаемых её среднего квадрата.
+
+    mean_error — собственный неизменяемый массив. squared_bias равен
+    квадрату нормы среднего, variance — следу ковариации ошибки,
+    value — их сумме. Это значения в FP64, не интервальные сертификаты.
+    """
+
+    mean_error: np.ndarray
+    squared_bias: float
+    variance: float
+    value: float
+
+
+def joint_moment_risk(K, offset, mean, covariance):
+    r"""Вычислить E||offset+K X||² по совместным моментам X.
+
+    Parameters
+    ----------
+    K : array_like, shape (k, p)
+        Карта расширенного случайного входа в целевую ошибку. Целевая
+        метрика уже включена в K и offset вызывающей процедурой.
+    offset : array_like, shape (k,)
+        Явное детерминированное смещение; нуль автоматически не назначается.
+    mean : array_like, shape (p,)
+        Полный совместный вектор средних. Нулевые средние не предполагаются.
+    covariance : array_like or CovarianceFactor
+        Совместная ковариация формы (p,p), её неотрицательная диагональ (p,)
+        или явный прямоугольный фактор. Все перекрёстные связи находятся
+        внутри этой ковариации; независимость компонент не предполагается.
+
+    Returns
+    -------
+    JointMomentRisk
+        mean_error=offset+K@mean, squared_bias=||mean_error||²,
+        variance=tr(K@covariance@K.T), value=squared_bias+variance.
+
+    Notes
+    -----
+    Тождество требует лишь конечных вторых моментов, без нормальности X.
+    Например, X может включать исходные данные, нелинейную направленную
+    MAD и изменяющуюся физическую цель. Моменты этого совместного вектора
+    должен предоставить вызывающий код; функция не выводит их из MAD.
+    Риск относится к переданной карте ошибки и не удостоверяет точность
+    нелинейной PDE. Ковариация обрабатывается тем же способом, что и
+    в affine_goal_risk; отрицательные собственные значения не обрезаются.
+    """
+    if any(np.ma.isMaskedArray(value) for value in (K, offset, mean, covariance)):
+        raise ValueError("Joint moment inputs cannot be masked arrays")
+    matrix = _matrix(K, "joint error map")
+    offset = real_array(offset, name="joint error offset")
+    mean = real_array(mean, name="joint input mean")
+    if offset.shape != (matrix.shape[0],) or mean.shape != (matrix.shape[1],):
+        raise ValueError("Joint mean and offset must match the error map dimensions")
+    factor = _covariance_factor(covariance, matrix.shape[1], "joint covariance")
+    try:
+        with np.errstate(over="raise", invalid="raise", under="raise"):
+            mean_error = real_array(offset + matrix @ mean, name="mean goal error")
+            spread = real_array(_right_factor(matrix, factor), name="joint goal spread")
+    except FloatingPointError as error:
+        raise ValueError(
+            "Joint moment arithmetic lost its scale; rescale the input units"
+        ) from error
+    squared_bias = _square_norm(mean_error, "squared mean goal error")
+    variance = _square_norm(spread, "goal error variance")
+    value = real_scalar(squared_bias + variance, name="joint moment risk")
+    immutable_mean = np.frombuffer(mean_error.tobytes(), dtype=mean_error.dtype).reshape(
+        mean_error.shape
+    )
+    return JointMomentRisk(immutable_mean, squared_bias, variance, value)
+
+
+@dataclass(frozen=True)
 class BallMaximum:
     """Численные оценки максимума квадрата нормы на шаре.
 

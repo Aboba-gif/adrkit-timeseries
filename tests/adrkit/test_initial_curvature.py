@@ -511,3 +511,191 @@ def test_tiny_forcing_direction_has_representable_hessian_under_huge_reaction(re
     result = path.state_forcing_hvp([[0], [1]], d_forcing=[[1e-308]])
     np.testing.assert_allclose(action.to_host(result["initial"]), [-4], rtol=5e-12)
     np.testing.assert_allclose(action.to_host(result["forcing"]), [[-8]], rtol=5e-12)
+
+
+def _parameter_path(*, backend="numpy", distributed=True, delta=0.0, direction=None, beta=0.3):
+    partials = {
+        "first": sparse.csr_matrix([[-2, 1, 1], [0, -1, 1], [1, 0, -1]], dtype=float),
+        "second": sparse.csr_matrix([[-1, 1, 0], [1, -2, 1], [0, 1, -1]], dtype=float),
+    }
+    initial = np.array([0.3, 0.5, 0.4])
+    forcing = np.full((4, 3), 0.2) if distributed else np.linspace(0.1, 0.4, 4)
+    coefficients, alpha = np.array([0.7, 0.4]), -0.2
+    if direction is not None:
+        initial += delta * direction["initial"]
+        forcing += delta * direction["forcing"]
+        coefficients += delta * np.array([direction["operator"][name] for name in partials])
+        alpha += delta * direction["alpha"]
+        beta += delta * direction["beta"]
+    action = PositiveAffineAction(
+        sum(coefficient * matrix for coefficient, matrix in zip(coefficients, partials.values())),
+        alpha,
+        step=0.1,
+        rate=5,
+        degree=14,
+        backend=backend,
+    )
+    return (
+        solve_strang(
+            action,
+            initial,
+            forcing,
+            beta=beta,
+            load=None if distributed else [0.6, 0.2, 0.4],
+        ),
+        partials,
+    )
+
+
+def _parameter_direction(distributed, seed=9102, mode="all"):
+    rng = np.random.default_rng(seed)
+    result = {
+        "initial": rng.normal(scale=0.1, size=3),
+        "forcing": rng.normal(scale=0.1, size=(4, 3) if distributed else (4,)),
+        "operator": dict(zip(("first", "second"), rng.normal(scale=0.1, size=2))),
+        "alpha": float(rng.normal(scale=0.1)),
+        "beta": float(rng.normal(scale=0.1)),
+    }
+    for key in result:
+        if mode != "all" and key != mode:
+            result[key] = dict.fromkeys(result[key], 0.0) if key == "operator" else result[key] * 0
+    return result
+
+
+def _parameter_hvp(path, partials, cotangent, direction):
+    d_operator = sum(direction["operator"][name] * matrix for name, matrix in partials.items())
+    return path.hvp(
+        cotangent,
+        operator_partials=partials,
+        d_initial=direction["initial"],
+        d_forcing=direction["forcing"],
+        dQ=d_operator,
+        dalpha=direction["alpha"],
+        dbeta=direction["beta"],
+    )
+
+
+def _parameter_pair(direction, covector):
+    return (
+        np.sum(direction["initial"] * covector["initial"])
+        + np.sum(direction["forcing"] * covector["forcing"])
+        + sum(direction["operator"][name] * value for name, value in covector["operator"].items())
+        + direction["alpha"] * covector["alpha"]
+        + direction["beta"] * covector["beta"]
+    )
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+@pytest.mark.parametrize("distributed", [True, False])
+@pytest.mark.parametrize("mode", ["initial", "forcing", "operator", "alpha", "beta", "all"])
+def test_full_parameter_hvp_matches_every_output_of_the_varied_pullback(
+    request, backend, distributed, mode
+):
+    if backend == "cupy":
+        request.getfixturevalue("cupy")
+    path, partials = _parameter_path(backend=backend, distributed=distributed)
+    direction = _parameter_direction(distributed, mode=mode)
+    cotangent = np.random.default_rng(7503).normal(size=path.states.shape)
+    actual = _parameter_hvp(path, partials, cotangent, direction)
+    step = 1e-5
+    varied = [
+        _parameter_path(
+            backend=backend, distributed=distributed, delta=sign * step, direction=direction
+        )[0].vjp(cotangent, operator_partials=partials)
+        for sign in (1, -1)
+    ]
+    for key in ("initial", "forcing", "alpha", "beta"):
+        expected = (varied[0][key] - varied[1][key]) / (2 * step)
+        observed = path.affine.to_host(actual[key])
+        expected = path.affine.to_host(expected)
+        np.testing.assert_allclose(observed, expected, rtol=3e-6, atol=4e-10)
+    for name in partials:
+        expected = (varied[0]["operator"][name] - varied[1]["operator"][name]) / (2 * step)
+        np.testing.assert_allclose(actual["operator"][name], expected, rtol=3e-6, atol=4e-10)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+@pytest.mark.parametrize("distributed", [True, False])
+def test_full_parameter_hessian_obeys_bilinear_symmetry(request, backend, distributed):
+    if backend == "cupy":
+        request.getfixturevalue("cupy")
+    path, partials = _parameter_path(backend=backend, distributed=distributed)
+    cotangent = np.random.default_rng(3440).normal(size=path.states.shape)
+    directions = [_parameter_direction(distributed, seed) for seed in (324, 531)]
+    products = [_parameter_hvp(path, partials, cotangent, value) for value in directions]
+    products = [
+        {
+            key: path.affine.to_host(value) if key in ("initial", "forcing") else value
+            for key, value in product.items()
+        }
+        for product in products
+    ]
+    np.testing.assert_allclose(
+        _parameter_pair(directions[0], products[1]),
+        _parameter_pair(directions[1], products[0]),
+        rtol=3e-11,
+        atol=2e-12,
+    )
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+def test_scalar_growth_reaction_hessian_has_an_independent_closed_form(request, backend):
+    if backend == "cupy":
+        request.getfixturevalue("cupy")
+    initial, step, alpha, beta, weight = 0.4, 0.2, -0.3, 0.7, 1.1
+    action = PositiveAffineAction(
+        sparse.csr_matrix((1, 1)), alpha, step=step, rate=1, degree=14, backend=backend
+    )
+    path = solve_strang(action, [initial], [[0.0]], beta=beta)
+    growth, half = exp(alpha * step), step / 2
+    z = beta * half * initial
+    denominator = 1 + z * (1 + growth)
+    constant = 1 + z
+    haa = step**2 * initial * constant * growth * (denominator - 2 * z * growth) / denominator**3
+    hab = (
+        step
+        * growth
+        * half
+        * initial**2
+        * (denominator - 2 * constant * (1 + growth))
+        / denominator**3
+    )
+    hbb = 2 * half**2 * initial**3 * growth * (1 + growth) ** 2 / denominator**3
+    alpha_product = path.hvp([[0.3], [weight]], dalpha=1.0)
+    beta_product = path.hvp([[0.3], [weight]], dbeta=1.0)
+    np.testing.assert_allclose(alpha_product["alpha"], weight * haa, rtol=5e-12, atol=1e-14)
+    np.testing.assert_allclose(alpha_product["beta"], weight * hab, rtol=5e-12, atol=1e-14)
+    np.testing.assert_allclose(beta_product["alpha"], weight * hab, rtol=5e-12, atol=1e-14)
+    np.testing.assert_allclose(beta_product["beta"], weight * hbb, rtol=5e-12, atol=1e-14)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+@pytest.mark.parametrize("distributed", [True, False])
+def test_zero_reaction_keeps_nonzero_mixed_beta_curvature(request, backend, distributed):
+    if backend == "cupy":
+        request.getfixturevalue("cupy")
+    path, partials = _parameter_path(backend=backend, distributed=distributed, beta=0.0)
+    direction = _parameter_direction(distributed, mode="beta")
+    direction["beta"] = 1.0
+    cotangent = np.random.default_rng(3233).normal(size=path.states.shape)
+    actual = _parameter_hvp(path, partials, cotangent, direction)
+    step = 1e-5
+    pulled = [
+        _parameter_path(
+            backend=backend,
+            distributed=distributed,
+            beta=0.0,
+            delta=shift * step,
+            direction=direction,
+        )[0].vjp(cotangent, operator_partials=partials)
+        for shift in (0, 1, 2)
+    ]
+    for key in ("initial", "forcing", "alpha", "beta"):
+        expected = (-3 * pulled[0][key] + 4 * pulled[1][key] - pulled[2][key]) / (2 * step)
+        np.testing.assert_allclose(
+            path.affine.to_host(actual[key]),
+            path.affine.to_host(expected),
+            rtol=2e-5,
+            atol=2e-9,
+        )
+    assert abs(actual["beta"]) > 1e-5

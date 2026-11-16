@@ -1,5 +1,7 @@
 """Спуск, ограничения и локальная сходимость нелинейных наименьших квадратов."""
 
+from fractions import Fraction
+
 import numpy as np
 import pytest
 from scipy.optimize import LinearConstraint, OptimizeResult
@@ -24,6 +26,208 @@ def linear_residual(matrix, target):
         predict=lambda x: matrix @ x - target,
         jvp=lambda x, p: matrix @ p,
     )
+
+
+def _rounded_constant_channel(*, declared_jacobian=True, ulps=1):
+    """Known quadratic objective with controlled rounding in a constant channel.
+
+    The exact residual is (scale*x, 1), with minimizer x=0. Only the computed
+    constant channel changes by the requested ULP count after the first point;
+    the derivative is that of the smooth exact residual, not artificial data noise.
+    """
+    origin, scale = 2.0**-12, 2.0**-16
+    rounded = 1.0
+    for _ in range(ulps):
+        rounded = np.nextafter(rounded, np.inf)
+    jacobian = np.array([[scale], [0.0]])
+    residual = map_from_functions(
+        domain=space(1, "parameter"),
+        codomain=space(2, "residual"),
+        predict=lambda x: np.array([scale * x[0], 1.0 if x[0] == origin else rounded]),
+        jvp=lambda x, direction: jacobian @ direction,
+        jacobian=(lambda x: jacobian) if declared_jacobian else None,
+    )
+    return residual, origin, scale
+
+
+@pytest.mark.parametrize("declared_jacobian", [False, True])
+def test_original_stationarity_at_rounded_trial_is_terminal_not_armijo(declared_jacobian):
+    residual, origin, scale = _rounded_constant_channel(declared_jacobian=declared_jacobian)
+    trajectory = []
+    # With mu=scale**2*origin, the exact GN candidate is origin**2/(1+origin).
+    tolerance = 1e-16
+    result = optimizers.solve_damped_gauss_newton(
+        residual,
+        [origin],
+        bounds=[(0.0, 1.0)],
+        options={
+            "gtol": tolerance,
+            "qp_tolerance": 1e-24,
+            "damping_rule": "projected-gradient",
+            "max_backtracks": 0,
+        },
+        callback=trajectory.append,
+    )
+    assert result.success and result.status == 2 and result.optimality <= tolerance
+    assert abs(result.x[0]) <= tolerance / scale**2
+    assert abs(result.jac[0]) <= tolerance
+    assert result.fun > trajectory[0].fun
+    assert result.step_acceptance == "stationary_trial"
+    assert "Armijo not certified" in result.step_acceptance_reason
+    assert "Trial satisfies original projected/free" in result.message
+    assert result.nit == 1 and result.nfev == 2 and result.njev == 2
+    assert result.njvp == (0 if declared_jacobian else 2)
+    assert [point.nit for point in trajectory] == [0, 1]
+    assert trajectory[0].step_acceptance is None
+    assert trajectory[1].step_acceptance == "stationary_trial"
+    np.testing.assert_array_equal(trajectory[-1].x, result.x)
+    np.testing.assert_array_equal(trajectory[-1].jac, result.jac)
+
+
+def test_roundoff_screen_does_not_accept_a_nonstationary_trial():
+    residual, origin, _ = _rounded_constant_channel()
+    trajectory = []
+    tolerance = 1e-25
+    result = optimizers.solve_damped_gauss_newton(
+        residual,
+        [origin],
+        bounds=[(0.0, 1.0)],
+        options={
+            "gtol": tolerance,
+            "qp_tolerance": 1e-24,
+            "damping_rule": "projected-gradient",
+            "max_backtracks": 0,
+        },
+        callback=trajectory.append,
+    )
+    assert not result.success and result.status == -2
+    assert result.optimality > tolerance and result.step_acceptance is None
+    assert result.nit == 0 and result.njev == 2 and len(trajectory) == 1
+    np.testing.assert_array_equal(result.x, [origin])
+
+
+def test_stationary_trial_outside_the_dot_roundoff_envelope_is_not_accepted():
+    residual, origin, _ = _rounded_constant_channel(ulps=16)
+    result = optimizers.solve_damped_gauss_newton(
+        residual,
+        [origin],
+        bounds=[(0.0, 1.0)],
+        options={
+            "gtol": 1e-16,
+            "qp_tolerance": 1e-24,
+            "damping_rule": "projected-gradient",
+            "max_backtracks": 0,
+        },
+    )
+    assert not result.success and result.status == -2
+    assert result.step_acceptance is None and result.nit == 0
+    # A trial derivative is not evaluated outside the declared arithmetic screen.
+    assert result.njev == 1
+    np.testing.assert_array_equal(result.x, [origin])
+
+
+def test_dot_roundoff_bound_covers_exact_rational_half_squared_norm():
+    values = np.array([1.0, 2.0**-27, 2.0**-26])
+    computed = float(0.5 * (values @ values))
+    exact = sum((Fraction.from_float(float(value)) ** 2 for value in values), Fraction()) / 2
+    bound = optimizers._squared_norm_roundoff(values, computed)
+    assert bound is not None and bound > 0
+    assert abs(Fraction.from_float(computed) - exact) <= Fraction.from_float(bound)
+
+
+def test_roundoff_trial_near_a_bound_still_requires_the_interior_gradient():
+    origin, floor = 2.0**-20, 2.0**28
+    offset = 1.0 - 2.0**-8
+    rounded_floor = np.nextafter(floor, np.inf)
+    derivative_points = []
+
+    def predict(point):
+        value = point[0]
+        return np.array(
+            [
+                offset + value + (value / origin) ** 2,
+                floor if value == origin else rounded_floor,
+            ]
+        )
+
+    def jacobian(point):
+        derivative_points.append(float(point[0]))
+        return np.array([[1.0 + 2 * point[0] / origin**2], [0.0]])
+
+    residual = map_from_functions(
+        domain=space(1, "parameter"),
+        codomain=space(2, "residual"),
+        predict=predict,
+        jacobian=jacobian,
+    )
+    tolerance = 1e-8
+    # At origin, a=r'=1+2/origin and r=2-2**-8+origin. The undamped GN
+    # endpoint is q=origin*2**-8/(2+origin)>0. Since 0<=mu<=g=r*a,
+    # damping puts the endpoint in [q, q+origin**2], wholly inside (0, gtol).
+    # Nevertheless r(x)*r'(x)>=offset>gtol there: only the projected test passes.
+    result = optimizers.solve_damped_gauss_newton(
+        residual,
+        [origin],
+        bounds=[(0.0, 1.0)],
+        options={
+            "gtol": tolerance,
+            "damping_rule": "projected-gradient",
+            "max_backtracks": 0,
+        },
+    )
+    assert len(derivative_points) == 2
+    candidate = derivative_points[-1]
+    candidate_gradient = (offset + candidate + (candidate / origin) ** 2) * (
+        1.0 + 2 * candidate / origin**2
+    )
+    assert 0 < candidate < tolerance
+    assert min(candidate_gradient, candidate) <= tolerance < candidate_gradient
+    assert not result.success and result.status == -2 and result.nit == 0
+    assert result.step_acceptance is None
+    np.testing.assert_array_equal(result.x, [origin])
+
+
+def test_roundoff_terminal_check_rejects_wrong_active_sign_in_a_narrow_box():
+    width, slope, start_y = 2.0**-40, 2.0**26, 2.0**-52
+    start = np.array([0.0, start_y])
+    trial_points = []
+
+    def predict(point):
+        x, y = point
+        constant = 1.0 if np.array_equal(point, start) else np.nextafter(1.0, np.inf)
+        return np.array([1.0 - x + x**2 / width, slope * y, constant])
+
+    def jacobian(point):
+        trial_points.append(point.copy())
+        return np.array([[-1.0 + 2 * point[0] / width, 0.0], [0.0, slope], [0.0, 0.0]])
+
+    residual = map_from_functions(
+        domain=space(2, "parameter"), codomain=space(3, "residual"),
+        predict=predict, jacobian=jacobian,
+    )
+    tolerance = 1e-8
+    result = optimizers.solve_damped_gauss_newton(
+        residual, start, bounds=[(0.0, width), (None, None)],
+        options={"gtol": tolerance, "damping_rule": "projected-gradient", "max_backtracks": 0},
+    )
+    assert len(trial_points) == 2
+    trial = trial_points[-1]
+    assert trial[0] == width < tolerance
+    # The residual is 1 and its x derivative is +1 at the upper endpoint.
+    # PG is capped by the narrow width; the original upper KKT sign is wrong.
+    assert not result.success and result.status == -2 and result.nit == 0
+    assert result.step_acceptance is None
+    np.testing.assert_array_equal(result.x, start)
+
+
+@pytest.mark.parametrize("subnormal_product", [True, False])
+def test_relative_dot_screen_is_disabled_when_its_normal_arithmetic_model_fails(
+    subnormal_product,
+):
+    root_tiny = np.sqrt(np.finfo(float).tiny)
+    values = np.array([1.0, root_tiny / 2]) if subnormal_product else np.array([root_tiny])
+    computed = float(0.5 * (values @ values))
+    assert optimizers._squared_norm_roundoff(values, computed) is None
 
 
 def test_declared_full_jacobian_avoids_scalar_jvp_and_keeps_the_same_problem():

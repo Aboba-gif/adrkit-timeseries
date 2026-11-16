@@ -168,6 +168,47 @@ def _decay_increment(u, shifted, increment, beta, step, *, xp=np):
     return xp.where(increment == 0.0, 0.0, xp.where(valid, direct, fallback))
 
 
+def _decay_pullback_tangent(
+    u, value, beta, step, tangent, cotangent, cotangent_direction, dbeta, *, parameters, xp
+):
+    """Differentiate a reaction pullback, retaining weighted mixed beta terms."""
+    ratio = _decay_ratio(u, value, xp=xp)
+    slope = ratio**2
+    pulled = slope * cotangent
+    changed = slope * cotangent_direction + _decay_curvature_product(
+        u, ratio, beta, step, tangent, cotangent, xp=xp
+    )
+    if not parameters:
+        return pulled, changed, 0.0
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        log_u = xp.log(u)
+        log_denominator = (
+            xp.zeros_like(u)
+            if beta == 0
+            else xp.logaddexp(0.0, np.log(beta) + np.log(step) + log_u)
+        )
+
+        def weighted(log_coefficient, *factors, negative=False):
+            log_magnitude = log_coefficient.copy()
+            sign = -xp.ones_like(u) if negative else xp.ones_like(u)
+            zero = u == 0
+            for factor in factors:
+                log_magnitude = log_magnitude + xp.log(xp.abs(factor))
+                sign = sign * xp.sign(factor)
+                zero = zero | (factor == 0)
+            return xp.where(zero, 0.0, sign * xp.exp(log_magnitude))
+
+        beta_log = np.log(step) + 2 * log_u - 2 * log_denominator
+        mixed_log = np.log(2.0) + np.log(step) + log_u - 3 * log_denominator
+        changed_beta = weighted(beta_log, cotangent_direction, negative=True)
+        changed_beta += weighted(mixed_log, tangent, cotangent, negative=True)
+        if dbeta != 0:
+            changed += weighted(mixed_log, dbeta, cotangent, negative=True)
+            beta_beta_log = np.log(2.0) + 2 * np.log(step) + 3 * log_u - 3 * log_denominator
+            changed_beta += weighted(beta_beta_log, dbeta, cotangent)
+    return pulled, changed, xp.sum(changed_beta)
+
+
 def _decay_partials(u, value, step, *, xp=np):
     if xp is not np:
         derivative = _decay_ratio(u, value, xp=xp) ** 2
@@ -258,7 +299,7 @@ def poisson_degree(mean, tolerance):
     return high
 
 
-def _weights(alpha, step, rate, degree):
+def _weights(alpha, step, rate, degree, *, second=False):
     k = np.arange(degree + 1, dtype=float)
     mean = rate * step
     alpha_step = alpha * step
@@ -267,19 +308,32 @@ def _weights(alpha, step, rate, degree):
         if alpha < 0.0 and -alpha_step >= 1.0:
             total = -np.expm1(alpha_step) / (-alpha)
             log_total_derivative = np.log(gammainc(2.0, -alpha_step)) - 2 * np.log(-alpha)
+            if second:
+                log_total_second = (
+                    np.log(2.0) + np.log(gammainc(3.0, -alpha_step)) - 3 * np.log(-alpha)
+                )
         else:
             total = step * exprel(alpha_step)
             log_total_derivative = (
                 2 * np.log(step) - np.log(2.0) + np.log(hyp1f1(2.0, 3.0, alpha_step))
             )
+            if second:
+                log_total_second = (
+                    3 * np.log(step) - np.log(3.0) + np.log(hyp1f1(3.0, 4.0, alpha_step))
+                )
         total_derivative = np.exp(log_total_derivative)
+        if second:
+            total_second = np.exp(log_total_second)
     if not np.isfinite([mean, growth, total, total_derivative]).all() or total <= 0:
         raise FloatingPointError("The affine weights are outside the representable range")
+    if second and not np.isfinite(total_second):
+        raise FloatingPointError("The source-weight second derivative is not representable")
     if mean == 0.0:
         transport = np.zeros(degree + 1)
         transport[0] = 1.0
         source, source_derivative = transport * total, transport * total_derivative
-        return growth, total, transport, source, source_derivative, 0.0
+        result = growth, total, transport, source, source_derivative, 0.0
+        return (*result, transport * total_second) if second else result
     log_power = k * np.log(mean)
     log_transport = log_power - gammaln(k + 1.0)
     transport = np.exp(log_transport - np.max(log_transport))
@@ -300,39 +354,80 @@ def _weights(alpha, step, rate, degree):
             - np.log(k + 2.0)
             + np.log(hyp1f1(k + 2.0, k + 3.0, argument))
         )
-    # Неполная гамма избегает потери exp(-mean) при больших средних.
+        if second:
+            log_ddw = (
+                3 * np.log(step)
+                + log_power
+                - gammaln(k + 1.0)
+                - np.log(k + 3.0)
+                + np.log(hyp1f1(k + 3.0, k + 4.0, argument))
+            )
+    # При положительном затухании гамма-форма сохраняет точность и тогда,
+    # когда гипергеометрическая функция конечна, но уже неточна.
+    # Субнормальная вероятность не даёт нужной относительной точности:
+    # для неё или непредставимого логарифма остаётся гипергеометрическая запись.
     if rate > alpha:
         log_loss = (
             np.logaddexp(np.log(rate), np.log(-alpha)) if alpha < 0.0 else np.log(rate - alpha)
         )
+        probability = gammainc(k + 1.0, -argument)
+        derivative_probability = gammainc(k + 2.0, -argument)
+        if second:
+            second_probability = gammainc(k + 3.0, -argument)
         with np.errstate(divide="ignore", invalid="ignore"):
-            alternative = (
-                k * (np.log(rate) - log_loss) - log_loss + np.log(gammainc(k + 1.0, -argument))
-            )
+            alternative = k * (np.log(rate) - log_loss) - log_loss + np.log(probability)
             alternative_dw = (
                 np.log(k + 1.0)
                 + k * (np.log(rate) - log_loss)
                 - 2 * log_loss
-                + np.log(gammainc(k + 2.0, -argument))
+                + np.log(derivative_probability)
             )
-        log_w = np.where(~np.isfinite(log_w) & np.isfinite(alternative), alternative, log_w)
-        log_dw = np.where(
-            ~np.isfinite(log_dw) & np.isfinite(alternative_dw), alternative_dw, log_dw
+            if second:
+                alternative_ddw = (
+                    np.log(k + 1.0)
+                    + np.log(k + 2.0)
+                    + k * (np.log(rate) - log_loss)
+                    - 3 * log_loss
+                    + np.log(second_probability)
+                )
+        normal_minimum = np.finfo(float).tiny
+        log_w = np.where(
+            (probability >= normal_minimum) & np.isfinite(alternative), alternative, log_w
         )
+        log_dw = np.where(
+            (derivative_probability >= normal_minimum) & np.isfinite(alternative_dw),
+            alternative_dw,
+            log_dw,
+        )
+        if second:
+            log_ddw = np.where(
+                (second_probability >= normal_minimum) & np.isfinite(alternative_ddw),
+                alternative_ddw,
+                log_ddw,
+            )
     if np.isnan(log_w).any() or np.isposinf(log_w).any() or not np.isfinite(log_w).any():
         raise FloatingPointError("The source weights are not representable")
-    normalized = np.exp(log_w - np.max(log_w))
-    normalized /= normalized.sum()
+    maximum = np.max(log_w)
+    normalized = np.exp(log_w - maximum)
+    normalization = normalized.sum()
+    normalized /= normalization
     ratios = np.zeros_like(k)
     finite = np.isfinite(log_w) & np.isfinite(log_dw)
     ratios[finite] = np.exp(log_dw[finite] - log_w[finite])
-    if np.any((normalized > 0) & ~finite):
-        raise FloatingPointError("The source-weight derivative is not representable")
     source = total * normalized
+    # S*p_k can be normal even when p_k is subnormal or rounded to zero.
+    # Recover that same S*I_k/sum(I) using the existing logarithmic normalizer.
+    small_probability = (normalized < np.finfo(float).tiny) & np.isfinite(log_w)
+    if small_probability.any():
+        source[small_probability] = np.exp(
+            np.log(total) + log_w[small_probability] - (maximum + np.log(normalization))
+        )
+    if np.any((source > 0) & ~finite):
+        raise FloatingPointError("The source-weight derivative is not representable")
     source_derivative = source * (total_derivative / total + ratios - normalized @ ratios)
     if not np.isfinite(source_derivative).all():
         raise FloatingPointError("The normalized source derivative is not representable")
-    return (
+    result = (
         growth,
         total,
         transport,
@@ -340,6 +435,26 @@ def _weights(alpha, step, rate, degree):
         source_derivative,
         float(gammainc(degree + 1.0, mean)),
     )
+    if not second:
+        return result
+    second_ratios = np.zeros_like(k)
+    active = source > 0
+    finite_second = np.isfinite(log_w) & np.isfinite(log_ddw)
+    if np.any(active & ~finite_second):
+        raise FloatingPointError("The source-weight second moment is not representable")
+    with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+        second_ratios[active] = np.exp(log_ddw[active] - log_w[active])
+        first_mean = normalized @ ratios
+        second_mean = normalized @ second_ratios
+        source_second = source * (
+            total_second / total
+            + 2 * (total_derivative / total - first_mean) * (ratios - first_mean)
+            + second_ratios
+            - second_mean
+        )
+    if not np.isfinite(source_second).all():
+        raise FloatingPointError("The normalized source second derivative is not representable")
+    return (*result, source_second)
 
 
 @dataclass(frozen=True, init=False)
@@ -477,6 +592,19 @@ class PositiveAffineAction:
         """ndarray : Производные источниковых весов по alpha."""
         return _owned(self._db, "weight derivatives", xp=self._xp)
 
+    @property
+    def source_alpha_second_derivative(self):
+        """ndarray : Вторые производные нормированных источниковых весов по alpha.
+
+        Вычисляются по запросу для той же фиксированной степени и rate.
+        Производные общей интенсивности и нормировки включены. Массив
+        независим, хранится в выбранном backend и не кэшируется в объекте.
+        Непредставимая вторая производная вызывает FloatingPointError только
+        при обращении к этому свойству; обычные apply и JVP её не вычисляют.
+        """
+        weights = _weights(self.alpha, self.step, self.rate, self.degree, second=True)[-1]
+        return _owned(weights, "second weight derivatives", xp=self._xp)
+
     def _powers(self, u, f):
         up = self._xp.empty((self.degree + 1, self.size))
         fp = self._xp.empty_like(up)
@@ -556,6 +684,71 @@ class PositiveAffineAction:
                 u_bar = self._transition.T @ u_bar
                 f_bar = self._transition.T @ f_bar
         return {"u": u_bar, "f": f_bar, "operator": operator_bar, "alpha": alpha_bar}
+
+    def _power_directions(self, powers, du, df, dP):
+        xp = self._xp
+        up, fp = powers
+        dup, dfp = xp.empty_like(up), xp.empty_like(fp)
+        dup[0], dfp[0] = du, df
+        for k in range(1, self.degree + 1):
+            dup[k] = self._transition @ dup[k - 1]
+            dfp[k] = self._transition @ dfp[k - 1]
+            if dP is not None:
+                dup[k] += dP @ up[k - 1]
+                dfp[k] += dP @ fp[k - 1]
+        return dup, dfp
+
+    def _pullback_directional(
+        self,
+        powers,
+        power_directions,
+        cotangent,
+        cotangent_direction,
+        partials,
+        dP,
+        dalpha,
+        source_second,
+    ):
+        """Tangent-over-reverse of this fixed, normalized finite polynomial."""
+        xp = self._xp
+        up, fp = powers
+        dup, dfp = power_directions
+        u_bar, f_bar = xp.zeros(self.size), xp.zeros(self.size)
+        du_bar, df_bar = xp.zeros(self.size), xp.zeros(self.size)
+        operator_bar = {name: 0.0 for name in partials}
+        alpha_bar = self.step * self._growth * (
+            self._a @ (dup @ cotangent + up @ cotangent_direction)
+        ) + self._db @ (dfp @ cotangent + fp @ cotangent_direction)
+        if dalpha != 0:
+            alpha_bar += dalpha * (
+                (self.step * self._growth) * self.step * (self._a @ (up @ cotangent))
+                + source_second @ (fp @ cotangent)
+            )
+        for k in range(self.degree, -1, -1):
+            transport = self._growth * self._a[k]
+            u_bar += transport * cotangent
+            f_bar += self._b[k] * cotangent
+            du_bar += transport * cotangent_direction
+            df_bar += self._b[k] * cotangent_direction
+            if dalpha != 0:
+                du_bar += self.step * transport * dalpha * cotangent
+                df_bar += self._db[k] * dalpha * cotangent
+            if k:
+                for name, matrix in partials.items():
+                    operator_bar[name] += (
+                        du_bar @ (matrix @ up[k - 1])
+                        + u_bar @ (matrix @ dup[k - 1])
+                        + df_bar @ (matrix @ fp[k - 1])
+                        + f_bar @ (matrix @ dfp[k - 1])
+                    )
+                du_bar = self._transition.T @ du_bar
+                df_bar = self._transition.T @ df_bar
+                if dP is not None:
+                    du_bar += dP.T @ u_bar
+                    df_bar += dP.T @ f_bar
+                u_bar = self._transition.T @ u_bar
+                f_bar = self._transition.T @ f_bar
+        return u_bar, {"u": du_bar, "f": df_bar, "operator": operator_bar, "alpha": alpha_bar}
 
     def apply(self, u, f):
         """Применить аффинный подшаг.
@@ -1181,9 +1374,99 @@ class StrangTrajectory:
         )
 
     def _state_forcing_hvp(self, cotangent, *, d_initial, d_forcing, collect_forcing):
+        return self._hvp_core(
+            cotangent,
+            {},
+            d_initial=d_initial,
+            d_forcing=d_forcing,
+            dQ=None,
+            dalpha=0.0,
+            dbeta=0.0,
+            collect_forcing=collect_forcing,
+            collect_parameters=False,
+        )
+
+    def hvp(
+        self,
+        cotangent,
+        operator_partials=None,
+        *,
+        d_initial=None,
+        d_forcing=None,
+        dQ=None,
+        dalpha=0.0,
+        dbeta=0.0,
+    ):
+        r"""Differentiate the complete trajectory pullback in one control direction.
+
+        Parameters
+        ----------
+        cotangent : array_like, shape (nt+1,N)
+            Fixed coordinate covector of all trajectory layers.
+        operator_partials : Mapping or None, optional
+            Fixed physical partial matrices dQ/dtheta, as in vjp. Their
+            derivatives are zero; a nonlinear generator parametrization
+            requires its own second chain rule in the caller.
+        d_initial, d_forcing : array_like or None, optional
+            Signed directions of the initial vector and original forcing.
+        dQ : sparse matrix or array_like or None, optional
+            Signed generator direction; rate and degree remain fixed.
+        dalpha, dbeta : float, optional
+            Physical directions of growth and quadratic reaction.
+
+        Returns
+        -------
+        products : dict
+            Directional derivatives of all vjp outputs: initial, forcing,
+            operator, alpha and beta. Arrays retain the original backend
+            and control shapes; scalar contractions are Python floats.
+
+        Notes
+        -----
+        This is the weighted Hessian of the implemented finite polynomial
+        and Strang composition. The covector is not differentiated. The
+        Gauss-Newton term of a least-squares objective is added separately.
+        Normalization derivatives of source weights and mixed beta terms
+        are included. Beta=0 does not eliminate mixed parameter curvature.
+        No dense state Hessian or matrix-valued Q cotangent is constructed.
+        """
+        return self._hvp_core(
+            cotangent,
+            operator_partials or {},
+            d_initial=d_initial,
+            d_forcing=d_forcing,
+            dQ=dQ,
+            dalpha=dalpha,
+            dbeta=dbeta,
+            collect_forcing=True,
+            collect_parameters=True,
+        )
+
+    def _hvp_core(
+        self,
+        cotangent,
+        operator_partials,
+        *,
+        d_initial,
+        d_forcing,
+        dQ,
+        dalpha,
+        dbeta,
+        collect_forcing,
+        collect_parameters,
+    ):
         affine, half = self.affine, self.affine.step / 2
         xp = affine.array_module
         cotangent = _owned(cotangent, "cotangent", shape=self._states.shape, xp=xp)
+        dalpha, dbeta = _scalar(dalpha, "dalpha"), _scalar(dbeta, "dbeta")
+        generator_direction = None if dQ is None else _matrix(dQ, "dQ", affine.size, xp=xp)
+        transition_direction = (
+            None if generator_direction is None else generator_direction / affine.rate
+        )
+        partials = {
+            name: _matrix(value, name, affine.size, xp=xp) / affine.rate
+            for name, value in operator_partials.items()
+        }
         initial_direction = (
             xp.zeros(affine.size)
             if d_initial is None
@@ -1195,19 +1478,35 @@ class StrangTrajectory:
             else _owned(d_forcing, "d_forcing", shape=self._forcing.shape, xp=xp)
         )
         forcing_bar = xp.zeros_like(self._forcing) if collect_forcing else None
+        operator_bar = {name: 0.0 for name in partials}
+        alpha_bar, beta_bar = 0.0, 0.0
         if (
-            self.beta == 0.0
+            (not collect_parameters and self.beta == 0.0)
             or not bool(xp.any(cotangent[1:]))
             or (
                 not bool(xp.any(initial_direction))
                 and (forcing_direction is None or not bool(xp.any(forcing_direction)))
+                and (generator_direction is None or not bool(xp.any(generator_direction.data)))
+                and dalpha == 0.0
+                and dbeta == 0.0
             )
         ):
             result = {"initial": xp.zeros(affine.size)}
             if collect_forcing:
                 result["forcing"] = forcing_bar
+            if collect_parameters:
+                result.update(operator=operator_bar, alpha=alpha_bar, beta=beta_bar)
             return result
-        tangents = self.jvp(d_initial=initial_direction, d_forcing=forcing_direction)
+        tangents = self.jvp(
+            d_initial=initial_direction,
+            d_forcing=forcing_direction,
+            dQ=generator_direction,
+            dalpha=dalpha,
+            dbeta=dbeta,
+        )
+        source_second = (
+            affine.source_alpha_second_derivative if collect_parameters and dalpha != 0 else None
+        )
         state_bar = cotangent[-1].copy()
         tangent_bar = xp.zeros(affine.size)
         zero = xp.zeros(affine.size)
@@ -1221,33 +1520,65 @@ class StrangTrajectory:
                 first_slope = first_ratio**2
                 powers = affine._powers(first, self._frame(n))
                 middle = affine._value(powers)
-                middle_ratio = _decay_ratio(middle, self._states[n + 1], xp=xp)
-                middle_slope = middle_ratio**2
-                middle_direction = affine._tangent_many(
-                    powers,
-                    (first_slope * tangents[n])[:, None],
-                    (
-                        zero[:, None]
-                        if forcing_direction is None
-                        else self._frame(n, forcing_direction)[:, None]
-                    ),
-                    (),
-                    operator_directions,
-                    alpha_direction,
-                    plan=(False, slice(0, 0)),
-                )[:, 0]
-                middle_bar = middle_slope * state_bar
-                middle_tangent_bar = middle_slope * tangent_bar + _decay_curvature_product(
+                first_direction = first_slope * tangents[n]
+                if dbeta != 0:
+                    first_direction += _decay_partials(state, first, half, xp=xp)[1] * dbeta
+                load_direction = (
+                    zero if forcing_direction is None else self._frame(n, forcing_direction)
+                )
+                if collect_parameters:
+                    power_directions = affine._power_directions(
+                        powers, first_direction, load_direction, transition_direction
+                    )
+                    middle_direction = (
+                        affine._growth * (affine._a @ power_directions[0])
+                        + affine._b @ power_directions[1]
+                    )
+                    if dalpha != 0:
+                        middle_direction += dalpha * (
+                            affine.step * affine._growth * (affine._a @ powers[0])
+                            + affine._db @ powers[1]
+                        )
+                else:
+                    middle_direction = affine._tangent_many(
+                        powers,
+                        first_direction[:, None],
+                        load_direction[:, None],
+                        (),
+                        operator_directions,
+                        alpha_direction,
+                        plan=(False, slice(0, 0)),
+                    )[:, 0]
+                middle_bar, middle_tangent_bar, beta_contribution = _decay_pullback_tangent(
                     middle,
-                    middle_ratio,
+                    self._states[n + 1],
                     self.beta,
                     half,
                     middle_direction,
                     state_bar,
+                    tangent_bar,
+                    dbeta,
+                    parameters=collect_parameters,
                     xp=xp,
                 )
-                first_bar = affine._pullback(powers, middle_bar, {})["u"]
-                tangent_pulled = affine._pullback(powers, middle_tangent_bar, {})
+                beta_bar += beta_contribution
+                if collect_parameters:
+                    first_bar, tangent_pulled = affine._pullback_directional(
+                        powers,
+                        power_directions,
+                        middle_bar,
+                        middle_tangent_bar,
+                        partials,
+                        transition_direction,
+                        dalpha,
+                        source_second,
+                    )
+                    alpha_bar += tangent_pulled["alpha"]
+                    for name in operator_bar:
+                        operator_bar[name] += tangent_pulled["operator"][name]
+                else:
+                    first_bar = affine._pullback(powers, middle_bar, {})["u"]
+                    tangent_pulled = affine._pullback(powers, middle_tangent_bar, {})
                 first_tangent_bar = tangent_pulled["u"]
                 if collect_forcing:
                     forcing_bar[n] = (
@@ -1255,24 +1586,44 @@ class StrangTrajectory:
                         if self._load is None
                         else self._load @ tangent_pulled["f"]
                     )
-                tangent_bar = first_slope * first_tangent_bar + _decay_curvature_product(
+                state_bar, tangent_bar, beta_contribution = _decay_pullback_tangent(
                     state,
-                    first_ratio,
+                    first,
                     self.beta,
                     half,
                     tangents[n],
                     first_bar,
+                    first_tangent_bar,
+                    dbeta,
+                    parameters=collect_parameters,
                     xp=xp,
                 )
-                state_bar = cotangent[n] + first_slope * first_bar
+                beta_bar += beta_contribution
+                state_bar = cotangent[n] + state_bar
         finite = xp.isfinite(tangent_bar).all() & xp.isfinite(state_bar).all()
         if collect_forcing:
             finite &= xp.isfinite(forcing_bar).all()
+        if collect_parameters:
+            finite &= xp.isfinite(
+                xp.stack(
+                    [
+                        xp.asarray(alpha_bar),
+                        xp.asarray(beta_bar),
+                        *(xp.asarray(value) for value in operator_bar.values()),
+                    ]
+                )
+            ).all()
         if not bool(finite):
             raise FloatingPointError("The state/forcing Hessian action is not representable")
         result = {"initial": tangent_bar}
         if collect_forcing:
             result["forcing"] = forcing_bar
+        if collect_parameters:
+            result.update(
+                operator={name: float(value) for name, value in operator_bar.items()},
+                alpha=float(alpha_bar),
+                beta=float(beta_bar),
+            )
         return result
 
 

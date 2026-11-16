@@ -8,6 +8,7 @@ import pytest
 from scipy import sparse
 from scipy.integrate import quad, solve_ivp
 from scipy.linalg import expm
+from scipy.special import gammaln, logsumexp, xlogy
 from scipy.stats import poisson
 
 from adrkit.backends.bounded import BoundedResidual
@@ -117,7 +118,7 @@ def test_many_tangent_requires_declared_operator_direction_dimensions():
         list(trajectory.iter_jvp_many(np.zeros((3, 2)), np.zeros((2, 3))))
 
 
-@pytest.mark.parametrize("alpha", [-0.7, 0.0, 0.8, 5.0, 6.0])
+@pytest.mark.parametrize("alpha", [-10.0, -0.7, 0.0, 0.8, 5.0, 6.0])
 def test_integral_weights_and_alpha_derivatives_match_independent_quadrature(alpha):
     step, rate, degree = 0.2, 5.0, 8
     action = PositiveAffineAction(generator(), alpha, step=step, rate=rate, degree=degree)
@@ -143,18 +144,61 @@ def test_integral_weights_and_alpha_derivatives_match_independent_quadrature(alp
             for k in range(degree + 1)
         ]
     )
+    ddw = np.array(
+        [
+            quad(
+                lambda s: s**2 * np.exp((alpha - rate) * s) * (rate * s) ** k / factorial(k),
+                0.0,
+                step,
+                epsabs=1e-15,
+            )[0]
+            for k in range(degree + 1)
+        ]
+    )
     total = quad(lambda s: np.exp(alpha * s), 0.0, step, epsabs=1e-15)[0]
     total_derivative = quad(lambda s: s * np.exp(alpha * s), 0.0, step, epsabs=1e-15)[0]
+    total_second = quad(lambda s: s**2 * np.exp(alpha * s), 0.0, step, epsabs=1e-15)[0]
     expected = total * w / w.sum()
     derivative = (
         total_derivative * w / w.sum() + total * dw / w.sum() - total * w * dw.sum() / w.sum() ** 2
     )
+    second = (
+        (total_second * w + 2 * total_derivative * dw + total * ddw) / w.sum()
+        - 2 * (total_derivative * w + total * dw) * dw.sum() / w.sum() ** 2
+        - total * w * ddw.sum() / w.sum() ** 2
+        + 2 * total * w * dw.sum() ** 2 / w.sum() ** 3
+    )
     np.testing.assert_allclose(action.source_weights, expected, rtol=3e-14, atol=1e-17)
     np.testing.assert_allclose(action.source_alpha_derivative, derivative, rtol=5e-14, atol=1e-17)
+    np.testing.assert_allclose(
+        action.source_alpha_second_derivative, second, rtol=2e-13, atol=1e-17
+    )
     assert np.all(action.source_weights >= 0) and np.all(action.source_alpha_derivative > 0)
     np.testing.assert_allclose(action.transport_weights.sum(), 1.0, rtol=0, atol=3e-16)
     np.testing.assert_allclose(action.source_weights.sum(), total, rtol=3e-15)
     np.testing.assert_allclose(action.source_alpha_derivative.sum(), total_derivative, rtol=3e-15)
+    np.testing.assert_allclose(
+        action.source_alpha_second_derivative.sum(), total_second, rtol=5e-15
+    )
+
+
+@pytest.mark.parametrize("alpha", [-10.0, 0.0, 5.0, 6.0])
+def test_source_second_alpha_derivative_matches_centered_difference_of_first(alpha):
+    options = {"step": 0.2, "rate": 5.0, "degree": 8}
+    action = PositiveAffineAction(generator(), alpha, **options)
+    displacement = 1e-4
+    first_upper = PositiveAffineAction(
+        generator(), alpha + displacement, **options
+    ).source_alpha_derivative
+    first_lower = PositiveAffineAction(
+        generator(), alpha - displacement, **options
+    ).source_alpha_derivative
+    np.testing.assert_allclose(
+        action.source_alpha_second_derivative,
+        (first_upper - first_lower) / (2 * displacement),
+        rtol=2e-8,
+        atol=1e-13,
+    )
 
 
 @pytest.mark.parametrize("mean", [0.0, 0.2, 8.0, 1000.0])
@@ -176,6 +220,77 @@ def test_large_poisson_mean_keeps_positive_normalized_weights():
     np.testing.assert_allclose(
         action.apply(np.ones(3), np.ones(3)), np.exp(0.1) + np.expm1(0.1) / 0.1, rtol=3e-13
     )
+    second_total = quad(lambda s: s**2 * np.exp(0.1 * s), 0.0, step, epsabs=1e-14)[0]
+    np.testing.assert_allclose(
+        action.source_alpha_second_derivative.sum(), second_total, rtol=5e-13
+    )
+    displacement = 1e-4
+    varied = [
+        PositiveAffineAction(
+            generator(), 0.1 + sign * displacement, step=step, rate=rate, degree=action.degree
+        ).source_alpha_derivative
+        for sign in (1, -1)
+    ]
+    np.testing.assert_allclose(
+        action.source_alpha_second_derivative,
+        (varied[0] - varied[1]) / (2 * displacement),
+        rtol=3e-6,
+        atol=2e-10,
+    )
+
+
+def test_large_mean_individual_weights_and_two_derivatives_match_log_integral_quadrature():
+    rate, step, alpha = 1000.0, 1.0, 0.1
+    degree = poisson_degree(rate * step, 1e-12)
+    action = PositiveAffineAction(generator(), alpha, step=step, rate=rate, degree=degree)
+    indices = np.array([0, degree // 3, degree // 2, int(rate * step), degree])
+    powers = np.arange(degree + 1)
+    log_factorials = gammaln(powers + 1)
+
+    def moment(order, source_index=None):
+        def integrand(time):
+            if source_index is None:
+                log_polynomial = logsumexp(xlogy(powers, rate * time) - log_factorials)
+            else:
+                log_polynomial = xlogy(source_index, rate * time) - gammaln(source_index + 1)
+            return np.exp((alpha - rate) * time + log_polynomial + xlogy(order, time))
+
+        points = None
+        if source_index is not None:
+            center = (source_index + order + 1) / (rate - alpha)
+            if 0 < center < step:
+                points = [center]
+        return quad(integrand, 0.0, step, points=points, epsabs=1e-18, epsrel=3e-12, limit=250)[0]
+
+    total = np.array(
+        [
+            quad(lambda time: time**order * np.exp(alpha * time), 0.0, step, epsabs=1e-14)[0]
+            for order in range(3)
+        ]
+    )
+    normalizer = np.array([moment(order) for order in range(3)])
+    individual = np.array([[moment(order, int(k)) for k in indices] for order in range(3)])
+    source = total[0] * individual[0] / normalizer[0]
+    derivative = (total[1] * individual[0] + total[0] * individual[1]) / normalizer[0] - total[
+        0
+    ] * individual[0] * normalizer[1] / normalizer[0] ** 2
+    second = (
+        (total[2] * individual[0] + 2 * total[1] * individual[1] + total[0] * individual[2])
+        / normalizer[0]
+        - 2
+        * (total[1] * individual[0] + total[0] * individual[1])
+        * normalizer[1]
+        / normalizer[0] ** 2
+        - total[0] * individual[0] * normalizer[2] / normalizer[0] ** 2
+        + 2 * total[0] * individual[0] * normalizer[1] ** 2 / normalizer[0] ** 3
+    )
+    np.testing.assert_allclose(action.source_weights[indices], source, rtol=5e-10, atol=5e-15)
+    np.testing.assert_allclose(
+        action.source_alpha_derivative[indices], derivative, rtol=5e-10, atol=5e-15
+    )
+    np.testing.assert_allclose(
+        action.source_alpha_second_derivative[indices], second, rtol=5e-10, atol=5e-15
+    )
 
 
 def test_long_decay_interval_has_finite_source_integral_and_alpha_derivative():
@@ -185,8 +300,53 @@ def test_long_decay_interval_has_finite_source_integral_and_alpha_derivative():
     # integral(exp(-s)) -> 1; integral(s*exp(-s)) -> 1 при step -> infinity.
     np.testing.assert_allclose(action.source_weight_sum, 1.0, rtol=1e-14)
     np.testing.assert_allclose(action.source_alpha_derivative.sum(), 1.0, rtol=1e-14)
+    np.testing.assert_allclose(action.source_alpha_second_derivative.sum(), 2.0, rtol=1e-14)
     np.testing.assert_allclose(action.apply([2.0], [3.0]), [3.0], rtol=1e-14)
     np.testing.assert_allclose(action.jvp([2.0], [3.0], dalpha=1.0), [3.0], rtol=1e-14)
+
+
+@pytest.mark.parametrize("alpha_step", [-1.0, 0.0, 1.0])
+def test_zero_mean_branch_has_only_the_total_second_moment(alpha_step):
+    step, rate = 1e-100, 1e-300
+    action = PositiveAffineAction(
+        sparse.csr_matrix((1, 1)), alpha_step / step, step=step, rate=rate, degree=2
+    )
+    expected = step**3 * quad(lambda t: t**2 * np.exp(alpha_step * t), 0.0, 1.0)[0]
+    actual = action.source_alpha_second_derivative
+    np.testing.assert_allclose(actual[0], expected, rtol=2e-13, atol=0)
+    np.testing.assert_array_equal(actual[1:], [0.0, 0.0])
+    assert not actual.flags.writeable
+
+
+def test_unrepresentable_second_moment_does_not_change_first_order_range():
+    step, rate = 1e110, 1e-110
+    action = PositiveAffineAction(sparse.csr_matrix((1, 1)), 0.0, step=step, rate=rate, degree=2)
+    np.testing.assert_allclose(action.source_weight_sum, step, rtol=1e-14)
+    np.testing.assert_allclose(action.source_alpha_derivative.sum(), step**2 / 2, rtol=1e-13)
+    np.testing.assert_allclose(action.apply([1.0], [1e-110]), [2.0], rtol=1e-13)
+    np.testing.assert_allclose(action.jvp([1.0], [1e-110], dalpha=1e-110), [1.5], rtol=1e-13)
+    with pytest.raises(FloatingPointError, match="second derivative.*representable"):
+        action.source_alpha_second_derivative
+    np.testing.assert_allclose(action.apply([1.0], [1e-110]), [2.0], rtol=1e-13)
+
+
+def test_subnormal_gamma_probabilities_preserve_representable_source_weights():
+    step, rate = 1e140, 1e-300
+    mean = rate * step
+    action = PositiveAffineAction(sparse.csr_matrix((1, 1)), 0.0, step=step, rate=rate, degree=2)
+    powers = np.arange(3)
+    # For mean << eps, exp(-rate*s)=1 to FP64 relative accuracy and the
+    # normalized-polynomial tail is O(mean**3). The individual integrals
+    # therefore have the leading values below. Logs avoid losing mean**2
+    # before multiplication by the large, representable step.
+    expected = np.exp(np.log(step) + powers * np.log(mean) - gammaln(powers + 2))
+    expected_derivative = np.exp(
+        2 * np.log(step) + powers * np.log(mean) - gammaln(powers + 1) - np.log(powers + 2)
+    )
+    np.testing.assert_allclose(action.source_weights, expected, rtol=5e-13, atol=0)
+    np.testing.assert_allclose(
+        action.source_alpha_derivative, expected_derivative, rtol=5e-13, atol=0
+    )
 
 
 @pytest.mark.parametrize("alpha", [-0.4, 0.0, 0.3])

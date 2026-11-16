@@ -39,6 +39,19 @@ class NonnegativeAnalysisLinearization:
     inverse_hessian: LinearOperator
 
 
+@dataclass(frozen=True)
+class StationaryBoxInverse:
+    """Обратное действие гессиана на выбранной стационарной грани коробки.
+
+    operator задаёт K=Z@inv(Z.T@H@Z)@Z.T. metadata хранит исходные
+    остатки стационарности, знаковые запасы и границы. Проверка допусков
+    и решение линейных систем не доказывают минимум или положительность H.
+    """
+
+    operator: LinearOperator
+    metadata: Mapping
+
+
 def gradient_mapping(theta, gradient):
     r"""Вычислить отображение проекционного градиента.
 
@@ -95,6 +108,233 @@ def box_bounds(bounds, size):
             raise ValueError("Invalid coefficient bounds")
         result.append((low, high))
     return result
+
+
+def _restricted_inverse_action(hessian_action, size, free, *, solve_rtol, maxiter):
+    """Использовать один MINRES и уточнение по исходному остатку на свободной грани."""
+    free = np.array(free, dtype=np.intp, copy=True)
+    free.flags.writeable = False
+
+    def reduced_hessian(direction):
+        full = np.zeros(size)
+        full[free] = direction
+        value = real_array(hessian_action(full), name="Hessian action")
+        if value.shape != (size,):
+            raise ValueError("Hessian action must have shape (N,)")
+        return value[free]
+
+    reduced = (
+        LinearOperator(
+            (free.size, free.size), matvec=reduced_hessian, rmatvec=reduced_hessian, dtype=float
+        )
+        if free.size
+        else None
+    )
+
+    def inverse_action(right):
+        right = real_array(right, name="inverse Hessian right-hand side")
+        if right.shape not in ((size,), (size, 1)):
+            raise ValueError("Inverse Hessian right-hand side must have length N")
+        right = right.reshape(size)
+        result = np.zeros(size)
+        if not free.size:
+            return result
+        selected = real_array(right[free], name="free linear right-hand side")
+        if not np.any(selected):
+            return result
+        inner_rtol = solve_rtol / np.sqrt(free.size)
+        if inner_rtol == 0:
+            raise ValueError("The requested internal MINRES tolerance is not representable")
+        right_norm = norm(selected)
+        if not np.isfinite(right_norm) or right_norm == 0:
+            raise ValueError("The free right-hand-side norm is not representable")
+        solution = np.zeros(free.size)
+        residual = selected.copy()
+        residual_norm = right_norm
+        iterations = 0
+        while iterations < maxiter:
+            used = 0
+
+            def count_iteration(_):
+                nonlocal used
+                used += 1
+
+            correction, info = minres(
+                reduced,
+                residual,
+                rtol=inner_rtol,
+                maxiter=maxiter - iterations,
+                callback=count_iteration,
+                check=True,
+            )
+            iterations += used
+            if info < 0:
+                raise RuntimeError("MINRES failed the requested true relative linear residual")
+            correction = real_array(correction, name="free linear correction")
+            updated = real_array(solution + correction, name="free linear solution")
+            actual = real_array(selected - reduced @ updated, name="free linear residual")
+            actual_norm = norm(actual)
+            if actual_norm / right_norm <= solve_rtol:
+                result[free] = updated
+                return result
+            if (
+                info > 0
+                or used == 0
+                or iterations >= maxiter
+                or np.array_equal(updated, solution)
+                or actual_norm >= residual_norm
+            ):
+                break
+            solution, residual, residual_norm = updated, actual, actual_norm
+        raise RuntimeError("MINRES failed the requested true relative linear residual")
+
+    return inverse_action
+
+
+def stationary_box_inverse(
+    point,
+    gradient,
+    hessian,
+    lower,
+    upper,
+    *,
+    kkt_tolerance,
+    active_margin,
+    solve_rtol,
+    maxiter,
+):
+    r"""Построить KKT-обратное действие при фиксированных покомпонентных границах.
+
+    Parameters
+    ----------
+    point, gradient : array_like, shape (N,)
+        Непустая конечная допустимая точка x и исходный координатный градиент g.
+        Передаётся градиент исходного функционала, без обнуления активных строк.
+    hessian : array_like, shape (N, N), or scipy.sparse.linalg.LinearOperator
+        Гессиан в той же зафиксированной точке. Плотная матрица копируется
+        и должна быть точно симметричной; усреднения или сдвига нет. Для
+        оператора самосопряжённость и неизменяемая линеаризация — предпосылки
+        вызывающей стороны. Его внешнее изменяемое состояние не копируется.
+    lower, upper : scalar or array_like broadcastable to (N,)
+        Переданные границы l<=x<=u. Разрешены l=-inf и u=+inf; NaN,
+        l=+inf и u=-inf запрещены. Совпадающие конечные границы фиксируют
+        координату; её градиент произволен. Окрестности границ не округляются.
+    kkt_tolerance : positive float
+        Общий допуск исходного проекционного и отдельно свободного градиента.
+    active_margin : nonnegative float
+        На x=l<u требуется g>active_margin, на x=u>l — -g>active_margin.
+        Это численный запас, а не доказательство устойчивости активной грани.
+    solve_rtol : float in (0, 1)
+        Допуск фактического относительного остатка свободной системы.
+    maxiter : positive int
+        Общий бюджет MINRES, включая уточнение по исходному остатку.
+
+    Returns
+    -------
+    StationaryBoxInverse
+        operator формы (N,N): K=Z@inv(Z.T@H@Z)@Z.T; Z вкладывает строго
+        свободные координаты l<x<u. Активные и фиксированные выходы нулевые.
+
+    Notes
+    -----
+    Проверяется p=x-P_[l,u](x-g). Без вычитания x-g используется эквивалентная
+    формула p_i=min(g_i,x_i-l_i) при g_i>=0 и p_i=max(g_i,x_i-u_i) при g_i<0.
+    Отдельная проверка g на свободных координатах предотвращает ложную
+    стационарность от малого расстояния до границы. Грань определяется
+    точными сравнениями с переданными границами, без snap или padding.
+
+    Для производной стационарной ветви предполагаются её гладкость,
+    устойчивость грани и невырожденность свободного гессиана. Они не следуют
+    из допусков. MINRES допускает неопределённый гессиан; положительная
+    определённость не проверяется, минимум не удостоверяется. Используется
+    тот же решатель с проверкой исходного остатка, что и для неотрицательного
+    анализа: нет псевдообратной, сдвига, запасного алгоритма или ослабления
+    допуска. Конечная точность не обеспечивает точное сопряжённое тождество.
+    """
+    x = real_array(point, name="point", copy=True)
+    g = real_array(gradient, name="original gradient", copy=True)
+    if x.ndim != 1 or not x.size or g.shape != x.shape:
+        raise ValueError("Point and original gradient must have the same nonempty vector shape")
+    size = x.size
+
+    def boundary(value, name):
+        raw = real_array(value, name=name, finite=False)
+        try:
+            result = np.array(np.broadcast_to(raw, x.shape), dtype=float, copy=True)
+        except ValueError as error:
+            raise ValueError(f"{name} must broadcast to the point shape") from error
+        if np.isnan(result).any():
+            raise ValueError(f"{name} cannot contain NaN")
+        return result
+
+    low, high = boundary(lower, "lower"), boundary(upper, "upper")
+    if np.any(low > high) or np.any(low == np.inf) or np.any(high == -np.inf):
+        raise ValueError("Require ordered bounds with no lower=+inf or upper=-inf")
+    if np.any(x < low) or np.any(x > high):
+        raise ValueError("Point must satisfy the supplied bounds")
+    tolerance = real_scalar(kkt_tolerance, name="kkt_tolerance")
+    margin = real_scalar(active_margin, name="active_margin")
+    relative = real_scalar(solve_rtol, name="solve_rtol")
+    if tolerance <= 0 or margin < 0 or not 0 < relative < 1:
+        raise ValueError("Require kkt_tolerance>0, active_margin>=0 and 0<solve_rtol<1")
+    if type(maxiter) is not int or maxiter < 1:
+        raise ValueError("maxiter must be a positive integer")
+    fixed = low == high
+    active_low, active_high = (x == low) & ~fixed, (x == high) & ~fixed
+    free = np.flatnonzero(~(fixed | active_low | active_high))
+    with np.errstate(over="ignore", invalid="ignore"):
+        projected = np.where(g >= 0, np.minimum(g, x - low), np.maximum(g, x - high))
+    projected_residual = float(np.max(np.abs(projected)))
+    free_residual = float(np.max(np.abs(g[free]))) if free.size else 0.0
+    if projected_residual > tolerance or free_residual > tolerance:
+        raise ValueError("Point fails original projected or free stationarity tolerance")
+    lower_min = float(np.min(g[active_low])) if np.any(active_low) else None
+    upper_min = float(np.min(-g[active_high])) if np.any(active_high) else None
+    if (lower_min is not None and lower_min <= margin) or (
+        upper_min is not None and upper_min <= margin
+    ):
+        raise ValueError("Point has a weak or incorrectly signed active box face")
+    if isinstance(hessian, LinearOperator):
+        if hessian.shape != (size, size) or np.dtype(hessian.dtype).kind not in "iuf":
+            raise ValueError("Hessian operator must have real shape (N,N)")
+        hessian_action = hessian.matvec
+        kind = "self_adjoint_operator_assumed"
+    else:
+        matrix = real_array(hessian, name="Hessian", copy=True)
+        if matrix.shape != (size, size) or not np.array_equal(matrix, matrix.T):
+            raise ValueError("Dense Hessian must have exactly symmetric shape (N,N)")
+        matrix = np.frombuffer(matrix.tobytes(), dtype=matrix.dtype).reshape(matrix.shape)
+        hessian_action = lambda direction: matrix @ direction
+        kind = "exactly_symmetric_dense"
+    inverse_action = _restricted_inverse_action(
+        hessian_action, size, free, solve_rtol=relative, maxiter=maxiter
+    )
+    operator = LinearOperator(
+        (size, size), matvec=inverse_action, rmatvec=inverse_action, dtype=float
+    )
+    metadata = MappingProxyType(
+        {
+            "point": tuple(float(value) for value in x),
+            "original_gradient": tuple(float(value) for value in g),
+            "lower": tuple(float(value) for value in low),
+            "upper": tuple(float(value) for value in high),
+            "free_indices": tuple(int(index) for index in free),
+            "lower_active_indices": tuple(int(index) for index in np.flatnonzero(active_low)),
+            "upper_active_indices": tuple(int(index) for index in np.flatnonzero(active_high)),
+            "fixed_indices": tuple(int(index) for index in np.flatnonzero(fixed)),
+            "projected_gradient_inf": projected_residual,
+            "free_root_residual_inf": free_residual,
+            "lower_gradient_min": lower_min,
+            "upper_negative_gradient_min": upper_min,
+            "kkt_tolerance": tolerance,
+            "active_margin": margin,
+            "solve_rtol": relative,
+            "maxiter": maxiter,
+            "hessian_kind": kind,
+            "positive_definiteness": "not_checked",
+        }
+    )
+    return StationaryBoxInverse(operator, metadata)
 
 
 def project_nonnegative_equalities(
@@ -1038,71 +1278,9 @@ def nonnegative_analysis_linear_operator(
             value = value + extra
         return real_array(value, name="analysis Hessian product")
 
-    def reduced_hessian(direction):
-        full = np.zeros(domain.size)
-        full[free] = direction
-        return hessian(full)[free]
-
-    reduced = (
-        LinearOperator(
-            (free.size, free.size), matvec=reduced_hessian, rmatvec=reduced_hessian, dtype=float
-        )
-        if free.size
-        else None
+    solve_free = _restricted_inverse_action(
+        hessian, domain.size, free, solve_rtol=relative, maxiter=maxiter
     )
-
-    def solve_free(right):
-        result = np.zeros(domain.size)
-        if not free.size:
-            return result
-        selected = real_array(right[free], name="free linear right-hand side")
-        if not np.any(selected):
-            return result
-        inner_rtol = relative / np.sqrt(free.size)
-        if inner_rtol == 0:
-            raise ValueError("The requested internal MINRES tolerance is not representable")
-        right_norm = norm(selected)
-        if not np.isfinite(right_norm) or right_norm == 0:
-            raise ValueError("The free right-hand-side norm is not representable")
-        solution = np.zeros(free.size)
-        residual = selected.copy()
-        residual_norm = right_norm
-        iterations = 0
-        while iterations < maxiter:
-            used = 0
-
-            def count_iteration(_):
-                nonlocal used
-                used += 1
-
-            correction, info = minres(
-                reduced,
-                residual,
-                rtol=inner_rtol,
-                maxiter=maxiter - iterations,
-                callback=count_iteration,
-                check=True,
-            )
-            iterations += used
-            if info < 0:
-                raise RuntimeError("MINRES failed the requested true relative linear residual")
-            correction = real_array(correction, name="free linear correction")
-            updated = real_array(solution + correction, name="free linear solution")
-            actual = real_array(selected - reduced @ updated, name="free linear residual")
-            actual_norm = norm(actual)
-            if actual_norm / right_norm <= relative:
-                result[free] = updated
-                return result
-            if (
-                info > 0
-                or used == 0
-                or iterations >= maxiter
-                or np.array_equal(updated, solution)
-                or actual_norm >= residual_norm
-            ):
-                break
-            solution, residual, residual_norm = updated, actual, actual_norm
-        raise RuntimeError("MINRES failed the requested true relative linear residual")
 
     def matvec(direction):
         direction = real_array(direction, name="analysis input direction").reshape(-1)
@@ -1145,14 +1323,7 @@ def nonnegative_analysis_linear_operator(
     operator = LinearOperator(
         (domain.size, domain.size + codomain.size), matvec=matvec, rmatvec=rmatvec, dtype=float
     )
-
-    def inverse_action(right):
-        right = real_array(right, name="inverse Hessian right-hand side")
-        if right.shape not in (domain.shape, (domain.size, 1)):
-            raise ValueError("Inverse Hessian right-hand side must have length N")
-        return solve_free(right.reshape(domain.size))
-
     inverse_hessian = LinearOperator(
-        (domain.size, domain.size), matvec=inverse_action, rmatvec=inverse_action, dtype=float
+        (domain.size, domain.size), matvec=solve_free, rmatvec=solve_free, dtype=float
     )
     return NonnegativeAnalysisLinearization(operator, metadata, inverse_hessian)

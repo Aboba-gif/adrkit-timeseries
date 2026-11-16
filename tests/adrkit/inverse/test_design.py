@@ -9,10 +9,80 @@ from adrkit.inverse.design import (
     CovarianceFactor,
     DesignCandidate,
     affine_goal_risk,
+    joint_moment_risk,
     profile_information,
     robust_ball_maximum,
     select_designs,
 )
+
+
+def test_joint_moment_risk_matches_finite_joint_population_with_nonlinear_component():
+    data = np.array([[-2.0, 0.2], [-1.0, 1.1], [0.5, -0.3], [1.5, 0.7], [2.0, -0.9], [0.3, 0.5]])
+    scales = np.abs(data[:, :1] + 0.2 * data[:, 1:])
+    target = 0.3 * data[:, :1] - 0.1 * data[:, 1:] + 0.2 * scales
+    samples = np.column_stack((data, scales, target))
+    matrix = np.array([[0.7, -0.2, 0.4, -1.0], [-0.1, 0.6, 0.3, -0.5]])
+    offset = np.array([0.2, -0.3])
+    mean = samples.mean(axis=0)
+    centered = samples - mean
+    factor = CovarianceFactor(centered.T / np.sqrt(len(samples)))
+    result = joint_moment_risk(matrix, offset, mean, factor)
+    errors = samples @ matrix.T + offset
+    error_mean = errors.mean(axis=0)
+    expected_variance = np.mean(np.sum((errors - error_mean) ** 2, axis=1))
+    np.testing.assert_allclose(result.mean_error, error_mean, rtol=1e-14, atol=1e-14)
+    np.testing.assert_allclose(result.squared_bias, error_mean @ error_mean, rtol=1e-14)
+    np.testing.assert_allclose(result.variance, expected_variance, rtol=1e-14)
+    np.testing.assert_allclose(result.value, np.mean(np.sum(errors**2, axis=1)), rtol=1e-14)
+    assert mean[2] > 0
+    independent = joint_moment_risk(matrix, offset, mean, np.diag(factor.factor @ factor.factor.T))
+    assert abs(independent.value - result.value) > 0.1
+
+
+def test_joint_moment_risk_keeps_correlated_cancellation_and_explicit_mean():
+    result = joint_moment_risk([[1.0, -1.0]], [0.5], [2.0, 2.0], CovarianceFactor([[1.0], [1.0]]))
+    np.testing.assert_array_equal(result.mean_error, [0.5])
+    assert result.squared_bias == 0.25
+    assert result.variance == 0.0
+    assert result.value == 0.25
+
+
+def test_joint_moment_factor_diagonal_and_matrix_representations_agree():
+    matrix, mean, offset = (
+        np.array([[0.2, -0.6, 0.5], [0.4, 0.1, -0.3]]),
+        [0.7, -0.2, 0.5],
+        [0.3, -0.1],
+    )
+    diagonal = np.array([0.25, 4.0, 0.0])
+    reference = joint_moment_risk(matrix, offset, mean, diagonal)
+    for covariance in (np.diag(diagonal), CovarianceFactor(np.diag(np.sqrt(diagonal)))):
+        result = joint_moment_risk(matrix, offset, mean, covariance)
+        np.testing.assert_array_equal(result.mean_error, reference.mean_error)
+        np.testing.assert_allclose(result.value, reference.value, rtol=1e-14)
+
+
+def test_joint_moment_result_owns_immutable_mean_error():
+    matrix, offset, mean, diagonal = (
+        np.eye(2),
+        np.array([0.2, 0.4]),
+        np.array([0.5, -0.1]),
+        np.ones(2),
+    )
+    result = joint_moment_risk(matrix, offset, mean, diagonal)
+    expected = result.mean_error.copy()
+    matrix[:] = 0
+    offset[:] = 9
+    mean[:] = 8
+    diagonal[:] = 7
+    np.testing.assert_array_equal(result.mean_error, expected)
+    assert not result.mean_error.flags.writeable
+    with pytest.raises(ValueError):
+        result.mean_error.flags.writeable = True
+
+
+def test_joint_moment_risk_rejects_negative_joint_variance():
+    with pytest.raises(ValueError):
+        joint_moment_risk([[1.0, 0.0]], [0.0], [0.0, 0.0], [[1.0, 2.0], [2.0, 1.0]])
 
 
 def assert_ball_result(result, a, matrix, radius, expected, *, atol=2e-10):

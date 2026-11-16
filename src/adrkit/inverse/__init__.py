@@ -17,15 +17,19 @@ from .optimizers import solve_lbfgsb
 from .problem import InverseProblem
 from .constraints import (
     NonnegativeAnalysisLinearization,
+    StationaryBoxInverse,
     analyze_nonnegative_map,
     analyze_nonnegative_observations,
     nonnegative_analysis_linear_operator,
     project_nonnegative_equalities,
+    stationary_box_inverse,
 )
 from .design import (
     CovarianceFactor,
     DesignCandidate,
+    JointMomentRisk,
     affine_goal_risk,
+    joint_moment_risk,
     profile_information,
     robust_ball_maximum,
     select_designs,
@@ -56,9 +60,13 @@ __all__ = [
     "analyze_nonnegative_map",
     "NonnegativeAnalysisLinearization",
     "nonnegative_analysis_linear_operator",
+    "StationaryBoxInverse",
+    "stationary_box_inverse",
     "CovarianceFactor",
     "DesignCandidate",
+    "JointMomentRisk",
     "affine_goal_risk",
+    "joint_moment_risk",
     "profile_information",
     "robust_ball_maximum",
     "select_designs",

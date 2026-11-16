@@ -102,7 +102,12 @@ def test_device_trajectory_derivatives_match_cpu_and_duality(cupy, distributed, 
     directions[:, -1] = 0.0
     da, db = rng.normal(scale=0.1, size=count), rng.normal(scale=0.1, size=count)
     cpu, gpu = action(q, "numpy"), action(q, "cupy")
-    for name in ("transport_weights", "source_weights", "source_alpha_derivative"):
+    for name in (
+        "transport_weights",
+        "source_weights",
+        "source_alpha_derivative",
+        "source_alpha_second_derivative",
+    ):
         np.testing.assert_array_equal(gpu.to_host(getattr(gpu, name)), getattr(cpu, name))
     cpu_path = solve_strang(cpu, initial, forcing, beta=beta, load=load)
     gpu_path = solve_strang(gpu, initial, forcing, beta=beta, load=load)
