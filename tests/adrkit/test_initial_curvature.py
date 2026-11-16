@@ -213,3 +213,128 @@ def test_unrepresentable_curvature_is_reported_instead_of_returned(request, back
     path = solve_strang(action, [0], [[0]], beta=1e308)
     with np.errstate(over="ignore", invalid="ignore"), pytest.raises(FloatingPointError):
         path.initial_hvp([[0], [1]], [1])
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+@pytest.mark.parametrize("distributed", [True, False])
+def test_initial_increment_matches_independent_shifted_solve_and_owns_output(
+    request, backend, distributed
+):
+    if backend == "cupy":
+        module = request.getfixturevalue("cupy")
+    initial = np.array([0.3, 0.5, 0.4])
+    direction = np.array([0.05, -0.07, 0.1])
+    base = _path(backend=backend, distributed=distributed, initial=initial)
+    shifted = _path(backend=backend, distributed=distributed, initial=initial + direction)
+    original = base.affine.to_host(base.states)
+    actual = base.initial_increment(direction)
+    if backend == "cupy":
+        assert isinstance(actual, module.ndarray)
+    else:
+        assert not np.shares_memory(actual, base.states)
+    expected = shifted.affine.to_host(shifted.states) - original
+    np.testing.assert_allclose(base.affine.to_host(actual), expected, rtol=4e-12, atol=2e-15)
+    actual[0, 0] = 7.0
+    np.testing.assert_array_equal(base.affine.to_host(base.states), original)
+    np.testing.assert_array_equal(direction, [0.05, -0.07, 0.1])
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+@pytest.mark.parametrize("direction", [2.0**-60, -(2.0**-60)])
+def test_sub_ulp_increment_remains_nonzero_when_forward_difference_is_zero(
+    request, backend, direction
+):
+    if backend == "cupy":
+        request.getfixturevalue("cupy")
+    initial, beta, step = 1.0, 1.0, 1.0
+    action = PositiveAffineAction(
+        sparse.csr_matrix((1, 1)), 0, step=step, rate=1, degree=14, backend=backend
+    )
+    base = solve_strang(action, [initial], [[0]], beta=beta)
+    shifted = solve_strang(action, [initial + direction], [[0]], beta=beta)
+    np.testing.assert_array_equal(action.to_host(shifted.states), action.to_host(base.states))
+    actual = action.to_host(base.initial_increment([direction]))
+    expected = direction / (
+        (1 + beta * step * initial) * (1 + beta * step * (initial + direction))
+    )
+    assert actual[1, 0] != 0.0
+    np.testing.assert_allclose(actual[:, 0], [direction, expected], rtol=5e-13, atol=0)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+def test_increment_log_denominators_do_not_replace_overflowing_products_by_zero(request, backend):
+    if backend == "cupy":
+        request.getfixturevalue("cupy")
+    action = PositiveAffineAction(
+        sparse.csr_matrix((1, 1)), 0, step=4, rate=1, degree=14, backend=backend
+    )
+    base = solve_strang(action, [0], [[0]], beta=1e308)
+    actual = action.to_host(base.initial_increment([1e-308]))
+    # Full reaction flow: delta/(1+beta*h*delta) = 1e-308/5.
+    np.testing.assert_allclose(actual[1], [2e-309], rtol=2e-11, atol=0)
+
+
+def test_initial_increment_has_the_declared_tangent_as_its_small_step_limit():
+    path = _path()
+    direction = np.array([0.1, -0.2, 0.3])
+    tangent = path.jvp(d_initial=direction)
+    first = path.initial_increment(1e-4 * direction) / 1e-4
+    second = path.initial_increment(1e-5 * direction) / 1e-5
+    first_error = np.linalg.norm(first - tangent)
+    second_error = np.linalg.norm(second - tangent)
+    assert second_error < 0.2 * first_error
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+def test_zero_beta_increment_is_the_fixed_affine_tangent(request, backend):
+    if backend == "cupy":
+        request.getfixturevalue("cupy")
+    path = _path(beta=0.0, backend=backend)
+    direction = np.array([-0.1, 0.2, -0.05])
+    actual = path.initial_increment(direction)
+    expected = path.jvp(d_initial=direction)
+    np.testing.assert_array_equal(path.affine.to_host(actual), path.affine.to_host(expected))
+
+
+def test_increment_uses_the_actual_truncated_polynomial_plan():
+    step, rate = 0.2, 5.0
+    generator = _generator()
+    action = PositiveAffineAction(generator, -0.2, step=step, rate=rate, degree=2)
+    path = solve_strang(action, [0.3, 0.5, 0.4], [[0.1, 0.2, 0.3]], beta=0)
+    direction = np.array([-0.1, 0.2, 0.05])
+    transition = np.eye(3) + generator.toarray() / rate
+    power, expected = np.eye(3), np.zeros(3)
+    for weight in action.transport_weights:
+        expected += exp(-0.2 * step) * weight * (power @ direction)
+        power = transition @ power
+    np.testing.assert_allclose(
+        path.initial_increment(direction)[1], expected, rtol=5e-14, atol=2e-16
+    )
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+def test_feasible_negative_increment_can_reach_an_exact_zero_shifted_state(request, backend):
+    if backend == "cupy":
+        request.getfixturevalue("cupy")
+    action = PositiveAffineAction(_generator(), -0.2, step=0.1, rate=5, degree=14, backend=backend)
+    initial = np.array([0.3, 0.5, 0.4])
+    path = solve_strang(action, initial, np.zeros((4, 3)), beta=0.3)
+    actual = action.to_host(path.initial_increment(-initial))
+    np.testing.assert_allclose(actual, -action.to_host(path.states), rtol=5e-13, atol=2e-15)
+
+
+def test_no_steps_and_zero_initial_increment_return_independent_arrays():
+    action = PositiveAffineAction(_generator(), -0.2, step=0.1, rate=5, degree=14)
+    path = solve_strang(action, [0.3, 0.5, 0.4], np.empty((0, 3)), beta=0.3)
+    direction = np.array([-0.1, 0.2, 0.0])
+    actual = path.initial_increment(direction)
+    np.testing.assert_array_equal(actual, direction[None, :])
+    assert not np.shares_memory(actual, direction)
+    zeros = _path().initial_increment(np.zeros(3))
+    np.testing.assert_array_equal(zeros, np.zeros((7, 3)))
+
+
+def test_infeasible_initial_increment_is_rejected_without_projection():
+    path = _path()
+    with pytest.raises(ValueError, match="shifted initial state"):
+        path.initial_increment([-0.31, 0, 0])

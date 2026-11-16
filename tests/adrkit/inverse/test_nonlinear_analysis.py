@@ -113,6 +113,30 @@ def test_nonlinear_saturating_map_recovers_known_unique_minimum_with_signed_adju
     assert np.all(np.diff(result.objective_history) < 0)
 
 
+def test_stable_observation_increment_resolves_armijo_below_objective_ulp():
+    # A=x/(1+x), r=7/8, d=1 gives Phi'=0 at x=1 and
+    # Phi''=1+3/(1+x)^4>0 on x>=0: this is the unique minimum.
+    mapping = _scalar(lambda x: x / (1 + x), lambda x: 1 / (1 + x) ** 2)
+    result = constraints.analyze_nonnegative_map(
+        [7 / 8],
+        mapping,
+        [1.0],
+        [1.0],
+        [1.0],
+        x0=[0.3],
+        kkt_tolerance=1e-12,
+        maxiter=100,
+        linear_options={"kkt_tolerance": 1e-14},
+        observation_increment=lambda point, delta: delta / ((1 + point) * (1 + point + delta)),
+    )
+    assert result.success
+    np.testing.assert_allclose(result.x, [1.0], rtol=0, atol=1e-12)
+    assert result.diagnostics["projected_gradient_inf"] <= 1e-12
+    assert result.diagnostics["objective_comparison"] == "stable_increment"
+    assert np.all(result.objective_changes < 0)
+    assert np.min(np.abs(result.objective_changes)) < np.spacing(result.fun)
+
+
 def test_armijo_rejects_an_increasing_full_gn_step_on_the_original_objective():
     result = constraints.analyze_nonnegative_map(
         [0],

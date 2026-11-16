@@ -149,6 +149,25 @@ def _decay_curvature_product(u, ratio, beta, step, tangent, cotangent, *, xp=np)
     return xp.where(zero, 0.0, xp.where(normal, direct, fallback))
 
 
+def _decay_increment(u, shifted, increment, beta, step, *, xp=np):
+    if beta == 0.0 or step == 0.0:
+        return increment.copy()
+    k = beta * step
+    denominator = 1.0 + k * u
+    shifted_denominator = 1.0 + k * shifted
+    direct = (increment / denominator) / shifted_denominator
+    valid = xp.isfinite(denominator) & xp.isfinite(shifted_denominator)
+    if k == 0.0:
+        valid = xp.zeros(u.shape, dtype=bool)
+    log_k = np.log(beta) + np.log(step)
+    log_denominator = xp.logaddexp(0.0, log_k + xp.log(u))
+    log_shifted_denominator = xp.logaddexp(0.0, log_k + xp.log(shifted))
+    fallback = xp.sign(increment) * xp.exp(
+        xp.log(xp.abs(increment)) - log_denominator - log_shifted_denominator
+    )
+    return xp.where(increment == 0.0, 0.0, xp.where(valid, direct, fallback))
+
+
 def _decay_partials(u, value, step, *, xp=np):
     if xp is not np:
         derivative = _decay_ratio(u, value, xp=xp) ** 2
@@ -995,6 +1014,88 @@ class StrangTrajectory:
             "alpha": alpha_bar,
             "beta": beta_bar,
         }
+
+    def initial_increment(self, direction):
+        r"""Propagate a finite initial-state increment without subtracting trajectories.
+
+        Parameters
+        ----------
+        direction : array_like, shape (N,)
+            Finite signed initial increment. The shifted initial state must
+            remain finite and nonnegative. It is checked without clipping.
+
+        Returns
+        -------
+        increments : numpy.ndarray or cupy.ndarray, shape (nt+1, N)
+            Independently owned increments on the trajectory's backend,
+            including the supplied increment at layer zero.
+
+        Notes
+        -----
+        Forcing, load, Q, alpha, beta and the complete polynomial plan remain
+        fixed. At a reaction half-step the algebraic identity
+        ``R(u+d)-R(u)=d/((1+k*u)*(1+k*(u+d)))`` is evaluated directly.
+        The affine increment uses the existing linear state action; forcing
+        cancels. Increments are never obtained by subtracting two states.
+
+        One shifted positive state is advanced as a denominator anchor, with
+        one additional affine forward action per time step. It avoids a
+        possibly negative rounded reconstruction of u+d near d=-u and does
+        not replace the separately propagated increment. The second full
+        trajectory is not stored. This is a floating-point evaluation of an
+        algebraic increment identity, not an interval certificate or the
+        literal difference of two rounded forward solves. In particular a
+        sub-ulp increment can be nonzero when that rounded difference is zero.
+        """
+        affine, half = self.affine, self.affine.step / 2
+        xp = affine.array_module
+        increment = _owned(direction, "direction", shape=(affine.size,), xp=xp)
+        with np.errstate(over="ignore", invalid="ignore"):
+            shifted = _owned(
+                self._states[0] + increment,
+                "shifted initial state",
+                shape=(affine.size,),
+                nonnegative=True,
+                xp=xp,
+            )
+        result = xp.empty_like(self._states)
+        result[0] = increment
+        if not bool(xp.any(increment)):
+            return xp.zeros_like(self._states)
+        zero = xp.zeros((affine.size, 1))
+        operator_directions = xp.empty((0, 1))
+        alpha_direction = xp.zeros(1)
+        valid = xp.asarray(True)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            for n in range(len(self._states) - 1):
+                state = self._states[n]
+                first = _decay(state, self.beta, half, xp=xp)
+                shifted_first = _decay(shifted, self.beta, half, xp=xp)
+                first_increment = _decay_increment(
+                    state, shifted, increment, self.beta, half, xp=xp
+                )
+                frame = self._frame(n)
+                powers = affine._powers(first, frame)
+                middle = affine._value(powers)
+                shifted_middle = affine._value(affine._powers(shifted_first, frame))
+                middle_increment = affine._tangent_many(
+                    powers,
+                    first_increment[:, None],
+                    zero,
+                    (),
+                    operator_directions,
+                    alpha_direction,
+                    plan=(False, slice(0, 0)),
+                )[:, 0]
+                increment = _decay_increment(
+                    middle, shifted_middle, middle_increment, self.beta, half, xp=xp
+                )
+                shifted = _decay(shifted_middle, self.beta, half, xp=xp)
+                result[n + 1] = increment
+                valid &= xp.isfinite(increment).all() & xp.isfinite(shifted).all()
+        if not bool(valid):
+            raise FloatingPointError("The initial-state increment is not representable")
+        return result
 
     def initial_hvp(self, cotangent, direction):
         r"""Differentiate the initial-state pullback in a fixed initial direction.

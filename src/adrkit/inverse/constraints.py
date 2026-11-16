@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from math import fsum
 from types import MappingProxyType
 
 import numpy as np
@@ -554,6 +555,7 @@ def analyze_nonnegative_map(
     backtrack_factor=0.5,
     model_change_rtol=1e-12,
     linear_options=None,
+    observation_increment=None,
 ):
     r"""Analyze a nonnegative vector using a nonlinear observation map.
 
@@ -591,12 +593,21 @@ def analyze_nonnegative_map(
         analyze_nonnegative_observations. Its tolerance controls the linear
         subproblem's own KKT residuals in their original units, separately
         from this function's projected-gradient tolerance.
+    observation_increment : callable or None, optional
+        Optional stable evaluation (x,delta) -> A(x+delta)-A(x), in the
+        declared observation space. It must use the same fixed observation
+        map and the actual feasible displacement. The callback permits
+        Armijo to compare objective changes below the resolution of two
+        separately rounded objective values. Its accuracy is the caller's
+        responsibility; no numerical differentiation or fallback is used.
 
     Returns
     -------
     result : scipy.optimize.OptimizeResult
         x, original objective fun and gradient jac, observation_multipliers,
-        projected-gradient diagnostics, counts and objective_history. A true
+        projected-gradient diagnostics, counts, objective_history and accepted
+        objective_changes. With a stable increment, rounded objective_history
+        entries can coincide despite negative accepted objective_changes. A true
         success means that the original projected-gradient test passed;
         it does not establish a global minimum or physical reconstruction.
         status is 0 for stationarity, 1 for the outer limit, 2 for an inner
@@ -620,7 +631,12 @@ def analyze_nonnegative_map(
 
     Trials are convex combinations of two feasible vectors, rather than
     clipping an unconstrained solution. Armijo and strict decrease are tested
-    on Phi. Only the forward map is used during backtracking. Continuous
+    on Phi. If observation_increment is given, the same change is evaluated as
+    ``(m*(x-r))@delta + 0.5*(m*delta)@delta + white_e@white_delta_A
+    + 0.5*white_delta_A@white_delta_A``. The Armijo slope uses the actual
+    floating-point displacement. No positive comparison allowance is added.
+    Otherwise the separately evaluated objective values are compared as before.
+    Only predictions and optional stable increments are used in backtracking. Continuous
     differentiability and accurate declared derivatives are assumptions of
     the method, not facts established by optimizer termination.
     """
@@ -653,6 +669,8 @@ def analyze_nonnegative_map(
             raise ValueError(f"{name} must be a positive integer")
     if linear_options is not None and not isinstance(linear_options, dict):
         raise ValueError("linear_options must be a dictionary or None")
+    if observation_increment is not None and not callable(observation_increment):
+        raise ValueError("observation_increment must be callable or None")
     linear = {} if linear_options is None else dict(linear_options)
     if set(linear) - {"kkt_tolerance", "maxiter", "max_backtracks"}:
         raise ValueError("linear_options supports only native linear analysis options")
@@ -669,6 +687,8 @@ def analyze_nonnegative_map(
     nfev = njev = nvjp = linear_nit = 0
     last_model_change = last_model_allowance = last_directional = None
     last_step = 0.0
+    last_objective_change = None
+    accepted_changes = []
 
     def whiten(vector):
         if factor.ndim == 1:
@@ -735,6 +755,7 @@ def analyze_nonnegative_map(
             status=status,
             message=message,
             objective_history=np.asarray(history),
+            objective_changes=np.asarray(accepted_changes),
             diagnostics={
                 "projected_gradient_inf": optimality,
                 "kkt_residual_inf": optimality,
@@ -743,6 +764,10 @@ def analyze_nonnegative_map(
                 "last_model_allowance": last_model_allowance,
                 "last_directional_derivative": last_directional,
                 "last_step_size": last_step,
+                "last_objective_change": last_objective_change,
+                "objective_comparison": (
+                    "stable_increment" if observation_increment is not None else "direct_values"
+                ),
             },
         )
 
@@ -792,10 +817,40 @@ def analyze_nonnegative_map(
         for _ in range(max_backtracks):
             trial = (1.0 - step) * x + step * endpoint
             trial_prediction, trial_white, trial_fun = evaluate(trial)
-            if trial_fun < fun and trial_fun <= fun + decrease * step * last_directional:
+            if observation_increment is None:
+                last_objective_change = trial_fun - fun
+                accepted = (
+                    trial_fun < fun and trial_fun <= fun + decrease * step * last_directional
+                )
+            else:
+                delta = trial - x
+                increment = codomain.array(
+                    observation_increment(x.copy(), delta.copy()),
+                    name="observation increment",
+                    copy=True,
+                )
+                with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                    white_increment = whiten(increment)
+                    terms = (
+                        float(np.dot(m * (x - r), delta)),
+                        0.5 * float(np.dot(m * delta, delta)),
+                        float(np.dot(whitened_residual, white_increment)),
+                        0.5 * float(np.dot(white_increment, white_increment)),
+                    )
+                    slope = float(gradient @ delta)
+                if not np.isfinite([*terms, slope]).all():
+                    raise RuntimeError("Nonlinear analysis has a nonfinite objective increment")
+                last_objective_change = fsum(terms)
+                accepted = (
+                    slope < 0
+                    and last_objective_change < 0
+                    and last_objective_change <= decrease * slope
+                )
+            if accepted:
                 x, prediction = trial, trial_prediction
                 whitened_residual, fun = trial_white, trial_fun
                 history.append(fun)
+                accepted_changes.append(last_objective_change)
                 last_step = step
                 break
             step *= contraction
