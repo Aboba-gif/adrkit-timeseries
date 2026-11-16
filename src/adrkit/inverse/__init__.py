@@ -16,7 +16,10 @@ from .regularization import (
 from .optimizers import solve_lbfgsb
 from .problem import InverseProblem
 from .constraints import (
+    NonnegativeAnalysisLinearization,
+    analyze_nonnegative_map,
     analyze_nonnegative_observations,
+    nonnegative_analysis_linear_operator,
     project_nonnegative_equalities,
 )
 from .design import (
@@ -50,6 +53,9 @@ __all__ = [
     "InverseProblem",
     "project_nonnegative_equalities",
     "analyze_nonnegative_observations",
+    "analyze_nonnegative_map",
+    "NonnegativeAnalysisLinearization",
+    "nonnegative_analysis_linear_operator",
     "CovarianceFactor",
     "DesignCandidate",
     "affine_goal_risk",

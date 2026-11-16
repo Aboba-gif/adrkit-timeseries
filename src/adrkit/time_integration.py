@@ -114,13 +114,46 @@ def _decay(u, beta, step, *, xp=np):
     return value
 
 
+def _decay_ratio(u, value, *, xp=np):
+    if xp is not np:
+        return xp.where(u > 0.0, value / u, 1.0)
+    ratio = np.ones_like(u)
+    positive = u > 0.0
+    ratio[positive] = value[positive] / u[positive]
+    return ratio
+
+
+def _decay_curvature_product(u, ratio, beta, step, tangent, cotangent, *, xp=np):
+    if beta == 0.0 or step == 0.0:
+        return xp.zeros_like(u)
+    # R'' can overflow by itself while the weighted action is zero or finite.
+    first = (beta * step) * ratio
+    second = ratio * tangent
+    third = (2.0 * ratio) * cotangent
+    partial = first * second
+    direct = -partial * third
+    normal = xp.ones(u.shape, dtype=bool)
+    for value in (first, second, third, partial, direct):
+        normal &= xp.isfinite(value) & (xp.abs(value) >= np.finfo(float).tiny)
+    log_k = np.log(beta) + np.log(step)
+    log_denominator = xp.logaddexp(0.0, log_k + xp.log(u))
+    log_magnitude = (
+        np.log(2.0)
+        + log_k
+        + xp.log(xp.abs(tangent))
+        + xp.log(xp.abs(cotangent))
+        - 3.0 * log_denominator
+    )
+    fallback = -xp.sign(tangent) * xp.sign(cotangent) * xp.exp(log_magnitude)
+    zero = (tangent == 0.0) | (cotangent == 0.0)
+    return xp.where(zero, 0.0, xp.where(normal, direct, fallback))
+
+
 def _decay_partials(u, value, step, *, xp=np):
     if xp is not np:
-        derivative = xp.where(u > 0.0, (value / u) ** 2, 1.0)
+        derivative = _decay_ratio(u, value, xp=xp) ** 2
         return derivative, -(step * value) * value
-    derivative = np.ones_like(u)
-    positive = u > 0.0
-    derivative[positive] = (value[positive] / u[positive]) ** 2
+    derivative = _decay_ratio(u, value) ** 2
     with np.errstate(over="ignore", invalid="ignore"):
         beta_derivative = np.asarray(-(step * value) * value)
     if not np.isfinite(beta_derivative).all():
@@ -962,6 +995,101 @@ class StrangTrajectory:
             "alpha": alpha_bar,
             "beta": beta_bar,
         }
+
+    def initial_hvp(self, cotangent, direction):
+        r"""Differentiate the initial-state pullback in a fixed initial direction.
+
+        Parameters
+        ----------
+        cotangent : array_like, shape (nt+1, N)
+            Fixed coordinate covector of all stored states, including layer 0.
+            Either sign is permitted.
+        direction : array_like, shape (N,)
+            Initial-state direction. Either sign is permitted, including at
+            zero components of the nonnegative base state.
+
+        Returns
+        -------
+        product : numpy.ndarray or cupy.ndarray, shape (N,)
+            The directional derivative of ``vjp(cotangent)['initial']``.
+            The backend and coordinate pairing are those of this trajectory.
+            No dense state Hessian is formed.
+
+        Notes
+        -----
+        The scalar objective is the fixed linear pairing of cotangent with
+        all trajectory states. Forcing, load, Q, alpha, beta, rate, degree and
+        polynomial weights stay fixed. This differentiates the implemented
+        discrete Strang composition, not the continuous PDE solution.
+
+        For each reaction half-step, ``R(u)=u/(1+k*u)``,
+        ``R'(u)=(1+k*u)^(-2)`` and ``R''(u)=-2*k*(1+k*u)^(-3)``.
+        Tangent-over-reverse adds ``R''(u)*du*state_bar`` to the tangent
+        pullback. The affine state substep has zero second derivative.
+        The initial cotangent contributes a linear term only. When beta=0
+        the initial-state Hessian is exactly zero.
+        Reaction curvature is evaluated as a weighted product, with a
+        logarithmic expression when direct intermediate products are outside
+        the normal floating-point range. No beta bound or curvature clipping
+        is introduced; zero direction or a purely initial pairing returns
+        exact zero before propagating derivatives.
+        """
+        affine, half = self.affine, self.affine.step / 2
+        xp = affine.array_module
+        cotangent = _owned(cotangent, "cotangent", shape=self._states.shape, xp=xp)
+        direction = _owned(direction, "direction", shape=(affine.size,), xp=xp)
+        if self.beta == 0.0 or not bool(xp.any(direction)) or not bool(xp.any(cotangent[1:])):
+            return xp.zeros(affine.size)
+        tangents = self.jvp(d_initial=direction)
+        state_bar = cotangent[-1].copy()
+        tangent_bar = xp.zeros(affine.size)
+        zero = xp.zeros(affine.size)
+        operator_directions = xp.empty((0, 1))
+        alpha_direction = xp.zeros(1)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            for n in range(len(self._states) - 2, -1, -1):
+                state = self._states[n]
+                first = _decay(state, self.beta, half, xp=xp)
+                first_ratio = _decay_ratio(state, first, xp=xp)
+                first_slope = first_ratio**2
+                powers = affine._powers(first, self._frame(n))
+                middle = affine._value(powers)
+                middle_ratio = _decay_ratio(middle, self._states[n + 1], xp=xp)
+                middle_slope = middle_ratio**2
+                middle_direction = affine._tangent_many(
+                    powers,
+                    (first_slope * tangents[n])[:, None],
+                    zero[:, None],
+                    (),
+                    operator_directions,
+                    alpha_direction,
+                    plan=(False, slice(0, 0)),
+                )[:, 0]
+                middle_bar = middle_slope * state_bar
+                middle_tangent_bar = middle_slope * tangent_bar + _decay_curvature_product(
+                    middle,
+                    middle_ratio,
+                    self.beta,
+                    half,
+                    middle_direction,
+                    state_bar,
+                    xp=xp,
+                )
+                first_bar = affine._pullback(powers, middle_bar, {})["u"]
+                first_tangent_bar = affine._pullback(powers, middle_tangent_bar, {})["u"]
+                tangent_bar = first_slope * first_tangent_bar + _decay_curvature_product(
+                    state,
+                    first_ratio,
+                    self.beta,
+                    half,
+                    tangents[n],
+                    first_bar,
+                    xp=xp,
+                )
+                state_bar = cotangent[n] + first_slope * first_bar
+        if not xp.isfinite(xp.concatenate((tangent_bar, state_bar))).all():
+            raise FloatingPointError("The initial-state Hessian action is not representable")
+        return tangent_bar
 
 
 def solve_strang(affine, initial, forcing, *, beta=0.0, load=None):

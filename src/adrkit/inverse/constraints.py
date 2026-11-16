@@ -1,11 +1,36 @@
 """Покомпонентные границы, проекция и анализ линейных наблюдений."""
 
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+
 import numpy as np
-from scipy.linalg import solve_triangular
+from scipy.linalg import norm, solve_triangular
 from scipy.optimize import OptimizeResult, linprog
+from scipy.sparse.linalg import LinearOperator, minres
+
+from adrkit.contracts import require_capability, validate_map_capabilities
 
 from ._numeric import real_array, real_scalar
 from .linalg import _spd_factor
+
+
+@dataclass(frozen=True)
+class NonnegativeAnalysisLinearization:
+    """Действие производной выбранной стационарной ветви анализа.
+
+    Parameters
+    ----------
+    operator : scipy.sparse.linalg.LinearOperator
+        Карта (delta_reference, delta_target) в delta_point и её транспонированное
+        действие. Свободные линейные системы решаются с численным допуском.
+    metadata : Mapping
+        Неизменяемые настройки и численные остатки исходной стационарности.
+        Они не удостоверяют гладкость ветви, невырожденность или минимум.
+    """
+
+    operator: LinearOperator
+    metadata: Mapping
 
 
 def gradient_mapping(theta, gradient):
@@ -512,3 +537,500 @@ def analyze_nonnegative_observations(
         f"Nonnegative observation analysis is uncertified after {iteration} steps; "
         f"KKT residual exceeds {tolerance:.6g}"
     )
+
+
+def analyze_nonnegative_map(
+    reference,
+    observation,
+    target,
+    mass,
+    covariance,
+    *,
+    x0=None,
+    kkt_tolerance=1e-8,
+    maxiter=50,
+    max_backtracks=30,
+    armijo=1e-4,
+    backtrack_factor=0.5,
+    model_change_rtol=1e-12,
+    linear_options=None,
+):
+    r"""Analyze a nonnegative vector using a nonlinear observation map.
+
+    Parameters
+    ----------
+    reference : array_like, shape (N,)
+        Finite prior centre r; negative entries are permitted.
+    observation : MapCapabilities
+        A map A with vector domain (N,) and codomain (M,). Prediction and
+        explicitly declared VJP are required. JVP and Jacobian are unused.
+    target : array_like, shape (M,)
+        Finite observations d. Signed values are permitted.
+    mass : array_like, shape (N,)
+        Strictly positive diagonal prior precision m, not necessarily cell areas.
+    covariance : array_like, shape (M,) or (M, M)
+        Positive observation variance vector or symmetric positive definite R.
+    x0 : array_like, shape (N,), optional
+        Nonnegative initial iterate. The default is the positive part of r,
+        the exact nonnegative minimizer of the prior term alone.
+    kkt_tolerance : float, optional
+        Positive absolute tolerance for the infinity norm of the original
+        coordinate projected gradient x-P_+(x-grad Phi). This is not a
+        tolerance for residuals, coefficient errors or objective optimality.
+    maxiter, max_backtracks : int, optional
+        Positive limits on accepted outer steps and trial step evaluations.
+    armijo, backtrack_factor : float, optional
+        Numbers strictly between zero and one. Line search tests the original
+        nonlinear objective, with an initial step of one.
+    model_change_rtol : float, optional
+        Finite comparison allowance in [0,1) for the quadratic model change.
+        Its absolute allowance is zero. This is a floating-point comparison
+        rule, not an interval-arithmetic certificate.
+    linear_options : dict or None, optional
+        Only kkt_tolerance, maxiter and max_backtracks are forwarded to
+        analyze_nonnegative_observations. Its tolerance controls the linear
+        subproblem's own KKT residuals in their original units, separately
+        from this function's projected-gradient tolerance.
+
+    Returns
+    -------
+    result : scipy.optimize.OptimizeResult
+        x, original objective fun and gradient jac, observation_multipliers,
+        projected-gradient diagnostics, counts and objective_history. A true
+        success means that the original projected-gradient test passed;
+        it does not establish a global minimum or physical reconstruction.
+        status is 0 for stationarity, 1 for the outer limit, 2 for an inner
+        analysis failure, 3 for a rejected model/direction, 4 for line-search
+        failure. Invalid inputs and invalid map outputs raise exceptions.
+
+    Notes
+    -----
+    The objective is
+    ``Phi(x)=0.5*sum(m*(x-r)**2)+0.5*(A(x)-d).T@inv(R)@(A(x)-d)``, x>=0.
+    Each row of J=A'(x) is obtained by a VJP of a coordinate covector.
+    The step endpoint v solves the native strictly convex linear analysis
+    with arguments (r,J,d-A(x)+J@x,m,R). No dense N-by-N prior is formed.
+
+    For p=v-x the explicit model change is
+    ``g@p + 0.5*(sum(m*p*p) + ||R^(-1/2) Jp||**2)``. It must be at most
+    ``model_change_rtol * (abs(g)@abs(p) + 0.5*curvature)``; additionally
+    g@p must be strictly negative. There is no alternative search direction.
+    An exact subproblem satisfies this descent property; a finite inner
+    tolerance does not guarantee it, hence the independent checks.
+
+    Trials are convex combinations of two feasible vectors, rather than
+    clipping an unconstrained solution. Armijo and strict decrease are tested
+    on Phi. Only the forward map is used during backtracking. Continuous
+    differentiability and accurate declared derivatives are assumptions of
+    the method, not facts established by optimizer termination.
+    """
+    validate_map_capabilities(observation, name="observation")
+    domain, codomain = observation.domain, observation.codomain
+    if len(domain.shape) != 1 or len(codomain.shape) != 1:
+        raise ValueError("Nonlinear analysis requires vector domain and codomain spaces")
+    derivative = require_capability(
+        observation.vjp, operation="VJP", consumer="nonlinear observation analysis"
+    )
+    r = real_array(reference, name="reference", copy=True)
+    d = real_array(target, name="target", copy=True)
+    m = real_array(mass, name="mass", copy=True)
+    cov = real_array(covariance, name="covariance", copy=True)
+    if r.shape != domain.shape or d.shape != codomain.shape or m.shape != r.shape:
+        raise ValueError("Analysis vectors must agree with the declared map spaces")
+    if np.any(m <= 0):
+        raise ValueError("Analysis mass must be strictly positive")
+    factor = _spd_factor(cov, codomain.size, "covariance")
+    tolerance = real_scalar(kkt_tolerance, name="kkt_tolerance")
+    decrease = real_scalar(armijo, name="armijo")
+    contraction = real_scalar(backtrack_factor, name="backtrack_factor")
+    model_rtol = real_scalar(model_change_rtol, name="model_change_rtol")
+    if tolerance <= 0 or not 0 < decrease < 1 or not 0 < contraction < 1:
+        raise ValueError("Require positive kkt_tolerance and line-search parameters in (0,1)")
+    if not 0 <= model_rtol < 1:
+        raise ValueError("model_change_rtol must lie in [0,1)")
+    for name, value in (("maxiter", maxiter), ("max_backtracks", max_backtracks)):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if linear_options is not None and not isinstance(linear_options, dict):
+        raise ValueError("linear_options must be a dictionary or None")
+    linear = {} if linear_options is None else dict(linear_options)
+    if set(linear) - {"kkt_tolerance", "maxiter", "max_backtracks"}:
+        raise ValueError("linear_options supports only native linear analysis options")
+    for name, value in linear.items():
+        if name == "kkt_tolerance":
+            if real_scalar(value, name="linear kkt_tolerance") <= 0:
+                raise ValueError("Linear kkt_tolerance must be positive")
+        elif type(value) is not int or value < 1:
+            raise ValueError(f"Linear {name} must be a positive integer")
+    x = np.maximum(r, 0.0) if x0 is None else real_array(x0, name="x0", copy=True)
+    if x.shape != r.shape or np.any(x < 0):
+        raise ValueError("x0 must be a nonnegative vector in the declared domain")
+
+    nfev = njev = nvjp = linear_nit = 0
+    last_model_change = last_model_allowance = last_directional = None
+    last_step = 0.0
+
+    def whiten(vector):
+        if factor.ndim == 1:
+            return vector / factor
+        return solve_triangular(factor, vector, lower=True, check_finite=False)
+
+    def whiten_transpose(vector):
+        if factor.ndim == 1:
+            return vector / factor
+        return solve_triangular(factor.T, vector, lower=False, check_finite=False)
+
+    def evaluate(point):
+        nonlocal nfev
+        nfev += 1
+        values = observation.predict.predict(domain.array(point, copy=True))
+        values = np.asarray(codomain.array(values, name="prediction", copy=True), dtype=float)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            residual = values - d
+            white = whiten(residual)
+            difference = point - r
+            value = 0.5 * (np.dot(m * difference, difference) + np.dot(white, white))
+        if not np.isfinite(value) or not np.isfinite(white).all():
+            raise RuntimeError("Nonlinear analysis has a nonfinite original objective")
+        return values, white, float(value)
+
+    def linearize(point, white):
+        nonlocal njev, nvjp
+        njev += 1
+        matrix = np.empty((codomain.size, domain.size))
+        unit = np.zeros(codomain.size)
+        for row in range(codomain.size):
+            unit[row] = 1.0
+            values = derivative.vjp(
+                domain.array(point, copy=True), codomain.array(unit, copy=True)
+            )
+            matrix[row] = domain.array(values, name="observation VJP", copy=True)
+            unit[row] = 0.0
+            nvjp += 1
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            multiplier = whiten_transpose(white)
+            gradient = m * (point - r) + matrix.T @ multiplier
+        if not np.isfinite(gradient).all() or not np.isfinite(multiplier).all():
+            raise RuntimeError("Nonlinear analysis has a nonfinite original gradient")
+        return matrix, multiplier, gradient
+
+    prediction, whitened_residual, fun = evaluate(x)
+    history = [fun]
+    iteration = 0
+    gradient = multipliers = matrix = None
+    optimality = float("inf")
+
+    def result(status, message):
+        return OptimizeResult(
+            x=x.copy(),
+            fun=fun,
+            jac=gradient.copy(),
+            observation_multipliers=multipliers.copy(),
+            nit=iteration,
+            nfev=nfev,
+            njev=njev,
+            nvjp=nvjp,
+            linear_nit=linear_nit,
+            success=status == 0,
+            status=status,
+            message=message,
+            objective_history=np.asarray(history),
+            diagnostics={
+                "projected_gradient_inf": optimality,
+                "kkt_residual_inf": optimality,
+                "minimum_state": float(np.min(x)),
+                "last_model_change": last_model_change,
+                "last_model_allowance": last_model_allowance,
+                "last_directional_derivative": last_directional,
+                "last_step_size": last_step,
+            },
+        )
+
+    for iteration in range(maxiter + 1):
+        matrix, multipliers, gradient = linearize(x, whitened_residual)
+        # For x>=0, min(x,g) equals x-P_+(x-g) without subtractive cancellation.
+        optimality = float(np.max(np.abs(np.minimum(x, gradient))))
+        if optimality <= tolerance:
+            return result(
+                0,
+                "Original projected-gradient tolerance satisfied; stationarity is not "
+                "a global minimum certificate.",
+            )
+        if iteration == maxiter:
+            return result(1, "Maximum outer iterations reached before original stationarity")
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            adjusted_target = d - prediction + matrix @ x
+        if not np.isfinite(adjusted_target).all():
+            return result(2, "Linearized target is nonfinite")
+        try:
+            inner = analyze_nonnegative_observations(r, matrix, adjusted_target, m, cov, **linear)
+        except (RuntimeError, ValueError) as error:
+            return result(2, "Linearized nonnegative analysis failed: " + str(error))
+        endpoint = real_array(inner.x, name="linearized state", copy=True)
+        if not inner.success or endpoint.shape != x.shape or np.any(endpoint < 0):
+            return result(2, "Linearized analysis did not return a verified feasible endpoint")
+        linear_nit += int(inner.nit)
+        direction = endpoint - x
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            last_directional = float(gradient @ direction)
+            white_tangent = whiten(matrix @ direction)
+            curvature = float(
+                np.dot(m * direction, direction) + np.dot(white_tangent, white_tangent)
+            )
+            last_model_change = last_directional + 0.5 * curvature
+            scale = float(np.abs(gradient) @ np.abs(direction)) + 0.5 * curvature
+            last_model_allowance = model_rtol * scale
+        if (
+            not np.isfinite([last_directional, curvature, last_model_change, scale]).all()
+            or last_directional >= 0
+            or last_model_change > last_model_allowance
+        ):
+            return result(3, "Linearized endpoint failed original descent or model-change test")
+        step = 1.0
+        last_step = 0.0
+        for _ in range(max_backtracks):
+            trial = (1.0 - step) * x + step * endpoint
+            trial_prediction, trial_white, trial_fun = evaluate(trial)
+            if trial_fun < fun and trial_fun <= fun + decrease * step * last_directional:
+                x, prediction = trial, trial_prediction
+                whitened_residual, fun = trial_white, trial_fun
+                history.append(fun)
+                last_step = step
+                break
+            step *= contraction
+        else:
+            return result(4, "Armijo search did not decrease the original nonlinear objective")
+    raise RuntimeError("Unreachable nonlinear analysis state")
+
+
+def nonnegative_analysis_linear_operator(
+    reference,
+    observation,
+    target,
+    mass,
+    covariance,
+    point,
+    *,
+    observation_hvp=None,
+    curvature="exact",
+    kkt_tolerance,
+    active_margin,
+    solve_rtol,
+    maxiter,
+):
+    r"""Линеаризовать выбранную стационарную ветвь неотрицательного анализа.
+
+    Parameters
+    ----------
+    reference, point : array_like, shape (N,)
+        Фоновый центр r и выбранная неотрицательная точка x.
+    observation : MapCapabilities
+        Карта A из (N,) в (M,) с прогнозом и VJP. Якобиан J собирается M
+        сопряжёнными действиями; JVP и явная матрица карты не требуются.
+    target : array_like, shape (M,)
+        Наблюдения d. Центр, наблюдения и масштабы копируются.
+    mass : array_like, shape (N,)
+        Положительная диагональ фоновой точности M.
+    covariance : array_like, shape (M,) or (M, M)
+        Положительные дисперсии либо симметричная положительно определённая R.
+    observation_hvp : callable or None, optional
+        Для curvature='exact' обязательное действие (zeta,v) ->
+        D²<zeta,A(x)>v формы (N,). Callback должен быть привязан к собственной
+        неизменяемой линеаризации именно в point. Библиотека не может заморозить
+        произвольные внешние переменные его closure. zeta передаётся фиксированным;
+        производная R^{-1}(A-d) уже учтена членом J.T@inv(R)@J.
+        В режиме 'gauss-newton' callback не вызывается.
+    curvature : {'exact', 'gauss-newton'}, optional
+        Точный гессиан исходного функционала либо явно объявленное приближение
+        без остаточной кривизны. Скрытой замены между ними нет.
+    kkt_tolerance : float
+        Положительный допуск исходного проекционного градиента и отдельно
+        свободного градиента. Свободны ровно координаты point>0.
+    active_margin : float
+        Неотрицательная граница: на point==0 требуется gradient>active_margin.
+        Это численная проверка запаса, а не доказательство строгой дополнительности.
+    solve_rtol : float
+        Относительный допуск в (0,1) фактического евклидова остатка свободной
+        линейной системы. MINRES использует более строгий внутренний rtol.
+    maxiter : int
+        Положительный предел итераций каждой свободной системы.
+
+    Returns
+    -------
+    linearization : NonnegativeAnalysisLinearization
+        operator формы (N,N+M): [dr,dd] -> K(M@dr+J.T@inv(R)@dd), где
+        K=Z@inv(Z.T@H@Z)@Z.T. Транспонированное действие возвращает
+        [M@K@bar_x, inv(R)@J@K@bar_x]. metadata хранит исходные остатки и запасы.
+
+    Notes
+    -----
+    Для exact используется H=M+J.T@inv(R)@J+sum(zeta_i*D²A_i),
+    zeta=inv(R)@(A(point)-d). Плотная матрица (N,N) не создаётся.
+    При пустом свободном множестве действие нулевое, гессиан не вычисляется.
+    Предполагаются гладкая устойчивая активная ветвь, стационарность и
+    невырожденность приведённого гессиана. Выполнение численных допусков
+    этих предпосылок не доказывает. Это не производная фактически остановленного
+    алгоритма и не производная выбора весов, центра, масок или гиперпараметров.
+
+    MINRES допускает симметричный неопределённый гессиан. Успешное решение
+    не удостоверяет положительную определённость, невырожденность или минимум.
+    При неуспешной проверке остатка возникает ошибка; сдвига, дополнительного
+    демпфирования, псевдообратной или запасного решателя нет. Конечные допуски
+    дают приближённые действия и не обеспечивают точное сопряжённое тождество.
+    """
+    validate_map_capabilities(observation, name="observation")
+    domain, codomain = observation.domain, observation.codomain
+    if len(domain.shape) != 1 or len(codomain.shape) != 1:
+        raise ValueError("Analysis linearization requires vector domain and codomain")
+    pullback = require_capability(
+        observation.vjp, operation="VJP", consumer="analysis linearization"
+    )
+    if curvature not in ("exact", "gauss-newton"):
+        raise ValueError("curvature must be exact or gauss-newton")
+    if curvature == "exact" and not callable(observation_hvp):
+        raise ValueError("Exact analysis curvature requires an observation_hvp callback")
+    r = real_array(reference, name="reference", copy=True)
+    x = real_array(point, name="point", copy=True)
+    d = real_array(target, name="target", copy=True)
+    m = real_array(mass, name="mass", copy=True)
+    cov = real_array(covariance, name="covariance", copy=True)
+    if (
+        r.shape != domain.shape
+        or x.shape != domain.shape
+        or d.shape != codomain.shape
+        or m.shape != domain.shape
+        or np.any(m <= 0)
+        or np.any(x < 0)
+    ):
+        raise ValueError("Require r(N), x(N)>=0, d(M) and positive diagonal mass(N)")
+    tolerance = real_scalar(kkt_tolerance, name="kkt_tolerance")
+    margin = real_scalar(active_margin, name="active_margin")
+    relative = real_scalar(solve_rtol, name="solve_rtol")
+    if tolerance <= 0 or margin < 0 or not 0 < relative < 1:
+        raise ValueError("Require kkt_tolerance>0, active_margin>=0 and 0<solve_rtol<1")
+    if type(maxiter) is not int or maxiter < 1:
+        raise ValueError("maxiter must be a positive integer")
+    factor = _spd_factor(cov, codomain.size, "covariance")
+
+    def inverse_covariance(values):
+        if factor.ndim == 1:
+            return (values / factor) / factor
+        return solve_triangular(
+            factor.T,
+            solve_triangular(factor, values, lower=True, check_finite=False),
+            lower=False,
+            check_finite=False,
+        )
+
+    prediction = codomain.array(
+        observation.predict.predict(x.copy()), name="prediction", copy=True
+    )
+    matrix = np.empty((codomain.size, domain.size))
+    unit = np.zeros(codomain.size)
+    for row in range(codomain.size):
+        unit[row] = 1.0
+        matrix[row] = domain.array(pullback.vjp(x.copy(), unit.copy()), name="observation VJP")
+        unit[row] = 0.0
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        zeta = inverse_covariance(prediction - d)
+        gradient = m * (x - r) + matrix.T @ zeta
+    zeta = real_array(zeta, name="observation multipliers", copy=True)
+    gradient = real_array(gradient, name="analysis gradient", copy=True)
+    free, active = np.flatnonzero(x > 0), np.flatnonzero(x == 0)
+    projected_residual = float(np.max(np.abs(np.minimum(x, gradient))))
+    root_residual = float(np.max(np.abs(gradient[free]))) if free.size else 0.0
+    if projected_residual > tolerance or root_residual > tolerance:
+        raise ValueError("Analysis point fails original projected or free stationarity tolerance")
+    active_minimum = float(np.min(gradient[active])) if active.size else None
+    if active_minimum is not None and active_minimum <= margin:
+        raise ValueError("Analysis point has a weak or insufficiently separated active face")
+    for values in (r, x, d, m, factor, matrix, zeta):
+        values.flags.writeable = False
+
+    def hessian(direction):
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            value = m * direction + matrix.T @ inverse_covariance(matrix @ direction)
+        if curvature == "exact":
+            extra = real_array(
+                observation_hvp(zeta.copy(), direction.copy()),
+                name="observation Hessian product",
+            )
+            if extra.shape != domain.shape:
+                raise ValueError("Observation Hessian product must have shape (N,)")
+            value = value + extra
+        return real_array(value, name="analysis Hessian product")
+
+    def reduced_hessian(direction):
+        full = np.zeros(domain.size)
+        full[free] = direction
+        return hessian(full)[free]
+
+    reduced = (
+        LinearOperator(
+            (free.size, free.size), matvec=reduced_hessian, rmatvec=reduced_hessian, dtype=float
+        )
+        if free.size
+        else None
+    )
+
+    def solve_free(right):
+        result = np.zeros(domain.size)
+        if not free.size:
+            return result
+        selected = real_array(right[free], name="free linear right-hand side")
+        if not np.any(selected):
+            return result
+        inner_rtol = relative / np.sqrt(free.size)
+        if inner_rtol == 0:
+            raise ValueError("The requested internal MINRES tolerance is not representable")
+        solution, info = minres(reduced, selected, rtol=inner_rtol, maxiter=maxiter, check=True)
+        solution = real_array(solution, name="free linear solution")
+        residual = real_array(reduced @ solution - selected, name="free linear residual")
+        if info != 0 or norm(residual) > relative * norm(selected):
+            raise RuntimeError("MINRES failed the requested true relative linear residual")
+        result[free] = solution
+        return result
+
+    def matvec(direction):
+        direction = real_array(direction, name="analysis input direction").reshape(-1)
+        if direction.size != domain.size + codomain.size:
+            raise ValueError("Analysis input direction must have length N+M")
+        if not free.size:
+            return np.zeros(domain.size)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            right = m * direction[: domain.size] + matrix.T @ inverse_covariance(
+                direction[domain.size :]
+            )
+        return solve_free(real_array(right, name="analysis derivative right-hand side"))
+
+    def rmatvec(cotangent):
+        cotangent = real_array(cotangent, name="analysis output cotangent").reshape(-1)
+        if cotangent.size != domain.size:
+            raise ValueError("Analysis output cotangent must have length N")
+        if not free.size:
+            return np.zeros(domain.size + codomain.size)
+        pulled = solve_free(cotangent)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            result = np.r_[m * pulled, inverse_covariance(matrix @ pulled)]
+        return real_array(result, name="analysis transposed derivative")
+
+    metadata = MappingProxyType(
+        {
+            "curvature": curvature,
+            "projected_gradient_inf": projected_residual,
+            "free_root_residual_inf": root_residual,
+            "free_min": float(np.min(x[free])) if free.size else None,
+            "active_gradient_min": active_minimum,
+            "free_indices": tuple(int(index) for index in free),
+            "active_indices": tuple(int(index) for index in active),
+            "point": tuple(float(value) for value in x),
+            "kkt_tolerance": tolerance,
+            "active_margin": margin,
+            "solve_rtol": relative,
+        }
+    )
+    operator = LinearOperator(
+        (domain.size, domain.size + codomain.size), matvec=matvec, rmatvec=rmatvec, dtype=float
+    )
+    return NonnegativeAnalysisLinearization(operator, metadata)
