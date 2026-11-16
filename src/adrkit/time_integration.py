@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from operator import index
+from importlib import import_module
 
 import numpy as np
 from scipy import sparse
@@ -20,60 +21,88 @@ def _scalar(value, name, *, nonnegative=False, positive=False):
     return value
 
 
-def _owned(value, name, *, shape=None, nonnegative=False):
-    raw = np.asarray(value)
-    if raw.dtype.kind not in "iuf" or not np.isfinite(raw).all():
+def _array_module(backend):
+    if backend == "numpy":
+        return np
+    if backend != "cupy":
+        raise ValueError("backend must be 'numpy' or 'cupy'")
+    try:
+        return import_module("cupy")
+    except ImportError as error:
+        raise ImportError("The 'cupy' backend requires a compatible CuPy installation") from error
+
+
+def _readonly(value, xp):
+    if xp is np:
+        value.flags.writeable = False
+    return value
+
+
+def _owned(value, name, *, shape=None, nonnegative=False, xp=np):
+    raw = xp.asarray(value)
+    if raw.dtype.kind not in "iuf" or not xp.isfinite(raw).all():
         raise ValueError(f"{name} must contain finite real values")
     with np.errstate(over="ignore", invalid="ignore"):
-        values = np.array(raw, dtype=float, copy=True)
-    if not np.isfinite(values).all():
+        values = xp.array(raw, dtype=float, copy=True)
+    if not xp.isfinite(values).all():
         raise ValueError(f"{name} must remain finite in double precision")
     if shape is not None and values.shape != shape:
         raise ValueError(f"{name} must have shape {shape}")
-    if nonnegative and np.any(values < 0):
+    if nonnegative and xp.any(values < 0):
         raise ValueError(f"{name} must be nonnegative")
-    values.flags.writeable = False
-    return values
+    return _readonly(values, xp)
 
 
-def _matrix(value, name, size=None):
+def _matrix(value, name, size=None, *, xp=np):
+    matrix_module = sparse if xp is np else import_module("cupyx.scipy.sparse")
     if (
-        np.dtype(value.dtype if sparse.issparse(value) else np.asarray(value).dtype).kind
+        np.dtype(
+            value.dtype
+            if sparse.issparse(value) or matrix_module.issparse(value)
+            else xp.asarray(value).dtype
+        ).kind
         not in "iuf"
     ):
         raise ValueError(f"{name} must be real")
-    matrix = sparse.csr_matrix(value, dtype=float, copy=True)
+    matrix = matrix_module.csr_matrix(value, dtype=float, copy=True)
     matrix.sum_duplicates()
     matrix.eliminate_zeros()
     if (
         matrix.shape[0] != matrix.shape[1]
         or not matrix.shape[0]
         or (size is not None and matrix.shape != (size, size))
-        or not np.isfinite(matrix.data).all()
+        or not xp.isfinite(matrix.data).all()
     ):
         raise ValueError(f"{name} must be a finite square matrix of the required size")
     return matrix
 
 
-def _operator_directions(partials, directions, count, size, rate):
+def _operator_directions(partials, directions, count, size, rate, *, xp=np):
     partials = tuple((partials or {}).values())
-    matrices = tuple(_matrix(value, "operator partial", size) / rate for value in partials)
+    matrices = tuple(_matrix(value, "operator partial", size, xp=xp) / rate for value in partials)
     if directions is None:
         if matrices:
             raise ValueError("Operator partials require explicit operator_directions")
-        coefficients = np.zeros((0, count))
+        coefficients = xp.zeros((0, count))
     else:
-        coefficients = _owned(directions, "operator_directions", shape=(len(matrices), count))
-    active = [j for j, matrix in enumerate(matrices) if matrix.nnz and np.any(coefficients[j])]
+        coefficients = _owned(
+            directions, "operator_directions", shape=(len(matrices), count), xp=xp
+        )
+    active = [j for j, matrix in enumerate(matrices) if matrix.nnz and xp.any(coefficients[j])]
     return tuple(matrices[j] for j in active), coefficients[active]
 
 
-def _decay(u, beta, step):
+def _decay(u, beta, step, *, xp=np):
     if beta == 0.0 or step == 0.0:
         return u.copy()
     with np.errstate(over="ignore", invalid="ignore"):
         product = (beta * step) * u
-        value = np.asarray(u / (1.0 + product))
+        value = xp.asarray(u / (1.0 + product))
+    if xp is not np:
+        # Device selection avoids a host synchronization at every reaction step.
+        log_u = xp.log(u)
+        fallback = xp.exp(log_u - xp.logaddexp(0.0, np.log(beta) + np.log(step) + log_u))
+        return xp.where(u == 0.0, 0.0, xp.where(xp.isfinite(product), value, fallback))
     overflow = ~np.isfinite(product) & (u > 0)
     if overflow.any():
         log_u = np.log(u[overflow])
@@ -82,7 +111,10 @@ def _decay(u, beta, step):
     return value
 
 
-def _decay_partials(u, value, step):
+def _decay_partials(u, value, step, *, xp=np):
+    if xp is not np:
+        derivative = xp.where(u > 0.0, (value / u) ** 2, 1.0)
+        return derivative, -(step * value) * value
     derivative = np.ones_like(u)
     positive = u > 0.0
     derivative[positive] = (value[positive] / u[positive]) ** 2
@@ -112,7 +144,9 @@ def quadratic_decay(u, beta, step):
     """
     values = _owned(u, "u", nonnegative=True)
     return _decay(
-        values, _scalar(beta, "beta", nonnegative=True), _scalar(step, "step", nonnegative=True)
+        values,
+        _scalar(beta, "beta", nonnegative=True),
+        _scalar(step, "step", nonnegative=True),
     )
 
 
@@ -243,7 +277,14 @@ def _weights(alpha, step, rate, degree):
     source_derivative = source * (total_derivative / total + ratios - normalized @ ratios)
     if not np.isfinite(source_derivative).all():
         raise FloatingPointError("The normalized source derivative is not representable")
-    return growth, total, transport, source, source_derivative, float(gammainc(degree + 1.0, mean))
+    return (
+        growth,
+        total,
+        transport,
+        source,
+        source_derivative,
+        float(gammainc(degree + 1.0, mean)),
+    )
 
 
 @dataclass(frozen=True, init=False)
@@ -262,6 +303,9 @@ class PositiveAffineAction:
         Единицы rate обратны единицам step.
     degree : int
         Заранее фиксированная степень не меньше двух.
+    backend : {"numpy", "cupy"}, optional
+        Место хранения и арифметики массивов. CuPy загружается только при
+        явном выборе; подготовка генератора и полиномиальных весов общая.
 
     Attributes
     ----------
@@ -288,11 +332,13 @@ class PositiveAffineAction:
     source_weight_sum: float
     _growth: float = field(repr=False)
     _transition: object = field(repr=False)
-    _a: np.ndarray = field(repr=False)
-    _b: np.ndarray = field(repr=False)
-    _db: np.ndarray = field(repr=False)
+    _a: object = field(repr=False)
+    _b: object = field(repr=False)
+    _db: object = field(repr=False)
+    backend: str
 
-    def __init__(self, Q, alpha, *, step, rate, degree):
+    def __init__(self, Q, alpha, *, step, rate, degree, backend="numpy"):
+        xp = _array_module(backend)
         operator = _matrix(Q, "Q")
         alpha, step, rate = (
             _scalar(alpha, "alpha"),
@@ -324,6 +370,8 @@ class PositiveAffineAction:
         growth, total, a, b, db, tail = _weights(alpha, step, rate, degree)
         for values in (transition.data, transition.indices, transition.indptr):
             values.flags.writeable = False
+        if xp is not np:
+            transition = import_module("cupyx.scipy.sparse").csr_matrix(transition)
         for name, value in dict(
             size=operator.shape[0],
             alpha=alpha,
@@ -334,30 +382,47 @@ class PositiveAffineAction:
             source_weight_sum=total,
             _growth=growth,
             _transition=transition,
-            _a=_owned(a, "weights"),
-            _b=_owned(b, "weights"),
-            _db=_owned(db, "weight derivatives"),
+            _a=_owned(a, "weights", xp=xp),
+            _b=_owned(b, "weights", xp=xp),
+            _db=_owned(db, "weight derivatives", xp=xp),
+            backend=backend,
         ).items():
             object.__setattr__(self, name, value)
 
     @property
+    def _xp(self):
+        # Keep frames serializable: modules are resolved, never stored in them.
+        return _array_module(self.backend)
+
+    @property
+    def array_module(self):
+        """Модуль NumPy или CuPy, выбранный для арифметики этого подшага."""
+        return self._xp
+
+    def to_host(self, values):
+        """Вернуть независимый NumPy-массив с явной синхронизацией устройства."""
+        if self._xp is np:
+            return np.array(values, copy=True)
+        return self._xp.asnumpy(values)
+
+    @property
     def transport_weights(self):
         """ndarray : Независимые нормированные пуассоновы веса."""
-        return _owned(self._a, "weights")
+        return _owned(self._a, "weights", xp=self._xp)
 
     @property
     def source_weights(self):
         """ndarray : Независимые интегральные источниковые веса."""
-        return _owned(self._b, "weights")
+        return _owned(self._b, "weights", xp=self._xp)
 
     @property
     def source_alpha_derivative(self):
         """ndarray : Производные источниковых весов по alpha."""
-        return _owned(self._db, "weight derivatives")
+        return _owned(self._db, "weight derivatives", xp=self._xp)
 
     def _powers(self, u, f):
-        up = np.empty((self.degree + 1, self.size))
-        fp = np.empty_like(up)
+        up = self._xp.empty((self.degree + 1, self.size))
+        fp = self._xp.empty_like(up)
         up[0], fp[0] = u, f
         for k in range(1, self.degree + 1):
             up[k] = self._transition @ up[k - 1]
@@ -366,58 +431,71 @@ class PositiveAffineAction:
 
     def _value(self, powers):
         value = self._growth * (self._a @ powers[0]) + self._b @ powers[1]
-        if not np.isfinite(value).all():
+        if self._xp is np and not np.isfinite(value).all():
             raise FloatingPointError("The affine substep is not representable")
         return value
 
     def _tangent(self, powers, du, df, dP, dalpha):
         partials = () if dP is None else (dP,)
-        directions = np.ones((len(partials), 1))
+        directions = self._xp.ones((len(partials), 1))
         return self._tangent_many(
-            powers, du[:, None], df[:, None], partials, directions, np.array([dalpha])
+            powers,
+            du[:, None],
+            df[:, None],
+            partials,
+            directions,
+            self._xp.array([dalpha]),
         )[:, 0]
 
-    def _tangent_many(self, powers, du, df, partials, directions, dalpha):
+    def _tangent_many(self, powers, du, df, partials, directions, dalpha, *, plan=None):
+        xp = self._xp
         up, fp = powers
-        result = np.zeros_like(du)
-        varying_alpha = np.any(dalpha)
-        active = np.flatnonzero(np.any(directions, axis=0))
-        selected = slice(None) if active.size == du.shape[1] else active
+        result = xp.zeros_like(du)
+        if plan is None:
+            active = xp.flatnonzero(xp.any(directions, axis=0))
+            plan = (
+                bool(xp.any(dalpha)),
+                slice(None) if active.size == du.shape[1] else active,
+            )
+        varying_alpha, selected = plan
         operator_coefficients = directions[:, selected]
         for k in range(self.degree + 1):
             result += self._growth * self._a[k] * du + self._b[k] * df
             if varying_alpha:
-                result += np.multiply.outer(
-                    self.step * self._growth * self._a[k] * up[k] + self._db[k] * fp[k], dalpha
+                result += xp.multiply.outer(
+                    self.step * self._growth * self._a[k] * up[k] + self._db[k] * fp[k],
+                    dalpha,
                 )
             if k < self.degree:
                 du, df = self._transition @ du, self._transition @ df
                 if partials:
                     du[:, selected] += (
-                        np.column_stack([matrix @ up[k] for matrix in partials])
+                        xp.column_stack([matrix @ up[k] for matrix in partials])
                         @ operator_coefficients
                     )
                     df[:, selected] += (
-                        np.column_stack([matrix @ fp[k] for matrix in partials])
+                        xp.column_stack([matrix @ fp[k] for matrix in partials])
                         @ operator_coefficients
                     )
         return result
 
     def _pullback(self, powers, cotangent, partials):
+        xp = self._xp
         up, fp = powers
-        u_bar, f_bar = np.zeros(self.size), np.zeros(self.size)
+        u_bar, f_bar = xp.zeros(self.size), xp.zeros(self.size)
         operator_bar = {name: 0.0 for name in partials}
-        alpha_bar = float(
-            self.step * self._growth * (self._a @ (up @ cotangent)) + self._db @ (fp @ cotangent)
+        alpha_bar = self.step * self._growth * (self._a @ (up @ cotangent)) + self._db @ (
+            fp @ cotangent
         )
+        if xp is np:
+            alpha_bar = float(alpha_bar)
         for k in range(self.degree, -1, -1):
             u_bar += self._growth * self._a[k] * cotangent
             f_bar += self._b[k] * cotangent
             if k:
                 for name, matrix in partials.items():
-                    operator_bar[name] += float(
-                        u_bar @ (matrix @ up[k - 1]) + f_bar @ (matrix @ fp[k - 1])
-                    )
+                    contribution = u_bar @ (matrix @ up[k - 1]) + f_bar @ (matrix @ fp[k - 1])
+                    operator_bar[name] += float(contribution) if xp is np else contribution
                 u_bar = self._transition.T @ u_bar
                 f_bar = self._transition.T @ f_bar
         return {"u": u_bar, "f": f_bar, "operator": operator_bar, "alpha": alpha_bar}
@@ -436,12 +514,15 @@ class PositiveAffineAction:
         values : ndarray, shape (N,)
             Состояние после подшага.
         """
-        return self._value(
+        result = self._value(
             self._powers(
-                _owned(u, "u", shape=(self.size,), nonnegative=True),
-                _owned(f, "f", shape=(self.size,), nonnegative=True),
+                _owned(u, "u", shape=(self.size,), nonnegative=True, xp=self._xp),
+                _owned(f, "f", shape=(self.size,), nonnegative=True, xp=self._xp),
             )
         )
+        if self._xp is not np and not self._xp.isfinite(result).all():
+            raise FloatingPointError("The affine substep is not representable")
+        return result
 
     def jvp(self, u, f, du=None, df=None, dQ=None, dalpha=0.0):
         """Применить производную аффинного подшага.
@@ -462,19 +543,23 @@ class PositiveAffineAction:
         tangent : ndarray, shape (N,)
             Координатная производная результата по всем направлениям.
         """
+        xp = self._xp
         u, f = (
-            _owned(u, "u", shape=(self.size,), nonnegative=True),
-            _owned(f, "f", shape=(self.size,), nonnegative=True),
+            _owned(u, "u", shape=(self.size,), nonnegative=True, xp=xp),
+            _owned(f, "f", shape=(self.size,), nonnegative=True, xp=xp),
         )
-        du = np.zeros(self.size) if du is None else _owned(du, "du", shape=(self.size,))
-        df = np.zeros(self.size) if df is None else _owned(df, "df", shape=(self.size,))
-        return self._tangent(
+        du = xp.zeros(self.size) if du is None else _owned(du, "du", shape=(self.size,), xp=xp)
+        df = xp.zeros(self.size) if df is None else _owned(df, "df", shape=(self.size,), xp=xp)
+        result = self._tangent(
             self._powers(u, f),
             du,
             df,
-            None if dQ is None else _matrix(dQ, "dQ", self.size) / self.rate,
+            None if dQ is None else _matrix(dQ, "dQ", self.size, xp=xp) / self.rate,
             _scalar(dalpha, "dalpha"),
         )
+        if xp is not np and not xp.isfinite(result).all():
+            raise FloatingPointError("The affine tangent is not representable")
+        return result
 
     def vjp(self, u, f, cotangent, operator_partials=None):
         """Перенести ковектор аффинного результата к входам и параметрам.
@@ -494,20 +579,43 @@ class PositiveAffineAction:
             u и f — массивы (N,), alpha — число, operator — именованные
             свёртки с dQ/dtheta. Используется евклидово спаривание координат.
         """
+        xp = self._xp
         u, f = (
-            _owned(u, "u", shape=(self.size,), nonnegative=True),
-            _owned(f, "f", shape=(self.size,), nonnegative=True),
+            _owned(u, "u", shape=(self.size,), nonnegative=True, xp=xp),
+            _owned(f, "f", shape=(self.size,), nonnegative=True, xp=xp),
         )
         partials = {
-            name: _matrix(value, name, self.size) / self.rate
+            name: _matrix(value, name, self.size, xp=xp) / self.rate
             for name, value in (operator_partials or {}).items()
         }
-        return self._pullback(
-            self._powers(u, f), _owned(cotangent, "cotangent", shape=(self.size,)), partials
+        pulled = self._pullback(
+            self._powers(u, f),
+            _owned(cotangent, "cotangent", shape=(self.size,), xp=xp),
+            partials,
         )
+        if xp is not np:
+            scalars = xp.stack(
+                [
+                    xp.asarray(pulled["alpha"]),
+                    *(xp.asarray(value) for value in pulled["operator"].values()),
+                ]
+            )
+            if not xp.isfinite(xp.concatenate((pulled["u"], pulled["f"], scalars))).all():
+                raise FloatingPointError("The affine pullback is not representable")
+            pulled["alpha"] = float(pulled["alpha"])
+            pulled["operator"] = {key: float(value) for key, value in pulled["operator"].items()}
+        return pulled
 
     def jvp_many(
-        self, u, f, du, df=None, *, operator_partials=None, operator_directions=None, dalpha=None
+        self,
+        u,
+        f,
+        du,
+        df=None,
+        *,
+        operator_partials=None,
+        operator_directions=None,
+        dalpha=None,
     ):
         """Применить производную аффинного подшага к нескольким направлениям.
 
@@ -532,29 +640,36 @@ class PositiveAffineAction:
             Те же производные, что отдельные JVP при фиксированных rate,
             degree и весах. Базовые степени P общие для всех столбцов.
         """
-        u, f = _owned(u, "u", shape=(self.size,), nonnegative=True), _owned(
-            f, "f", shape=(self.size,), nonnegative=True
+        xp = self._xp
+        u, f = _owned(u, "u", shape=(self.size,), nonnegative=True, xp=xp), _owned(
+            f, "f", shape=(self.size,), nonnegative=True, xp=xp
         )
-        du = _owned(du, "du")
+        du = _owned(du, "du", xp=xp)
         if du.ndim != 2 or du.shape[0] != self.size or du.shape[1] < 1:
             raise ValueError("du must have shape (N,K) with K>=1")
         count = du.shape[1]
-        df = np.zeros_like(du) if df is None else _owned(df, "df", shape=du.shape)
-        dalpha = np.zeros(count) if dalpha is None else _owned(dalpha, "dalpha", shape=(count,))
-        partials, directions = _operator_directions(
-            operator_partials, operator_directions, count, self.size, self.rate
+        df = xp.zeros_like(du) if df is None else _owned(df, "df", shape=du.shape, xp=xp)
+        dalpha = (
+            xp.zeros(count) if dalpha is None else _owned(dalpha, "dalpha", shape=(count,), xp=xp)
         )
-        return self._tangent_many(self._powers(u, f), du, df, partials, directions, dalpha)
+        partials, directions = _operator_directions(
+            operator_partials, operator_directions, count, self.size, self.rate, xp=xp
+        )
+        result = self._tangent_many(self._powers(u, f), du, df, partials, directions, dalpha)
+        if xp is not np and not xp.isfinite(result).all():
+            raise FloatingPointError("The affine tangent is not representable")
+        return result
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class StrangTrajectory:
     """Траектория и производные при фиксированных аффинном подшаге и нагрузке.
 
     Attributes
     ----------
-    states : ndarray, shape (nt+1, N)
-        Собственные состояния, включая начальное; запись запрещена.
+    states : numpy.ndarray or cupy.ndarray, shape (nt+1, N)
+        Состояния, включая начальное. NumPy возвращает неизменяемый массив;
+        CuPy — независимую копию, поскольку у устройства нет WRITEABLE-флага.
     polynomial_error_bound : float
         Накопленная оценка только усечения полиномов в бесконечной норме,
         в единице состояния.
@@ -565,12 +680,32 @@ class StrangTrajectory:
         Фиксированный коэффициент квадратичного стока.
     """
 
-    states: np.ndarray
+    _states: object = field(repr=False)
     affine: PositiveAffineAction
     beta: float
     polynomial_error_bound: float
-    _forcing: np.ndarray = field(repr=False)
-    _load: np.ndarray | None = field(repr=False)
+    _forcing: object = field(repr=False)
+    _load: object = field(repr=False)
+
+    def __init__(self, states, affine, beta, polynomial_error_bound, _forcing, _load):
+        xp = affine.array_module
+        for name, value in dict(
+            _states=_owned(states, "states", xp=xp),
+            affine=affine,
+            beta=beta,
+            polynomial_error_bound=polynomial_error_bound,
+            _forcing=_forcing,
+            _load=_load,
+        ).items():
+            object.__setattr__(self, name, value)
+
+    @property
+    def states(self):
+        """Сохранённые состояния без возможности изменить внутреннюю траекторию."""
+        if self.affine.array_module is np:
+            # NumPy deepcopy/pickle may restore an owned array as writable.
+            return _readonly(self._states, np)
+        return self._states.copy()
 
     def _frame(self, n, direction=None):
         values = self._forcing if direction is None else direction
@@ -595,19 +730,20 @@ class StrangTrajectory:
         tangent : ndarray, shape (nt+1, N)
             Касательная траектория. Пространственный load фиксирован.
         """
+        xp = self.affine.array_module
         initial = (
-            np.zeros(self.affine.size)
+            xp.zeros(self.affine.size)
             if d_initial is None
-            else _owned(d_initial, "d_initial", shape=(self.affine.size,))
+            else _owned(d_initial, "d_initial", shape=(self.affine.size,), xp=xp)
         )
         forcing = (
             None
             if d_forcing is None
-            else _owned(d_forcing, "d_forcing", shape=self._forcing.shape)[..., None]
+            else _owned(d_forcing, "d_forcing", shape=self._forcing.shape, xp=xp)[..., None]
         )
         partials = None if dQ is None else {"direction": dQ}
-        directions = None if dQ is None else np.ones((1, 1))
-        return np.stack(
+        directions = None if dQ is None else xp.ones((1, 1))
+        return xp.stack(
             [
                 value[:, 0]
                 for value in self.iter_jvp_many(
@@ -650,48 +786,76 @@ class StrangTrajectory:
 
         Yields
         ------
-        sensitivities : ndarray, shape (N, K)
-            Собственные неизменяемые матрицы для начального и последующих
-            временных узлов. Если потребитель не хранит прежние матрицы,
-            память не растёт как nt*N*K. Прямой шаг не изменяется.
+        sensitivities : numpy.ndarray or cupy.ndarray, shape (N, K)
+            Собственные матрицы для начального и последующих временных узлов.
+            NumPy запрещает запись; CuPy выдаёт независимые копии. Если
+            потребитель не хранит прежние матрицы, память не растёт как nt*N*K.
+            На GPU накопленная проверка конечности завершается при полном
+            исчерпании итератора. Прямой шаг не изменяется.
         """
         affine, half = self.affine, self.affine.step / 2
-        current = _owned(d_initial, "d_initial")
+        xp = affine.array_module
+        current = _owned(d_initial, "d_initial", xp=xp)
         if current.ndim != 2 or current.shape[0] != affine.size or current.shape[1] < 1:
             raise ValueError("d_initial must have shape (N,K) with K>=1")
         count = current.shape[1]
         forcing = (
             None
             if d_forcing is None
-            else _owned(d_forcing, "d_forcing", shape=(*self._forcing.shape, count))
+            else _owned(d_forcing, "d_forcing", shape=(*self._forcing.shape, count), xp=xp)
         )
-        dalpha = np.zeros(count) if dalpha is None else _owned(dalpha, "dalpha", shape=(count,))
-        dbeta = np.zeros(count) if dbeta is None else _owned(dbeta, "dbeta", shape=(count,))
+        dalpha = (
+            xp.zeros(count) if dalpha is None else _owned(dalpha, "dalpha", shape=(count,), xp=xp)
+        )
+        dbeta = xp.zeros(count) if dbeta is None else _owned(dbeta, "dbeta", shape=(count,), xp=xp)
         partials, directions = _operator_directions(
-            operator_partials, operator_directions, count, affine.size, affine.rate
+            operator_partials,
+            operator_directions,
+            count,
+            affine.size,
+            affine.rate,
+            xp=xp,
         )
-        yield current
-        for n in range(len(self.states) - 1):
-            first = _decay(self.states[n], self.beta, half)
-            du, db = _decay_partials(self.states[n], first, half)
+        active = xp.flatnonzero(xp.any(directions, axis=0))
+        tangent_plan = (
+            bool(xp.any(dalpha)),
+            slice(None) if active.size == count else active,
+        )
+        valid = xp.asarray(True)
+        yield current if xp is np else current.copy()
+        for n in range(len(self._states) - 1):
+            first = _decay(self._states[n], self.beta, half, xp=xp)
+            du, db = _decay_partials(self._states[n], first, half, xp=xp)
             powers = affine._powers(first, self._frame(n))
             middle = affine._value(powers)
-            first_direction = du[:, None] * current + np.multiply.outer(db, dbeta)
+            first_direction = du[:, None] * current + xp.multiply.outer(db, dbeta)
             if forcing is None:
-                forcing_direction = np.zeros_like(current)
+                forcing_direction = xp.zeros_like(current)
             else:
                 forcing_direction = (
-                    forcing[n] if self._load is None else np.multiply.outer(self._load, forcing[n])
+                    forcing[n] if self._load is None else xp.multiply.outer(self._load, forcing[n])
                 )
             tangent = affine._tangent_many(
-                powers, first_direction, forcing_direction, partials, directions, dalpha
+                powers,
+                first_direction,
+                forcing_direction,
+                partials,
+                directions,
+                dalpha,
+                plan=tangent_plan,
             )
-            du, db = _decay_partials(middle, self.states[n + 1], half)
-            current = du[:, None] * tangent + np.multiply.outer(db, dbeta)
-            if not np.isfinite(current).all():
-                raise FloatingPointError("The batched tangent is not representable")
-            current.flags.writeable = False
-            yield current
+            du, db = _decay_partials(middle, self._states[n + 1], half, xp=xp)
+            current = du[:, None] * tangent + xp.multiply.outer(db, dbeta)
+            if xp is np:
+                if not np.isfinite(current).all():
+                    raise FloatingPointError("The batched tangent is not representable")
+                current.flags.writeable = False
+                yield current
+            else:
+                valid &= xp.isfinite(current).all()
+                yield current.copy()
+        if xp is not np and not bool(valid):
+            raise FloatingPointError("The batched tangent is not representable")
 
     def jvp_many(
         self,
@@ -716,7 +880,7 @@ class StrangTrajectory:
             Все чувствительности. Для наблюдений без хранения этого
             тензора следует непосредственно использовать iterator.
         """
-        return np.stack(
+        return self.affine.array_module.stack(
             list(
                 self.iter_jvp_many(
                     d_initial,
@@ -747,28 +911,43 @@ class StrangTrajectory:
             Пространственный load фиксирован; спаривание евклидово.
         """
         affine, half = self.affine, self.affine.step / 2
-        cotangent = _owned(cotangent, "cotangent", shape=self.states.shape)
+        xp = affine.array_module
+        cotangent = _owned(cotangent, "cotangent", shape=self._states.shape, xp=xp)
         partials = {
-            name: _matrix(value, name, affine.size) / affine.rate
+            name: _matrix(value, name, affine.size, xp=xp) / affine.rate
             for name, value in (operator_partials or {}).items()
         }
         operator_bar = {name: 0.0 for name in partials}
-        forcing_bar = np.zeros_like(self._forcing)
+        forcing_bar = xp.zeros_like(self._forcing)
         state_bar, alpha_bar, beta_bar = cotangent[-1].copy(), 0.0, 0.0
-        for n in range(len(self.states) - 2, -1, -1):
-            first = _decay(self.states[n], self.beta, half)
+        for n in range(len(self._states) - 2, -1, -1):
+            first = _decay(self._states[n], self.beta, half, xp=xp)
             powers = affine._powers(first, self._frame(n))
             middle = affine._value(powers)
-            du, db = _decay_partials(middle, self.states[n + 1], half)
-            beta_bar += float(state_bar @ db)
+            du, db = _decay_partials(middle, self._states[n + 1], half, xp=xp)
+            contribution = state_bar @ db
+            beta_bar += float(contribution) if xp is np else contribution
             pulled = affine._pullback(powers, state_bar * du, partials)
             alpha_bar += pulled["alpha"]
             for name in operator_bar:
                 operator_bar[name] += pulled["operator"][name]
             forcing_bar[n] = pulled["f"] if self._load is None else self._load @ pulled["f"]
-            du, db = _decay_partials(self.states[n], first, half)
-            beta_bar += float(pulled["u"] @ db)
+            du, db = _decay_partials(self._states[n], first, half, xp=xp)
+            contribution = pulled["u"] @ db
+            beta_bar += float(contribution) if xp is np else contribution
             state_bar = cotangent[n] + pulled["u"] * du
+        if xp is not np:
+            scalars = xp.stack(
+                [
+                    xp.asarray(alpha_bar),
+                    xp.asarray(beta_bar),
+                    *(xp.asarray(value) for value in operator_bar.values()),
+                ]
+            )
+            if not xp.isfinite(xp.concatenate((state_bar, forcing_bar.ravel(), scalars))).all():
+                raise FloatingPointError("The trajectory pullback is not representable")
+            alpha_bar, beta_bar = float(alpha_bar), float(beta_bar)
+            operator_bar = {name: float(value) for name, value in operator_bar.items()}
         return {
             "initial": state_bar,
             "forcing": forcing_bar,
@@ -808,31 +987,34 @@ def solve_strang(affine, initial, forcing, *, beta=0.0, load=None):
     """
     if not isinstance(affine, PositiveAffineAction):
         raise TypeError("affine must be PositiveAffineAction")
+    xp = affine.array_module
     beta = _scalar(beta, "beta", nonnegative=True)
-    initial = _owned(initial, "initial", shape=(affine.size,), nonnegative=True)
-    forcing = _owned(forcing, "forcing", nonnegative=True)
+    initial = _owned(initial, "initial", shape=(affine.size,), nonnegative=True, xp=xp)
+    forcing = _owned(forcing, "forcing", nonnegative=True, xp=xp)
     if load is None:
         if forcing.ndim != 2 or forcing.shape[1] != affine.size:
             raise ValueError("Distributed forcing must have shape (nt,N)")
     else:
-        load = _owned(load, "load", shape=(affine.size,), nonnegative=True)
+        load = _owned(load, "load", shape=(affine.size,), nonnegative=True, xp=xp)
         if forcing.ndim != 1:
             raise ValueError("Load intensities must have shape (nt,)")
-    states = np.empty((len(forcing) + 1, affine.size))
+    states = xp.empty((len(forcing) + 1, affine.size))
     states[0] = initial
     error_bound = 0.0
     for n in range(len(forcing)):
-        first = _decay(states[n], beta, affine.step / 2)
+        first = _decay(states[n], beta, affine.step / 2, xp=xp)
         frame = forcing[n] if load is None else load * forcing[n]
-        states[n + 1] = _decay(affine._value(affine._powers(first, frame)), beta, affine.step / 2)
+        states[n + 1] = _decay(
+            affine._value(affine._powers(first, frame)), beta, affine.step / 2, xp=xp
+        )
         local = (
             2
             * affine.transport_tail
             * (
-                affine._growth * np.linalg.norm(first, np.inf)
-                + affine.source_weight_sum * np.linalg.norm(frame, np.inf)
+                affine._growth * xp.linalg.norm(first, np.inf)
+                + affine.source_weight_sum * xp.linalg.norm(frame, np.inf)
             )
         )
         error_bound = affine._growth * error_bound + local
-    states.flags.writeable = False
+    _readonly(states, xp)
     return StrangTrajectory(states, affine, beta, float(error_bound), forcing, load)

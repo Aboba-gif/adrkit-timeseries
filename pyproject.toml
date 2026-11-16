@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adrkit-timeseries"
-version = "0.4.1"
+version = "0.5.0"
 description = "Численные задачи переноса, обратные задачи и обработка временных рядов"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=8", "threadpoolctl>=3"]
 dev = ["black==26.10.1"]
+cuda13 = ["cupy-cuda13x[ctk]>=14.2,<15"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
