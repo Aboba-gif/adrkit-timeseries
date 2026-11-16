@@ -213,7 +213,8 @@ def test_replicated_mean_square_residual_has_the_same_step_and_normalization():
     settings = {"gtol": 0.0, "maxiter": 1}
     left = optimizers.solve_damped_gauss_newton(normalized, [0.0, 0.0], options=settings)
     right = optimizers.solve_damped_gauss_newton(repeated, [0.0, 0.0], options=settings)
-    np.testing.assert_allclose(left.x, right.x, rtol=0, atol=5e-16)
+    # Replication changes floating-point summation and the LAPACK factorization.
+    np.testing.assert_allclose(left.x, right.x, rtol=0, atol=8 * np.finfo(float).eps)
     np.testing.assert_allclose(left.fun, np.mean((matrix @ left.x - target) ** 2), rtol=1e-15)
     np.testing.assert_allclose(
         left.jac, 2 * matrix.T @ (matrix @ left.x - target) / len(target), rtol=2e-14
