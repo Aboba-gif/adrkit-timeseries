@@ -161,6 +161,8 @@ def test_empty_free_face_returns_zero_without_evaluating_the_hessian():
     )
     np.testing.assert_array_equal(linearization.operator @ [1.0, 2.0, 3.0, 4.0], [0.0, 0.0])
     np.testing.assert_array_equal(linearization.operator.rmatvec([1.0, 2.0]), np.zeros(4))
+    np.testing.assert_array_equal(linearization.inverse_hessian @ [1.0, 2.0], [0.0, 0.0])
+    np.testing.assert_array_equal(linearization.inverse_hessian.rmatvec([1.0, 2.0]), [0.0, 0.0])
     assert linearization.metadata["free_indices"] == ()
     assert linearization.metadata["free_min"] is None
 
@@ -201,6 +203,9 @@ def test_an_invertible_negative_hessian_is_not_replaced_by_gauss_newton():
     )
     # Stationarity holds at x=1, while H=1/16+1/16-1/4=-1/8.
     np.testing.assert_allclose(linearization.operator @ [2.0, 3.0], [-7.0], rtol=1e-12, atol=1e-14)
+    np.testing.assert_allclose(
+        linearization.inverse_hessian @ [1.0], [-8.0], rtol=1e-12, atol=1e-14
+    )
 
 
 def test_exact_mode_requires_a_callback_and_zero_rhs_skips_minres(monkeypatch):
@@ -216,6 +221,7 @@ def test_exact_mode_requires_a_callback_and_zero_rhs_skips_minres(monkeypatch):
     )
     np.testing.assert_array_equal(linearization.operator @ [0.0, 0.0], [0.0])
     np.testing.assert_array_equal(linearization.operator.rmatvec([0.0]), [0.0, 0.0])
+    np.testing.assert_array_equal(linearization.inverse_hessian @ [0.0], [0.0])
 
 
 def test_minres_success_flag_does_not_replace_the_true_residual_check(monkeypatch):
@@ -227,6 +233,63 @@ def test_minres_success_flag_does_not_replace_the_true_residual_check(monkeypatc
     )
     with pytest.raises(RuntimeError, match="true relative linear residual"):
         linearization.operator @ [1.0, 0.0]
+
+
+@pytest.mark.parametrize("budget", [1, 6])
+def test_true_residual_controls_correction_with_one_shared_iteration_budget(monkeypatch, budget):
+    options = {**_options(), "maxiter": budget}
+    linearization = nonnegative_analysis_linear_operator(
+        [1.0, 1.0, 1.0],
+        _affine(np.eye(3)),
+        [1.0, 1.0, 1.0],
+        [1.0, 4.0, 9.0],
+        [1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0],
+        curvature="gauss-newton",
+        **options,
+    )
+    native_minres = constraints.minres
+    iteration_count = 0
+    internal_results = []
+
+    def coarse_first_internal_stop(operator, right, *, callback, rtol, **kwargs):
+        def counted(point):
+            nonlocal iteration_count
+            iteration_count += 1
+            callback(point)
+
+        # A loose first internal test reproduces the distinction between an
+        # accepted Krylov stop and the public residual requirement. All linear
+        # iterations still use the actual MINRES and the same matrix.
+        solution, info = native_minres(
+            operator,
+            right,
+            rtol=0.5 if not internal_results else rtol,
+            callback=counted,
+            **kwargs,
+        )
+        internal_results.append((solution.copy(), info))
+        return solution, info
+
+    monkeypatch.setattr(constraints, "minres", coarse_first_internal_stop)
+    right = np.array([1.0, -2.0, 3.0])
+    hessian = np.diag([2.0, 5.0, 10.0])
+    if budget == 1:
+        with pytest.raises(RuntimeError, match="true relative linear residual"):
+            linearization.inverse_hessian @ right
+    else:
+        solution = linearization.inverse_hessian @ right
+        np.testing.assert_allclose(
+            solution, np.linalg.solve(hessian, right), rtol=1e-10, atol=1e-12
+        )
+        assert (
+            np.linalg.norm(right - hessian @ solution) / np.linalg.norm(right)
+            <= options["solve_rtol"]
+        )
+    first, info = internal_results[0]
+    assert info == 0
+    assert np.linalg.norm(right - hessian @ first) / np.linalg.norm(right) > options["solve_rtol"]
+    assert iteration_count <= budget
 
 
 @pytest.mark.parametrize("extra", [np.array([np.nan]), np.array([0.0, 0.0])])
@@ -243,3 +306,189 @@ def test_exact_hessian_callback_must_return_a_finite_state_vector(extra):
     )
     with pytest.raises(ValueError, match="Hessian product"):
         linearization.operator @ [1.0, 0.0]
+
+
+@pytest.mark.parametrize("curvature", ["exact", "gauss-newton"])
+def test_dense_spd_prior_matches_the_affine_reduced_equation_with_correlated_data(curvature):
+    matrix = np.array([[1.0, 0.0, 1.0], [0.0, 1.0, 1.0]])
+    mass = np.array([[3.0, -0.5, 0.25], [-0.5, 2.0, -0.4], [0.25, -0.4, 1.5]])
+    covariance = np.array([[2.0, 0.5], [0.5, 1.5]])
+    point = np.array([0.0, 1.0, 2.0])
+    multiplier = np.array([1.0, -0.5])
+    gradient = np.array([0.75, 0.0, 0.0])
+    reference = point + np.linalg.solve(mass, matrix.T @ multiplier - gradient)
+    target = matrix @ point - covariance @ multiplier
+    linearization = nonnegative_analysis_linear_operator(
+        reference,
+        _affine(matrix),
+        target,
+        mass,
+        covariance,
+        point,
+        observation_hvp=lambda zeta, direction: np.zeros(3),
+        curvature=curvature,
+        **_options(),
+    )
+    precision = np.linalg.solve(covariance, np.eye(2))
+    hessian = mass + matrix.T @ precision @ matrix
+    free = [1, 2]
+    expected = np.zeros((3, 5))
+    right = np.column_stack((mass, matrix.T @ precision))
+    expected[free] = np.linalg.solve(hessian[np.ix_(free, free)], right[free])
+    np.testing.assert_allclose(
+        linearization.operator @ np.eye(5), expected, rtol=2e-11, atol=2e-13
+    )
+    expected_inverse = np.zeros((3, 3))
+    expected_inverse[np.ix_(free, free)] = np.linalg.solve(
+        hessian[np.ix_(free, free)], np.eye(len(free))
+    )
+    np.testing.assert_allclose(
+        linearization.inverse_hessian @ np.eye(3), expected_inverse, rtol=2e-11, atol=2e-13
+    )
+    direction = np.linspace(-0.3, 0.7, 5)
+    cotangent = np.array([0.2, -0.4, 0.6])
+    np.testing.assert_allclose(
+        linearization.operator.rmatvec(cotangent),
+        expected.T @ cotangent,
+        rtol=2e-11,
+        atol=2e-13,
+    )
+    np.testing.assert_allclose(
+        cotangent @ (linearization.operator @ direction),
+        direction @ linearization.operator.rmatvec(cotangent),
+        rtol=2e-11,
+        atol=2e-13,
+    )
+    state_direction = np.array([0.3, -0.1, 0.5])
+    np.testing.assert_allclose(
+        cotangent @ (linearization.inverse_hessian @ state_direction),
+        state_direction @ linearization.inverse_hessian.rmatvec(cotangent),
+        rtol=2e-11,
+        atol=2e-13,
+    )
+    assert linearization.metadata["active_indices"] == (0,)
+
+
+def test_active_prior_coordinate_affects_the_free_solution_and_its_adjoint():
+    mass = np.array([[2.0, -1.0], [-1.0, 2.0]])
+    point = np.array([0.0, 1.0])
+    reference = point - np.linalg.solve(mass, [1.0, 0.0])
+    linearization = nonnegative_analysis_linear_operator(
+        reference,
+        _affine([[0.0, 1.0]]),
+        [1.0],
+        mass,
+        [1.0],
+        point,
+        curvature="gauss-newton",
+        **_options(),
+    )
+    # H_F=3, while M_F,A=-1: dr_A changes x_F even though dx_A remains zero.
+    np.testing.assert_allclose(
+        linearization.operator @ [1.0, 0.0, 0.0], [0.0, -1 / 3], rtol=1e-12, atol=1e-14
+    )
+    np.testing.assert_allclose(
+        linearization.operator.rmatvec([0.0, 1.0]),
+        [-1 / 3, 2 / 3, 1 / 3],
+        rtol=1e-12,
+        atol=1e-14,
+    )
+    np.testing.assert_array_equal(linearization.inverse_hessian @ [1.0, 0.0], [0.0, 0.0])
+    np.testing.assert_allclose(
+        linearization.inverse_hessian @ [0.0, 1.0], [0.0, 1 / 3], rtol=1e-12, atol=1e-14
+    )
+
+
+def test_diagonal_vector_and_dense_diagonal_prior_have_the_same_actions():
+    matrix = np.array([[1.0, 0.0, 1.0], [0.0, 1.0, 1.0]])
+    covariance = np.array([[2.0, 0.5], [0.5, 1.5]])
+    mass = np.array([2.0, 3.0, 4.0])
+    point = np.array([0.0, 1.0, 2.0])
+    multiplier = np.array([1.0, -0.5])
+    reference = point + (matrix.T @ multiplier - [0.75, 0.0, 0.0]) / mass
+    target = matrix @ point - covariance @ multiplier
+    operators = [
+        nonnegative_analysis_linear_operator(
+            reference,
+            _affine(matrix),
+            target,
+            prior,
+            covariance,
+            point,
+            curvature="gauss-newton",
+            **_options(),
+        ).operator
+        for prior in (mass, np.diag(mass))
+    ]
+    np.testing.assert_allclose(
+        operators[0] @ np.eye(5), operators[1] @ np.eye(5), rtol=2e-11, atol=2e-13
+    )
+    np.testing.assert_allclose(
+        operators[0].rmatvec([0.2, -0.4, 0.6]),
+        operators[1].rmatvec([0.2, -0.4, 0.6]),
+        rtol=2e-11,
+        atol=2e-13,
+    )
+
+
+def test_dense_prior_linearization_owns_the_matrix_and_preserves_signed_couplings():
+    mass = np.array([[2.0, -1.0], [-1.0, 2.0]])
+    point = np.array([1.0, 2.0])
+    linearization = nonnegative_analysis_linear_operator(
+        point.copy(),
+        _affine(np.eye(2)),
+        point.copy(),
+        mass,
+        [1.0, 3.0],
+        point,
+        curvature="gauss-newton",
+        **_options(),
+    )
+    direction = np.array([0.1, -0.2, 0.3, 0.4])
+    before = linearization.operator @ direction
+    reverse_before = linearization.operator.rmatvec([0.4, -0.6])
+    inverse_before = linearization.inverse_hessian @ [0.4, -0.6]
+    mass[:] = 90
+    np.testing.assert_array_equal(linearization.operator @ direction, before)
+    np.testing.assert_array_equal(linearization.operator.rmatvec([0.4, -0.6]), reverse_before)
+    np.testing.assert_array_equal(linearization.inverse_hessian @ [0.4, -0.6], inverse_before)
+
+
+@pytest.mark.parametrize(
+    "mass",
+    [
+        np.array([[1.0, 0.0], [0.0, -1.0]]),
+        np.array([[1.0, 2.0], [2.0, 1.0]]),
+        np.array([[1.0, 1.0], [1.0, 1.0]]),
+        np.array([[1.0, 0.5], [0.1, 1.0]]),
+        np.ones((2, 3)),
+    ],
+)
+def test_dense_prior_requires_the_declared_symmetric_positive_definite_metric(mass):
+    with pytest.raises(ValueError, match="mass"):
+        nonnegative_analysis_linear_operator(
+            [1.0, 2.0],
+            _affine(np.eye(2)),
+            [1.0, 2.0],
+            mass,
+            [1.0, 1.0],
+            [1.0, 2.0],
+            curvature="gauss-newton",
+            **_options(),
+        )
+
+
+@pytest.mark.parametrize("right", [np.array([np.nan, 0.0]), np.array([1.0, 2.0, 3.0])])
+def test_inverse_hessian_requires_a_finite_state_right_hand_side(right):
+    linearization = nonnegative_analysis_linear_operator(
+        [1.0, 2.0],
+        _affine(np.eye(2)),
+        [1.0, 2.0],
+        [1.0, 2.0],
+        [1.0, 1.0],
+        [1.0, 2.0],
+        curvature="gauss-newton",
+        **_options(),
+    )
+    with pytest.raises(ValueError):
+        linearization.inverse_hessian @ right

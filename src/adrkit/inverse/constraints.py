@@ -28,10 +28,15 @@ class NonnegativeAnalysisLinearization:
     metadata : Mapping
         Неизменяемые настройки и численные остатки исходной стационарности.
         Они не удостоверяют гладкость ветви, невырожденность или минимум.
+    inverse_hessian : scipy.sparse.linalg.LinearOperator
+        K=Z@inv(Z.T@H@Z)@Z.T формы (N,N) на выбранной свободной грани.
+        Активные входные компоненты отбрасываются, выходные равны нулю.
+        Это не обратный полный гессиан и не утверждение его положительности.
     """
 
     operator: LinearOperator
     metadata: Mapping
+    inverse_hessian: LinearOperator
 
 
 def gradient_mapping(theta, gradient):
@@ -885,8 +890,10 @@ def nonnegative_analysis_linear_operator(
         сопряжёнными действиями; JVP и явная матрица карты не требуются.
     target : array_like, shape (M,)
         Наблюдения d. Центр, наблюдения и масштабы копируются.
-    mass : array_like, shape (N,)
-        Положительная диагональ фоновой точности M.
+    mass : array_like, shape (N,) or (N, N)
+        Положительная диагональ либо симметричная положительно определённая
+        матрица фоновой точности M. Полное действие M сохраняет связь между
+        свободными и активными координатами центра.
     covariance : array_like, shape (M,) or (M, M)
         Положительные дисперсии либо симметричная положительно определённая R.
     observation_hvp : callable or None, optional
@@ -909,19 +916,25 @@ def nonnegative_analysis_linear_operator(
         Относительный допуск в (0,1) фактического евклидова остатка свободной
         линейной системы. MINRES использует более строгий внутренний rtol.
     maxiter : int
-        Положительный предел итераций каждой свободной системы.
+        Положительный общий предел итераций MINRES для каждой свободной
+        системы, включая повторные решения по фактическому остатку.
 
     Returns
     -------
     linearization : NonnegativeAnalysisLinearization
         operator формы (N,N+M): [dr,dd] -> K(M@dr+J.T@inv(R)@dd), где
         K=Z@inv(Z.T@H@Z)@Z.T. Транспонированное действие возвращает
-        [M@K@bar_x, inv(R)@J@K@bar_x]. metadata хранит исходные остатки и запасы.
+        [M@K@bar_x, inv(R)@J@K@bar_x]. inverse_hessian предоставляет отдельное
+        действие K по произвольной правой части. metadata хранит исходные
+        остатки и запасы.
 
     Notes
     -----
     Для exact используется H=M+J.T@inv(R)@J+sum(zeta_i*D²A_i),
-    zeta=inv(R)@(A(point)-d). Плотная матрица (N,N) не создаётся.
+    zeta=inv(R)@(A(point)-d). Плотный гессиан (N,N) не создаётся;
+    векторная точность не преобразуется в плотную матрицу. Для матричной M
+    используется каноническое SPD-разложение и действие L_M@(L_M.T@v),
+    а не обратная матрица фоновой точности.
     При пустом свободном множестве действие нулевое, гессиан не вычисляется.
     Предполагаются гладкая устойчивая активная ветвь, стационарность и
     невырожденность приведённого гессиана. Выполнение численных допусков
@@ -930,7 +943,13 @@ def nonnegative_analysis_linear_operator(
 
     MINRES допускает симметричный неопределённый гессиан. Успешное решение
     не удостоверяет положительную определённость, невырожденность или минимум.
-    При неуспешной проверке остатка возникает ошибка; сдвига, дополнительного
+    Его внутренний критерий остановки не заменяет проверку ||b-Hx||/||b||.
+    При необходимости тем же MINRES решается H*delta=b-Hx, затем x+=delta,
+    а остаток заново вычисляется по исходной системе. Все вызовы используют
+    один H, один внутренний допуск и общий maxiter. Принимается только
+    фактический solve_rtol: положительный info не препятствует приёмке, если
+    эта проверка уже пройдена; отрицательный info является ошибкой. При
+    стагнации или исчерпании бюджета возникает ошибка. Сдвига, дополнительного
     демпфирования, псевдообратной или запасного решателя нет. Конечные допуски
     дают приближённые действия и не обеспечивают точное сопряжённое тождество.
     """
@@ -954,11 +973,10 @@ def nonnegative_analysis_linear_operator(
         r.shape != domain.shape
         or x.shape != domain.shape
         or d.shape != codomain.shape
-        or m.shape != domain.shape
-        or np.any(m <= 0)
+        or m.shape not in (domain.shape, (domain.size, domain.size))
         or np.any(x < 0)
     ):
-        raise ValueError("Require r(N), x(N)>=0, d(M) and positive diagonal mass(N)")
+        raise ValueError("Require r(N), x(N)>=0, d(M) and diagonal or SPD mass")
     tolerance = real_scalar(kkt_tolerance, name="kkt_tolerance")
     margin = real_scalar(active_margin, name="active_margin")
     relative = real_scalar(solve_rtol, name="solve_rtol")
@@ -966,7 +984,11 @@ def nonnegative_analysis_linear_operator(
         raise ValueError("Require kkt_tolerance>0, active_margin>=0 and 0<solve_rtol<1")
     if type(maxiter) is not int or maxiter < 1:
         raise ValueError("maxiter must be a positive integer")
+    prior_factor = _spd_factor(m, domain.size, "mass")
     factor = _spd_factor(cov, codomain.size, "covariance")
+
+    def mass_action(values):
+        return m * values if m.ndim == 1 else prior_factor @ (prior_factor.T @ values)
 
     def inverse_covariance(values):
         if factor.ndim == 1:
@@ -989,7 +1011,7 @@ def nonnegative_analysis_linear_operator(
         unit[row] = 0.0
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
         zeta = inverse_covariance(prediction - d)
-        gradient = m * (x - r) + matrix.T @ zeta
+        gradient = mass_action(x - r) + matrix.T @ zeta
     zeta = real_array(zeta, name="observation multipliers", copy=True)
     gradient = real_array(gradient, name="analysis gradient", copy=True)
     free, active = np.flatnonzero(x > 0), np.flatnonzero(x == 0)
@@ -1000,12 +1022,12 @@ def nonnegative_analysis_linear_operator(
     active_minimum = float(np.min(gradient[active])) if active.size else None
     if active_minimum is not None and active_minimum <= margin:
         raise ValueError("Analysis point has a weak or insufficiently separated active face")
-    for values in (r, x, d, m, factor, matrix, zeta):
+    for values in (r, x, d, m, prior_factor, factor, matrix, zeta):
         values.flags.writeable = False
 
     def hessian(direction):
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            value = m * direction + matrix.T @ inverse_covariance(matrix @ direction)
+            value = mass_action(direction) + matrix.T @ inverse_covariance(matrix @ direction)
         if curvature == "exact":
             extra = real_array(
                 observation_hvp(zeta.copy(), direction.copy()),
@@ -1039,13 +1061,48 @@ def nonnegative_analysis_linear_operator(
         inner_rtol = relative / np.sqrt(free.size)
         if inner_rtol == 0:
             raise ValueError("The requested internal MINRES tolerance is not representable")
-        solution, info = minres(reduced, selected, rtol=inner_rtol, maxiter=maxiter, check=True)
-        solution = real_array(solution, name="free linear solution")
-        residual = real_array(reduced @ solution - selected, name="free linear residual")
-        if info != 0 or norm(residual) > relative * norm(selected):
-            raise RuntimeError("MINRES failed the requested true relative linear residual")
-        result[free] = solution
-        return result
+        right_norm = norm(selected)
+        if not np.isfinite(right_norm) or right_norm == 0:
+            raise ValueError("The free right-hand-side norm is not representable")
+        solution = np.zeros(free.size)
+        residual = selected.copy()
+        residual_norm = right_norm
+        iterations = 0
+        while iterations < maxiter:
+            used = 0
+
+            def count_iteration(_):
+                nonlocal used
+                used += 1
+
+            correction, info = minres(
+                reduced,
+                residual,
+                rtol=inner_rtol,
+                maxiter=maxiter - iterations,
+                callback=count_iteration,
+                check=True,
+            )
+            iterations += used
+            if info < 0:
+                raise RuntimeError("MINRES failed the requested true relative linear residual")
+            correction = real_array(correction, name="free linear correction")
+            updated = real_array(solution + correction, name="free linear solution")
+            actual = real_array(selected - reduced @ updated, name="free linear residual")
+            actual_norm = norm(actual)
+            if actual_norm / right_norm <= relative:
+                result[free] = updated
+                return result
+            if (
+                info > 0
+                or used == 0
+                or iterations >= maxiter
+                or np.array_equal(updated, solution)
+                or actual_norm >= residual_norm
+            ):
+                break
+            solution, residual, residual_norm = updated, actual, actual_norm
+        raise RuntimeError("MINRES failed the requested true relative linear residual")
 
     def matvec(direction):
         direction = real_array(direction, name="analysis input direction").reshape(-1)
@@ -1054,7 +1111,7 @@ def nonnegative_analysis_linear_operator(
         if not free.size:
             return np.zeros(domain.size)
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            right = m * direction[: domain.size] + matrix.T @ inverse_covariance(
+            right = mass_action(direction[: domain.size]) + matrix.T @ inverse_covariance(
                 direction[domain.size :]
             )
         return solve_free(real_array(right, name="analysis derivative right-hand side"))
@@ -1067,7 +1124,7 @@ def nonnegative_analysis_linear_operator(
             return np.zeros(domain.size + codomain.size)
         pulled = solve_free(cotangent)
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            result = np.r_[m * pulled, inverse_covariance(matrix @ pulled)]
+            result = np.r_[mass_action(pulled), inverse_covariance(matrix @ pulled)]
         return real_array(result, name="analysis transposed derivative")
 
     metadata = MappingProxyType(
@@ -1088,4 +1145,14 @@ def nonnegative_analysis_linear_operator(
     operator = LinearOperator(
         (domain.size, domain.size + codomain.size), matvec=matvec, rmatvec=rmatvec, dtype=float
     )
-    return NonnegativeAnalysisLinearization(operator, metadata)
+
+    def inverse_action(right):
+        right = real_array(right, name="inverse Hessian right-hand side")
+        if right.shape not in (domain.shape, (domain.size, 1)):
+            raise ValueError("Inverse Hessian right-hand side must have length N")
+        return solve_free(right.reshape(domain.size))
+
+    inverse_hessian = LinearOperator(
+        (domain.size, domain.size), matvec=inverse_action, rmatvec=inverse_action, dtype=float
+    )
+    return NonnegativeAnalysisLinearization(operator, metadata, inverse_hessian)

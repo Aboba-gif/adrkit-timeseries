@@ -1135,13 +1135,79 @@ class StrangTrajectory:
         is introduced; zero direction or a purely initial pairing returns
         exact zero before propagating derivatives.
         """
+        if direction is None:
+            raise ValueError("direction must be a finite initial-state vector")
+        return self._state_forcing_hvp(
+            cotangent, d_initial=direction, d_forcing=None, collect_forcing=False
+        )["initial"]
+
+    def state_forcing_hvp(self, cotangent, *, d_initial=None, d_forcing=None):
+        r"""Differentiate the state/forcing pullback in a joint control direction.
+
+        Parameters
+        ----------
+        cotangent : array_like, shape (nt+1, N)
+            Fixed coordinate covector of every trajectory state, including
+            the initial layer. Either sign is permitted.
+        d_initial : array_like, shape (N,), optional
+            Initial-state direction; None means zero.
+        d_forcing : array_like, optional
+            Direction with exactly the original forcing shape: (nt,N) for
+            distributed forcing, or (nt,) for intensity with fixed load.
+            None means zero. Signed directions are permitted for both inputs.
+
+        Returns
+        -------
+        products : dict
+            ``initial`` has shape (N,), ``forcing`` has the original forcing
+            shape. Both are independently owned arrays on this trajectory's
+            backend. They are derivatives of the corresponding two outputs
+            of vjp(cotangent), with cotangent held fixed.
+
+        Notes
+        -----
+        Q, alpha, beta, load, rate, degree and polynomial weights remain
+        fixed. This method differentiates the discrete composition only with
+        respect to initial state and forcing, not its parameter pullbacks.
+        For an affine step L*a+K*f, the differentiated forcing pullback is
+        K.T@eta_b, additionally paired with load for scalar intensities.
+        All reaction curvature uses the same weighted evaluation as
+        initial_hvp. Beta=0 makes every state/forcing Hessian block zero.
+        A fixed cotangent gives a weighted output Hessian; the Gauss-Newton
+        term of a least-squares objective must be added separately.
+        """
+        return self._state_forcing_hvp(
+            cotangent, d_initial=d_initial, d_forcing=d_forcing, collect_forcing=True
+        )
+
+    def _state_forcing_hvp(self, cotangent, *, d_initial, d_forcing, collect_forcing):
         affine, half = self.affine, self.affine.step / 2
         xp = affine.array_module
         cotangent = _owned(cotangent, "cotangent", shape=self._states.shape, xp=xp)
-        direction = _owned(direction, "direction", shape=(affine.size,), xp=xp)
-        if self.beta == 0.0 or not bool(xp.any(direction)) or not bool(xp.any(cotangent[1:])):
-            return xp.zeros(affine.size)
-        tangents = self.jvp(d_initial=direction)
+        initial_direction = (
+            xp.zeros(affine.size)
+            if d_initial is None
+            else _owned(d_initial, "d_initial", shape=(affine.size,), xp=xp)
+        )
+        forcing_direction = (
+            None
+            if d_forcing is None
+            else _owned(d_forcing, "d_forcing", shape=self._forcing.shape, xp=xp)
+        )
+        forcing_bar = xp.zeros_like(self._forcing) if collect_forcing else None
+        if (
+            self.beta == 0.0
+            or not bool(xp.any(cotangent[1:]))
+            or (
+                not bool(xp.any(initial_direction))
+                and (forcing_direction is None or not bool(xp.any(forcing_direction)))
+            )
+        ):
+            result = {"initial": xp.zeros(affine.size)}
+            if collect_forcing:
+                result["forcing"] = forcing_bar
+            return result
+        tangents = self.jvp(d_initial=initial_direction, d_forcing=forcing_direction)
         state_bar = cotangent[-1].copy()
         tangent_bar = xp.zeros(affine.size)
         zero = xp.zeros(affine.size)
@@ -1160,7 +1226,11 @@ class StrangTrajectory:
                 middle_direction = affine._tangent_many(
                     powers,
                     (first_slope * tangents[n])[:, None],
-                    zero[:, None],
+                    (
+                        zero[:, None]
+                        if forcing_direction is None
+                        else self._frame(n, forcing_direction)[:, None]
+                    ),
                     (),
                     operator_directions,
                     alpha_direction,
@@ -1177,7 +1247,14 @@ class StrangTrajectory:
                     xp=xp,
                 )
                 first_bar = affine._pullback(powers, middle_bar, {})["u"]
-                first_tangent_bar = affine._pullback(powers, middle_tangent_bar, {})["u"]
+                tangent_pulled = affine._pullback(powers, middle_tangent_bar, {})
+                first_tangent_bar = tangent_pulled["u"]
+                if collect_forcing:
+                    forcing_bar[n] = (
+                        tangent_pulled["f"]
+                        if self._load is None
+                        else self._load @ tangent_pulled["f"]
+                    )
                 tangent_bar = first_slope * first_tangent_bar + _decay_curvature_product(
                     state,
                     first_ratio,
@@ -1188,9 +1265,15 @@ class StrangTrajectory:
                     xp=xp,
                 )
                 state_bar = cotangent[n] + first_slope * first_bar
-        if not xp.isfinite(xp.concatenate((tangent_bar, state_bar))).all():
-            raise FloatingPointError("The initial-state Hessian action is not representable")
-        return tangent_bar
+        finite = xp.isfinite(tangent_bar).all() & xp.isfinite(state_bar).all()
+        if collect_forcing:
+            finite &= xp.isfinite(forcing_bar).all()
+        if not bool(finite):
+            raise FloatingPointError("The state/forcing Hessian action is not representable")
+        result = {"initial": tangent_bar}
+        if collect_forcing:
+            result["forcing"] = forcing_bar
+        return result
 
 
 def solve_strang(affine, initial, forcing, *, beta=0.0, load=None):

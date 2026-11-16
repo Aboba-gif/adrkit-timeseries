@@ -25,9 +25,10 @@ def _generator():
     return sparse.csr_matrix([[-2, 2, 0], [1, -4, 3], [0, 2, -2]], dtype=float)
 
 
-def _path(*, distributed=True, backend="numpy", beta=0.3, initial=None):
+def _path(*, distributed=True, backend="numpy", beta=0.3, initial=None, forcing=None):
     action = PositiveAffineAction(_generator(), -0.2, step=0.1, rate=5, degree=14, backend=backend)
-    forcing = np.full((6, 3), 0.2) if distributed else np.linspace(0.1, 0.4, 6)
+    if forcing is None:
+        forcing = np.full((6, 3), 0.2) if distributed else np.linspace(0.1, 0.4, 6)
     load = None if distributed else np.array([0.5, 0.0, 0.2])
     initial = [0.3, 0.5, 0.4] if initial is None else initial
     return solve_strang(action, initial, forcing, beta=beta, load=load)
@@ -338,3 +339,175 @@ def test_infeasible_initial_increment_is_rejected_without_projection():
     path = _path()
     with pytest.raises(ValueError, match="shifted initial state"):
         path.initial_increment([-0.31, 0, 0])
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+@pytest.mark.parametrize("distributed", [True, False])
+def test_joint_hessian_blocks_match_independent_one_step_scalar_formulas(
+    request, backend, distributed
+):
+    if backend == "cupy":
+        request.getfixturevalue("cupy")
+    initial, intensity, step, beta, terminal = 0.4, 0.3, 0.2, 0.7, 1.3
+    load = None if distributed else np.array([2.0])
+    load_factor = 1.0 if distributed else 2.0
+    forcing = np.array([[intensity]]) if distributed else np.array([intensity])
+    action = PositiveAffineAction(
+        sparse.csr_matrix((1, 1)), 0, step=step, rate=1, degree=14, backend=backend
+    )
+    path = solve_strang(action, [initial], forcing, beta=beta, load=load)
+    k = beta * step / 2
+    first = initial / (1 + k * initial)
+    middle = first + step * load_factor * intensity
+    first_slope = (1 + k * initial) ** -2
+    first_curvature = -2 * k * (1 + k * initial) ** -3
+    middle_slope = (1 + k * middle) ** -2
+    middle_curvature = -2 * k * (1 + k * middle) ** -3
+    huu = terminal * (middle_curvature * first_slope**2 + middle_slope * first_curvature)
+    huf = terminal * middle_curvature * first_slope * step * load_factor
+    hff = terminal * middle_curvature * (step * load_factor) ** 2
+    cotangent = [[0.6], [terminal]]
+    forcing_unit = np.ones_like(forcing)
+    initial_only = path.state_forcing_hvp(cotangent, d_initial=[1.0])
+    forcing_only = path.state_forcing_hvp(cotangent, d_forcing=forcing_unit)
+    both = path.state_forcing_hvp(cotangent, d_initial=[0.2], d_forcing=-0.4 * forcing_unit)
+    for result, expected_initial, expected_forcing in (
+        (initial_only, huu, huf),
+        (forcing_only, huf, hff),
+        (both, 0.2 * huu - 0.4 * huf, 0.2 * huf - 0.4 * hff),
+    ):
+        assert set(result) == {"initial", "forcing"}
+        assert result["forcing"].shape == forcing.shape
+        np.testing.assert_allclose(
+            action.to_host(result["initial"]), [expected_initial], rtol=4e-12, atol=2e-14
+        )
+        np.testing.assert_allclose(
+            action.to_host(result["forcing"]),
+            np.full_like(forcing, expected_forcing),
+            rtol=4e-12,
+            atol=2e-14,
+        )
+
+
+@pytest.mark.parametrize("distributed", [True, False])
+@pytest.mark.parametrize("mode", ["initial", "forcing", "both"])
+def test_joint_hessian_matches_finite_differences_of_both_pullback_outputs(distributed, mode):
+    initial = np.array([0.3, 0.5, 0.4])
+    forcing = np.full((6, 3), 0.2) if distributed else np.linspace(0.1, 0.4, 6)
+    path = _path(distributed=distributed, initial=initial, forcing=forcing)
+    rng = np.random.default_rng(5021)
+    cotangent = rng.normal(size=path.states.shape)
+    di = rng.normal(scale=0.1, size=3) if mode != "forcing" else np.zeros(3)
+    df = rng.normal(scale=0.1, size=forcing.shape) if mode != "initial" else np.zeros_like(forcing)
+    result = path.state_forcing_hvp(cotangent, d_initial=di, d_forcing=df)
+    epsilon = 1e-5
+    varied = [
+        _path(
+            distributed=distributed,
+            initial=initial + sign * epsilon * di,
+            forcing=forcing + sign * epsilon * df,
+        ).vjp(cotangent)
+        for sign in (1, -1)
+    ]
+    for key in ("initial", "forcing"):
+        difference = (varied[0][key] - varied[1][key]) / (2 * epsilon)
+        np.testing.assert_allclose(result[key], difference, rtol=7e-7, atol=3e-10)
+
+
+@pytest.mark.parametrize("distributed", [True, False])
+def test_mixed_state_forcing_blocks_obey_bilinear_symmetry(distributed):
+    path = _path(distributed=distributed)
+    rng = np.random.default_rng(6422)
+    cotangent = rng.normal(size=path.states.shape)
+    initial_direction = rng.normal(size=3)
+    forcing_direction = rng.normal(size=(6, 3) if distributed else (6,))
+    initial_only = path.state_forcing_hvp(cotangent, d_initial=initial_direction)
+    forcing_only = path.state_forcing_hvp(cotangent, d_forcing=forcing_direction)
+    left = initial_direction @ forcing_only["initial"]
+    right = np.sum(forcing_direction * initial_only["forcing"])
+    np.testing.assert_allclose(left, right, rtol=5e-12, atol=3e-14)
+    together = path.state_forcing_hvp(
+        cotangent, d_initial=initial_direction, d_forcing=forcing_direction
+    )
+    for key in ("initial", "forcing"):
+        np.testing.assert_allclose(
+            together[key], initial_only[key] + forcing_only[key], rtol=5e-12, atol=3e-14
+        )
+
+
+@pytest.mark.parametrize("distributed", [True, False])
+@pytest.mark.parametrize("mode", ["initial", "forcing", "both"])
+def test_joint_hessian_cpu_cuda_agreement_preserves_control_shapes(cupy, distributed, mode):
+    cpu = _path(distributed=distributed)
+    gpu = _path(distributed=distributed, backend="cupy")
+    rng = np.random.default_rng(4431)
+    cotangent = rng.normal(size=cpu.states.shape)
+    di = rng.normal(size=3) if mode != "forcing" else None
+    df = rng.normal(size=(6, 3) if distributed else (6,)) if mode != "initial" else None
+    expected = cpu.state_forcing_hvp(cotangent, d_initial=di, d_forcing=df)
+    actual = gpu.state_forcing_hvp(
+        cupy.asarray(cotangent),
+        d_initial=None if di is None else cupy.asarray(di),
+        d_forcing=None if df is None else cupy.asarray(df),
+    )
+    for key in ("initial", "forcing"):
+        assert isinstance(actual[key], cupy.ndarray) and actual[key].dtype == cupy.float64
+        assert actual[key].shape == expected[key].shape
+        np.testing.assert_allclose(
+            cupy.asnumpy(actual[key]), expected[key], rtol=5e-11, atol=4e-13
+        )
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+@pytest.mark.parametrize("distributed", [True, False])
+def test_zero_beta_and_no_steps_have_zero_joint_hessian_blocks(request, backend, distributed):
+    if backend == "cupy":
+        request.getfixturevalue("cupy")
+    path = _path(backend=backend, distributed=distributed, beta=0)
+    forcing_direction = np.full((6, 3) if distributed else (6,), -0.1)
+    result = path.state_forcing_hvp(
+        np.ones(path.states.shape), d_initial=[-0.2, 0.1, 0.3], d_forcing=forcing_direction
+    )
+    for key, shape in (("initial", (3,)), ("forcing", forcing_direction.shape)):
+        np.testing.assert_array_equal(path.affine.to_host(result[key]), np.zeros(shape))
+    empty_forcing = np.empty((0, 3)) if distributed else np.empty(0)
+    empty_path = solve_strang(
+        path.affine,
+        [0.3, 0.5, 0.4],
+        empty_forcing,
+        beta=0.3,
+        load=None if distributed else [0.5, 0, 0.2],
+    )
+    result = empty_path.state_forcing_hvp(
+        [[1, -2, 0.5]], d_initial=[0.1, -0.2, 0.3], d_forcing=empty_forcing
+    )
+    np.testing.assert_array_equal(path.affine.to_host(result["initial"]), np.zeros(3))
+    assert result["forcing"].shape == empty_forcing.shape
+
+
+def test_initial_wrapper_uses_shared_kernel_without_allocating_forcing_output(monkeypatch):
+    path = _path()
+    cotangent = np.ones(path.states.shape)
+    direction = [0.1, -0.2, 0.3]
+    expected = path.state_forcing_hvp(cotangent, d_initial=direction)["initial"]
+    original = np.zeros_like
+
+    def guard(value, *args, **kwargs):
+        assert value is not path._forcing, "Initial-only action must not allocate forcing output"
+        return original(value, *args, **kwargs)
+
+    monkeypatch.setattr(np, "zeros_like", guard)
+    np.testing.assert_array_equal(path.initial_hvp(cotangent, direction), expected)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+def test_tiny_forcing_direction_has_representable_hessian_under_huge_reaction(request, backend):
+    if backend == "cupy":
+        request.getfixturevalue("cupy")
+    action = PositiveAffineAction(
+        sparse.csr_matrix((1, 1)), 0, step=2, rate=1, degree=14, backend=backend
+    )
+    path = solve_strang(action, [0], [[0]], beta=1e308)
+    result = path.state_forcing_hvp([[0], [1]], d_forcing=[[1e-308]])
+    np.testing.assert_allclose(action.to_host(result["initial"]), [-4], rtol=5e-12)
+    np.testing.assert_allclose(action.to_host(result["forcing"]), [[-8]], rtol=5e-12)
