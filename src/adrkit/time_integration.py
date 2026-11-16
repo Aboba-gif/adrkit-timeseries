@@ -324,6 +324,8 @@ class PositiveAffineAction:
     P=I+Q/rate. Транспортные пуассоновы веса нормируются к единице,
     интегральные источниковые — к S=step*exprel(alpha*step).
     rate и degree не дифференцируются. Все входные матрицы копируются.
+    При backend='cupy' вызывающий код сохраняет текущее CUDA-устройство,
+    выбранное при создании объекта, на всё время его использования.
     """
 
     size: int
@@ -560,7 +562,7 @@ class PositiveAffineAction:
             None if dQ is None else _matrix(dQ, "dQ", self.size, xp=xp) / self.rate,
             _scalar(dalpha, "dalpha"),
         )
-        if xp is not np and not xp.isfinite(result).all():
+        if not xp.isfinite(result).all():
             raise FloatingPointError("The affine tangent is not representable")
         return result
 
@@ -596,17 +598,16 @@ class PositiveAffineAction:
             _owned(cotangent, "cotangent", shape=(self.size,), xp=xp),
             partials,
         )
-        if xp is not np:
-            scalars = xp.stack(
-                [
-                    xp.asarray(pulled["alpha"]),
-                    *(xp.asarray(value) for value in pulled["operator"].values()),
-                ]
-            )
-            if not xp.isfinite(xp.concatenate((pulled["u"], pulled["f"], scalars))).all():
-                raise FloatingPointError("The affine pullback is not representable")
-            pulled["alpha"] = float(pulled["alpha"])
-            pulled["operator"] = {key: float(value) for key, value in pulled["operator"].items()}
+        scalars = xp.stack(
+            [
+                xp.asarray(pulled["alpha"]),
+                *(xp.asarray(value) for value in pulled["operator"].values()),
+            ]
+        )
+        if not xp.isfinite(xp.concatenate((pulled["u"], pulled["f"], scalars))).all():
+            raise FloatingPointError("The affine pullback is not representable")
+        pulled["alpha"] = float(pulled["alpha"])
+        pulled["operator"] = {key: float(value) for key, value in pulled["operator"].items()}
         return pulled
 
     def jvp_many(
@@ -640,8 +641,9 @@ class PositiveAffineAction:
         Returns
         -------
         tangent : ndarray, shape (N, K)
-            Те же производные, что отдельные JVP при фиксированных rate,
-            degree и весах. Базовые степени P общие для всех столбцов.
+            Те же производные, что отдельные JVP при фиксированных rate
+            и degree; изменение весов по alpha учитывается. Базовые
+            степени P общие для всех столбцов.
         """
         xp = self._xp
         u, f = _owned(u, "u", shape=(self.size,), nonnegative=True, xp=xp), _owned(
@@ -659,7 +661,7 @@ class PositiveAffineAction:
             operator_partials, operator_directions, count, self.size, self.rate, xp=xp
         )
         result = self._tangent_many(self._powers(u, f), du, df, partials, directions, dalpha)
-        if xp is not np and not xp.isfinite(result).all():
+        if not xp.isfinite(result).all():
             raise FloatingPointError("The affine tangent is not representable")
         return result
 
@@ -671,8 +673,9 @@ class StrangTrajectory:
     Attributes
     ----------
     states : numpy.ndarray or cupy.ndarray, shape (nt+1, N)
-        Состояния, включая начальное. NumPy возвращает неизменяемый массив;
-        CuPy — независимую копию, поскольку у устройства нет WRITEABLE-флага.
+        Состояния, включая начальное. NumPy возвращает заимствованный массив
+        с выключенным WRITEABLE; потребитель сохраняет этот режим чтения.
+        CuPy возвращает независимую копию на выбранном устройстве.
     polynomial_error_bound : float
         Накопленная оценка только усечения полиномов в бесконечной норме,
         в единице состояния.
@@ -704,7 +707,7 @@ class StrangTrajectory:
 
     @property
     def states(self):
-        """Сохранённые состояния без возможности изменить внутреннюю траекторию."""
+        """Состояния: заимствованный readonly-массив CPU или независимая копия GPU."""
         if self.affine.array_module is np:
             # NumPy deepcopy/pickle may restore an owned array as writable.
             return _readonly(self._states, np)
@@ -792,7 +795,9 @@ class StrangTrajectory:
         sensitivities : numpy.ndarray or cupy.ndarray, shape (N, K)
             Собственные матрицы для начального и последующих временных узлов.
             NumPy запрещает запись; CuPy выдаёт независимые копии. Если
-            потребитель не хранит прежние матрицы, память не растёт как nt*N*K.
+            потребитель не хранит прежние матрицы, выходная память не растёт
+            как nt*N*K. Исходная траектория и входные направления остаются
+            в памяти; распределённый d_forcing сам имеет форму (nt,N,K).
             На GPU накопленная проверка конечности завершается при полном
             исчерпании итератора. Прямой шаг не изменяется.
         """
@@ -939,18 +944,17 @@ class StrangTrajectory:
             contribution = pulled["u"] @ db
             beta_bar += float(contribution) if xp is np else contribution
             state_bar = cotangent[n] + pulled["u"] * du
-        if xp is not np:
-            scalars = xp.stack(
-                [
-                    xp.asarray(alpha_bar),
-                    xp.asarray(beta_bar),
-                    *(xp.asarray(value) for value in operator_bar.values()),
-                ]
-            )
-            if not xp.isfinite(xp.concatenate((state_bar, forcing_bar.ravel(), scalars))).all():
-                raise FloatingPointError("The trajectory pullback is not representable")
-            alpha_bar, beta_bar = float(alpha_bar), float(beta_bar)
-            operator_bar = {name: float(value) for name, value in operator_bar.items()}
+        scalars = xp.stack(
+            [
+                xp.asarray(alpha_bar),
+                xp.asarray(beta_bar),
+                *(xp.asarray(value) for value in operator_bar.values()),
+            ]
+        )
+        if not xp.isfinite(xp.concatenate((state_bar, forcing_bar.ravel(), scalars))).all():
+            raise FloatingPointError("The trajectory pullback is not representable")
+        alpha_bar, beta_bar = float(alpha_bar), float(beta_bar)
+        operator_bar = {name: float(value) for name, value in operator_bar.items()}
         return {
             "initial": state_bar,
             "forcing": forcing_bar,

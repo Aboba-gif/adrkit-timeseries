@@ -26,6 +26,26 @@ def generator():
     return sparse.csr_matrix([[-2.0, 2.0, 0.0], [1.0, -4.0, 3.0], [0.0, 2.0, -2.0]])
 
 
+@pytest.mark.parametrize("backend", ["numpy", "cupy"])
+@pytest.mark.parametrize("operation", ["jvp", "jvp_many", "vjp", "trajectory_vjp"])
+def test_public_derivative_rejects_overflow_for_both_backends(request, backend, operation):
+    if backend == "cupy":
+        request.getfixturevalue("cupy")
+    affine = PositiveAffineAction(
+        sparse.csr_matrix((1, 1)), 0.0, step=1, rate=1, degree=2, backend=backend
+    )
+    with np.errstate(over="ignore", invalid="ignore"), pytest.raises(FloatingPointError):
+        if operation == "jvp":
+            affine.jvp([1.0], [0.0], du=[1e308], dalpha=1e308)
+        elif operation == "jvp_many":
+            affine.jvp_many([1.0], [0.0], [[1e308]], dalpha=[1e308])
+        elif operation == "vjp":
+            affine.vjp([2.0], [0.0], [1e308])
+        else:
+            trajectory = solve_strang(affine, [2.0], [[0.0]])
+            trajectory.vjp([[0.0], [1e308]])
+
+
 def test_device_stream_reports_nonfinite_tangent_when_fully_consumed(cupy):
     affine = action(generator(), "cupy", alpha=1.0)
     trajectory = solve_strang(
