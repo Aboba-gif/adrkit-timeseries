@@ -6,9 +6,11 @@ import numpy as np
 import pytest
 
 from adrkit.inverse.design import (
+    CenteredBudgetGoalRisk,
     CovarianceFactor,
     DesignCandidate,
     affine_goal_risk,
+    centered_budget_goal_risk,
     innovation_covariance_budget,
     joint_moment_risk,
     profile_information,
@@ -214,6 +216,169 @@ def test_joint_moment_result_owns_immutable_mean_error():
 def test_joint_moment_risk_rejects_negative_joint_variance():
     with pytest.raises(ValueError):
         joint_moment_risk([[1.0, 0.0]], [0.0], [0.0, 0.0], [[1.0, 2.0], [2.0, 1.0]])
+
+
+def test_centered_budget_risk_matches_joint_moments_with_correlated_low_rank_physics():
+    B = np.array([[0.7, -0.2, 0.3], [-0.1, 0.5, 0.4]])
+    O = np.array([[0.2, -0.1], [0.1, 0.3], [-0.2, 0.1]])
+    T = np.array([[0.6, 0.2], [-0.3, 0.7]])
+    innovation = np.array([[1.0, 0.0, 0.0], [0.2, 1.0, 0.0], [-0.1, 0.3, 1.0]])
+    inverse = np.linalg.solve(innovation, np.eye(3))
+    innovation_factor = 2 * np.eye(3)
+    physical_factor = np.array([[0.4], [0.8]])
+    mean = np.array([-0.3, 0.5])
+    offset = np.array([0.3, -0.2])
+    physical_innovation = innovation @ O @ physical_factor
+    data = B @ inverse @ innovation_factor
+    observed, target = B @ O @ physical_factor, T @ physical_factor
+    coefficients = []
+    for scale in (0.0, 0.2, 0.7, 1.0):
+        residual = innovation_factor @ innovation_factor.T - scale**2 * (
+            physical_innovation @ physical_innovation.T
+        )
+        joint_factor = np.zeros((5, 4))
+        joint_factor[:2, :1] = physical_factor
+        joint_factor[2:, 1:] = np.linalg.cholesky(residual)
+        # One xi enters the data and target; the residual is independent and centered jointly.
+        joint_mean = np.r_[mean, -scale * innovation @ O @ mean]
+        error_map = np.column_stack((scale * (B @ O - T), B @ inverse))
+        reference = joint_moment_risk(
+            error_map, offset, joint_mean, CovarianceFactor(joint_factor)
+        )
+        result = centered_budget_goal_risk(
+            offset, data, observed, target, T @ mean, max_scale=scale
+        )
+        assert isinstance(result, CenteredBudgetGoalRisk)
+        np.testing.assert_allclose(result.value_at_max_scale, reference.value, rtol=3e-14)
+        np.testing.assert_allclose(reference.mean_error, offset - scale * T @ mean, atol=1e-15)
+        coefficients.append([result.d, result.h, result.a])
+    np.testing.assert_allclose(coefficients, np.tile(coefficients[0], (4, 1)), rtol=1e-15)
+    missing_cross_term = np.linalg.norm(T @ mean) ** 2 + np.linalg.norm(target) ** 2
+    assert result.a != pytest.approx(missing_cross_term)
+
+
+def test_centered_budget_risk_finds_a_concave_interior_maximum():
+    # O=T=B=1, total variance=1; residual variance 1-s**2 is PSD on [0,1].
+    # With E[xi]=-1/2, R(s)=(1+s/2)**2+1-s**2=2+s-3*s**2/4.
+    result = centered_budget_goal_risk([1.0], [[1.0]], [[1.0]], [[1.0]], [-0.5], max_scale=1)
+    np.testing.assert_allclose([result.d, result.h, result.a], [2.0, -0.5, -0.75])
+    assert result.value_at_zero == 2.0 and result.value_at_max_scale == 2.25
+    np.testing.assert_allclose([result.vertex_scale, result.argmax], [2 / 3, 2 / 3])
+    np.testing.assert_allclose([result.vertex_value, result.value], [7 / 3, 7 / 3])
+    truncated = centered_budget_goal_risk([1.0], [[1.0]], [[1.0]], [[1.0]], [-0.5], max_scale=0.25)
+    assert truncated.vertex_scale is None and truncated.vertex_value is None
+    assert truncated.argmax == 0.25 and truncated.value == truncated.value_at_max_scale
+
+
+def test_centered_budget_risk_keeps_mean_with_empty_factors_and_labels_convex_vertex():
+    empty = np.empty((1, 0))
+    # Deterministic physical change: R(s)=(1-2*s)**2; its vertex is a minimum.
+    result = centered_budget_goal_risk([1.0], empty, empty, empty, [2.0], max_scale=1)
+    assert result.vertex_scale == 0.5 and result.vertex_value == 0.0
+    assert result.value_at_zero == result.value_at_max_scale == result.value == 1.0
+    assert result.argmax == 0.0
+    zero_interval = centered_budget_goal_risk([1.0], empty, empty, empty, [2.0], max_scale=0)
+    assert zero_interval.value == 1 and zero_interval.argmax == 0
+    assert zero_interval.vertex_scale is None
+
+
+def test_centered_budget_risk_accepts_exact_zero_boundary_cancellation():
+    result = centered_budget_goal_risk([0.0], [[1.0]], [[1.0]], [[1.0]], [0.0], max_scale=1)
+    assert result.a == -1 and result.value_at_max_scale == 0.0
+    assert result.value == 1 and result.argmax == 0
+
+
+def test_centered_budget_risk_preserves_common_latent_rotation():
+    data = np.array([[2.0, 0.0], [0.0, 2.0]])
+    observed = np.array([[0.2, 0.1], [-0.3, 0.4]])
+    target = np.array([[0.5, -0.2], [0.1, 0.3]])
+    rotation = np.array([[0.0, -1.0], [1.0, 0.0]])
+    reference = centered_budget_goal_risk(
+        [0.3, -0.2], data, observed, target, [-0.1, 0.2], max_scale=1
+    )
+    rotated = centered_budget_goal_risk(
+        [0.3, -0.2],
+        data @ rotation,
+        observed @ rotation,
+        target @ rotation,
+        [-0.1, 0.2],
+        max_scale=1,
+    )
+    np.testing.assert_allclose(
+        [reference.d, reference.h, reference.a, reference.value, reference.argmax],
+        [rotated.d, rotated.h, rotated.a, rotated.value, rotated.argmax],
+        rtol=1e-14,
+    )
+
+
+@pytest.mark.parametrize("mean", [0.0, 2.0])
+def test_centered_budget_risk_rejects_negative_endpoint_or_convex_interior(mean):
+    # Total data variance zero cannot fund the physical data variance 1.
+    # mean=2 has nonnegative endpoints but a negative interior minimum.
+    with pytest.raises(ValueError, match="negative.*incompatible.*cancellation"):
+        centered_budget_goal_risk(
+            [0.0 if mean == 0 else 1.0],
+            np.empty((1, 0)),
+            [[1.0]],
+            [[1.0]],
+            [mean],
+            max_scale=1,
+        )
+
+
+def test_centered_budget_risk_requires_an_explicit_physical_mean():
+    with pytest.raises(TypeError):
+        centered_budget_goal_risk([1.0], [[1.0]], [[0.1]], [[0.2]], max_scale=1)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("offset", [[1.0]]),
+        ("offset", []),
+        ("offset", [1j]),
+        ("total_data_factor", [[1.0], [2.0]]),
+        ("total_data_factor", [1.0]),
+        ("physical_target_factor", [[0.2, 0.3]]),
+        ("physical_target_mean", None),
+        ("physical_target_mean", [np.nan]),
+        ("physical_data_factor", [[np.inf]]),
+        ("offset", np.ma.array([1.0], mask=[True])),
+        ("max_scale", -0.1),
+        ("max_scale", 1.1),
+        ("max_scale", True),
+    ],
+)
+def test_centered_budget_risk_rejects_invalid_inputs(key, value):
+    inputs = dict(
+        offset=[1.0],
+        total_data_factor=[[1.0]],
+        physical_data_factor=[[0.1]],
+        physical_target_factor=[[0.2]],
+        physical_target_mean=[0.5],
+        max_scale=1,
+    )
+    inputs[key] = value
+    with pytest.raises(ValueError):
+        centered_budget_goal_risk(**inputs)
+
+
+@pytest.mark.parametrize("offset", [3e154, float.fromhex("0x0.0000000000001p-1022")])
+def test_centered_budget_risk_rejects_unrepresentable_required_energy(offset):
+    with pytest.raises(ValueError):
+        centered_budget_goal_risk([offset], [[0.0]], [[0.0]], [[0.0]], [0.0], max_scale=1)
+
+
+def test_centered_budget_risk_result_is_immutable_and_independent_of_inputs():
+    offset, data = np.array([1.0]), np.array([[1.0]])
+    observed, target, mean = np.array([[0.1]]), np.array([[0.2]]), np.array([0.5])
+    result = centered_budget_goal_risk(offset, data, observed, target, mean, max_scale=1)
+    saved = (result.d, result.h, result.a, result.value)
+    for array in (offset, data, observed, target, mean):
+        array[:] = 9.0
+    assert (result.d, result.h, result.a, result.value) == saved
+    with pytest.raises(AttributeError):
+        result.value = 0.0
 
 
 def assert_ball_result(result, a, matrix, radius, expected, *, atol=2e-10):

@@ -572,7 +572,10 @@ def test_nonnegative_observation_analysis_recovers_independent_full_covariance_k
 
 
 @pytest.mark.parametrize("covariance", [[], np.empty((0, 0))])
-def test_nonnegative_observation_analysis_without_observations(covariance):
+def test_nonnegative_observation_analysis_without_observations(covariance, monkeypatch):
+    monkeypatch.setattr(
+        np.linalg, "svd", lambda *a, **k: pytest.fail("A certified empty analysis needs no SVD")
+    )
     result = analyze_nonnegative_observations(
         [-2.0, 3.0, 0.0], np.empty((0, 3)), [], [2.0, 4.0, 1.0], covariance
     )
@@ -623,8 +626,98 @@ def test_nonnegative_observation_analysis_rejects_nonfinite_arithmetic(
         analyze_nonnegative_observations(reference, observation, [0.0], mass, [1.0])
 
 
-def test_nonnegative_observation_analysis_reports_iteration_limit_as_uncertified():
+def test_nonnegative_observation_analysis_polishes_a_valid_face_after_the_dual_step_limit():
+    result = analyze_nonnegative_observations(
+        [3.0, 2.0, 0.0],
+        [[1.0, 1.0, 1.0]],
+        [0.5],
+        [1.0, 1.0, 1.0],
+        [0.01],
+        maxiter=1,
+    )
+    # The final face has only U_0 free: (U_0-3)+100*(U_0-.5)=0.
+    expected = np.array([53 / 101, 0.0, 0.0])
+    np.testing.assert_allclose(result.x, expected, atol=1e-12)
+    gradient = result.x - [3.0, 2.0, 0.0] + 100 * (np.sum(result.x) - 0.5)
+    assert gradient[0] == pytest.approx(0.0, abs=1e-11)
+    assert np.all(gradient[1:] > 0)
+    assert result.nit == 1 and result.linear_solver == "active_face_svd"
+    assert result.diagnostics["kkt_residual_inf"] <= 1e-10
+
+
+def test_nonnegative_observation_analysis_rejects_a_polished_face_with_negative_free_state():
+    # After one dual step F={0,1}; its unconstrained face solution has U_1<0.
+    # The true solution needs another face change. It must not be obtained by clipping.
     with pytest.raises(RuntimeError, match="uncertified"):
+        analyze_nonnegative_observations(
+            [3.0, 2.0, 1.0, -10.0],
+            [[1.0, 1.0, 1.0, 1.0]],
+            [0.5],
+            [1.0, 1.0, 1.0, 1.0],
+            [0.01],
+            maxiter=1,
+        )
+
+
+@pytest.mark.parametrize("small_mass", [2.0**-20, 2.0**-40])
+def test_nonnegative_observation_analysis_handles_overlapping_rows_and_small_precision(small_mass):
+    reference = np.array([1.0, 2.0, 3.0])
+    observation = np.ones((2, 3))
+    mass = small_mass * np.array([1.0, 2.0, 4.0])
+    target = np.array([6.0, 8.0])
+    # The inconsistent duplicate rows leave O(1) dual components whose sum is O(mass).
+    # The unique exact primal solution depends on the average target, equal to seven.
+    expected = reference + np.array([2.0, 1.0, 0.5]) / (small_mass + 3.5)
+    result = analyze_nonnegative_observations(
+        reference,
+        observation,
+        target,
+        mass,
+        [1.0, 1.0],
+        maxiter=1,
+    )
+    np.testing.assert_allclose(observation @ result.x, observation @ expected, rtol=0, atol=1e-10)
+    expected_objective = 0.5 * np.dot(
+        mass * (expected - reference), expected - reference
+    ) + 0.5 * np.dot(observation @ expected - target, observation @ expected - target)
+    assert result.fun == pytest.approx(expected_objective, rel=1e-12, abs=1e-12)
+    assert result.diagnostics["kkt_residual_inf"] <= 1e-10
+    residual = observation @ result.x - target
+    gradient = mass * (result.x - reference) + observation.T @ residual
+    np.testing.assert_allclose(gradient, 0.0, atol=1e-10)
+    np.testing.assert_allclose(residual, result.observation_multipliers, atol=1e-10)
+
+
+def test_nonnegative_observation_analysis_certifies_an_empty_terminal_face(monkeypatch):
+    # A stalled normal solve leaves U=0. Here the original bound KKT really holds.
+    monkeypatch.setattr(np.linalg, "solve", lambda matrix, rhs: np.zeros_like(rhs))
+    native_svd = np.linalg.svd
+
+    def no_face_svd(*args, **kwargs):
+        if kwargs.get("full_matrices") is False:
+            pytest.fail("An empty free face has no matrix to factor")
+        return native_svd(*args, **kwargs)
+
+    monkeypatch.setattr(np.linalg, "svd", no_face_svd)
+    result = analyze_nonnegative_observations([0.0], [[1.0]], [-1.0], [1.0], [1.0], maxiter=1)
+    np.testing.assert_array_equal(result.x, [0.0])
+    np.testing.assert_array_equal(result.lower_multipliers, [1.0])
+    assert result.nit == 1 and result.linear_solver == "active_face_svd"
+    assert result.diagnostics["kkt_residual_inf"] == 0.0
+
+
+def test_nonnegative_observation_analysis_keeps_original_failure_if_terminal_svd_fails(
+    monkeypatch,
+):
+    native_svd = np.linalg.svd
+
+    def failed_face_svd(*args, **kwargs):
+        if kwargs.get("full_matrices") is False:
+            raise np.linalg.LinAlgError("Controlled terminal SVD failure")
+        return native_svd(*args, **kwargs)
+
+    monkeypatch.setattr(np.linalg, "svd", failed_face_svd)
+    with pytest.raises(RuntimeError, match="uncertified after 1 steps"):
         analyze_nonnegative_observations(
             [3.0, 2.0, 0.0],
             [[1.0, 1.0, 1.0]],

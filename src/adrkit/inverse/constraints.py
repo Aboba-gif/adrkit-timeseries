@@ -592,6 +592,8 @@ def analyze_nonnegative_observations(
         дополнительности и двойственной связи.
     maxiter, max_backtracks : int, optional
         Положительные пределы двойственных шагов и сокращений шага.
+        После неудачного окончания этих шагов отдельно проверяется прямое
+        SVD-решение на последней свободной грани; nit считает двойственные шаги.
 
     Returns
     -------
@@ -623,6 +625,13 @@ def analyze_nonnegative_observations(
     Обрезание является точным решением ортантной подзадачи, а не исправлением
     найденного неограниченного анализа. Успех оптимизатора не заменяет
     отдельную проверку градиента исходного функционала.
+
+    Если двойственные шаги не прошли исходную проверку, на последней грани
+    U>0 один раз решается квадратичная задача Тихонова через тонкое SVD матрицы
+    L^(-1) H_F M_F^(-1/2), без формирования её матрицы Грама. Остальные
+    координаты равны нулю. Отрицательные компоненты не обрезаются: такая
+    грань отвергается. Возврат допускается только после той же проверки
+    исходных ККТ; linear_solver='active_face_svd' отмечает этот путь.
     """
     r = real_array(reference, name="reference", copy=True)
     h = real_array(observation, name="observation", copy=True)
@@ -779,6 +788,31 @@ def analyze_nonnegative_observations(
             step *= 0.5
         else:
             break
+    # Solve the same quadratic on the final free face without forming a Gram
+    # matrix. Its admissibility is decided by the unchanged original KKT check.
+    try:
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            positive = u > 0
+            candidate = np.zeros_like(r)
+            if np.any(positive):
+                root_mass = np.sqrt(m[positive])
+                observation = hw[:, positive]
+                left, singular, right = np.linalg.svd(observation / root_mass, full_matrices=False)
+                gain = np.empty_like(singular)
+                large = singular >= 1
+                gain[large] = 1 / (singular[large] + 1 / singular[large])
+                gain[~large] = singular[~large] / (1 + singular[~large] ** 2)
+                rhs = dw - observation @ r[positive]
+                candidate[positive] = r[positive] + (right.T @ (gain * (left.T @ rhs))) / root_mass
+            if np.isfinite(candidate).all() and np.all(candidate >= 0):
+                candidate_dual = hw @ candidate - dw
+                if np.isfinite(candidate_dual).all():
+                    result = certify(candidate, candidate_dual, iteration)
+                    if result is not None:
+                        result["linear_solver"] = "active_face_svd"
+                        return result
+    except (np.linalg.LinAlgError, FloatingPointError, OverflowError, RuntimeError):
+        pass
     raise RuntimeError(
         f"Nonnegative observation analysis is uncertified after {iteration} steps; "
         f"KKT residual exceeds {tolerance:.6g}"

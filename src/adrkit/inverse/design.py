@@ -6,6 +6,7 @@
 """
 
 from dataclasses import dataclass
+from math import fsum
 from operator import index
 
 import numpy as np
@@ -269,6 +270,180 @@ def joint_moment_risk(K, offset, mean, covariance):
         mean_error.shape
     )
     return JointMomentRisk(immutable_mean, squared_bias, variance, value)
+
+
+@dataclass(frozen=True)
+class CenteredBudgetGoalRisk:
+    """Риск одной цели на интервале общего физического сжатия.
+
+    d, h и a задают R(s)=d-2*h*s+a*s**2. value_at_zero и
+    value_at_max_scale — значения на концах [0,max_scale]. vertex_scale
+    и vertex_value описывают внутреннюю стационарную точку, если она есть:
+    при a>0 это минимум, а не кандидат на внутренний максимум.
+    value — максимум, argmax — наименьший из вычисленных максимизаторов.
+    Все поля скалярны и неизменяемы; FP64 не даёт интервального сертификата.
+    """
+
+    d: float
+    h: float
+    a: float
+    max_scale: float
+    value_at_zero: float
+    value_at_max_scale: float
+    vertex_scale: float | None
+    vertex_value: float | None
+    value: float
+    argmax: float
+
+
+def centered_budget_goal_risk(
+    offset,
+    total_data_factor,
+    physical_data_factor,
+    physical_target_factor,
+    physical_target_mean,
+    *,
+    max_scale,
+):
+    r"""Максимизировать центрированный риск цели по общей доле физического бюджета.
+
+    Parameters
+    ----------
+    offset : array_like, shape (k,)
+        Явное номинальное смещение c в координатах выбранной цели, k>=1.
+    total_data_factor : array_like, shape (k, r_d)
+        B@R_d, где R_d@R_d.T=C_d — общий ковариационный бюджет данных.
+        Все целевые метрики уже входят в B. Допустим r_d=0.
+    physical_data_factor, physical_target_factor : array_like, shape (k, r)
+        B@O@R_0 и T@R_0 при C_0=R_0@R_0.T. Столбцы двух факторов
+        относятся к одним и тем же физическим направлениям; r=0 допустимо.
+        Они не масштабированы текущим s. Перекрёстные моменты не удаляются.
+    physical_target_mean : array_like, shape (k,)
+        Явный T@mu_0. Нулевое среднее не предполагается; даже при r=0
+        средняя физическая цель может быть ненулевой.
+    max_scale : float
+        Общее s_max в [0,1]. Верхняя граница 1 выражает сжатие исходных
+        физических сценариев к общей опоре, как в формуле (73).
+
+    Returns
+    -------
+    CenteredBudgetGoalRisk
+        Коэффициенты d,h,a, значения концов и внутренней стационарной точки,
+        максимум и его аргумент. При точной вычисленной ничьей выбирается
+        меньший масштаб. Нулевой интервал возвращает только значение R(0).
+
+    Notes
+    -----
+    Для центрированных данных E[delta d]=0 и физической цели s*T*xi_0
+    при независимом остатке с ковариацией C_d-s**2*O*C_0*O.T получаем
+    d=||c||**2+||B R_d||_F**2, h=c.T@(T mu_0),
+    a=||T mu_0||**2+||T R_0||_F**2-2*<B O R_0,T R_0>_F.
+    Матрица H и плотная ковариация физических входов не строятся.
+
+    Вызывающий код обязан обеспечить положительную полуопределённость
+    общего остаточного бюджета на всём интервале, согласованность факторов,
+    центрирование остаточного среднего и допустимость физического закона.
+    По целевым проекциям эти условия не удостоверяются. Номиналы, метрики,
+    параметры регуляризации и ветви должны оставаться фиксированными.
+
+    Скалярные суммы компенсируются, но сокращение в FP64 всё ещё возможно.
+    Отрицательное вычисленное значение на конце или во внутреннем экстремуме
+    вызывает ошибку: это несовместимость входов либо неразрешённое численное
+    сокращение, а не отдельный сертификат нарушения PSD. Обнуление, допуски
+    отрицательности и поправки к ковариациям не применяются.
+
+    Raises
+    ------
+    ValueError
+        Неверные формы, невещественные/неконечные входы, масштаб вне [0,1],
+        непредставимые требуемые значения или отрицательный вычисленный риск.
+    """
+    inputs = (
+        offset,
+        total_data_factor,
+        physical_data_factor,
+        physical_target_factor,
+        physical_target_mean,
+        max_scale,
+    )
+    if any(np.ma.isMaskedArray(value) for value in inputs):
+        raise ValueError("Centered budget inputs cannot be masked arrays")
+    c = real_array(offset, name="centered goal offset")
+    mean = real_array(physical_target_mean, name="physical target mean")
+    data = _matrix(total_data_factor, "total data goal factor")
+    observed = _matrix(physical_data_factor, "physical data goal factor")
+    target = _matrix(physical_target_factor, "physical target goal factor")
+    limit = real_scalar(max_scale, name="maximum physical scale")
+    if (
+        c.ndim != 1
+        or not c.size
+        or mean.shape != c.shape
+        or data.shape[0] != c.size
+        or observed.shape != target.shape
+        or observed.shape[0] != c.size
+    ):
+        raise ValueError("Centered budget goal vectors and factor rows/columns disagree")
+    if not 0 <= limit <= 1:
+        raise ValueError("Maximum physical scale must lie in [0,1]")
+    try:
+        with np.errstate(over="raise", invalid="raise", divide="raise", under="raise"):
+            d = real_scalar(
+                fsum((_square_norm(c, "offset energy"), _square_norm(data, "data energy"))),
+                name="centered constant coefficient",
+            )
+            h = real_scalar(fsum((c * mean).ravel()), name="centered mean cross term")
+            cross = real_scalar(
+                fsum((observed * target).ravel()), name="physical data-target cross term"
+            )
+            a = real_scalar(
+                fsum(
+                    (
+                        _square_norm(mean, "physical target mean energy"),
+                        -cross,
+                        _square_norm(target, "physical target energy"),
+                        -cross,
+                    )
+                ),
+                name="centered quadratic coefficient",
+            )
+
+            def risk(scale):
+                if scale == 0:
+                    return d
+                linear = np.multiply(h, scale)
+                quadratic = np.multiply(np.multiply(a, scale), scale)
+                value = real_scalar(
+                    fsum((d, -linear, -linear, quadratic)), name="centered goal risk"
+                )
+                if value < 0:
+                    raise ValueError(
+                        "A centered risk value is negative: incompatible inputs or "
+                        "unresolved FP64 cancellation; no PSD conclusion is certified"
+                    )
+                return value
+
+            endpoint = risk(limit)
+            vertex, vertex_value = None, None
+            # Only h/a in (0,1) can be interior; avoid an overflowing exterior ratio.
+            if limit > 0 and a * np.sign(h) > 0 and 0 < abs(h) < abs(a):
+                candidate = real_scalar(np.divide(h, a), name="stationary physical scale")
+                if candidate == 0:
+                    raise ValueError(
+                        "An interior physical scale underflowed; rescale target units"
+                    )
+                if candidate < limit:
+                    vertex, vertex_value = candidate, risk(candidate)
+    except (FloatingPointError, OverflowError) as error:
+        raise ValueError(
+            "Centered budget arithmetic lost its scale; rescale the target units"
+        ) from error
+    points = [(0.0, d), (limit, endpoint)]
+    if vertex is not None:
+        points.append((vertex, vertex_value))
+    argmax, maximum = min(points, key=lambda pair: (-pair[1], pair[0]))
+    return CenteredBudgetGoalRisk(
+        d, h, a, limit, d, endpoint, vertex, vertex_value, maximum, argmax
+    )
 
 
 @dataclass(frozen=True)
