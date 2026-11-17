@@ -6,8 +6,10 @@
 """
 
 from dataclasses import dataclass
+from collections.abc import Mapping
 from math import fsum
 from operator import index
+from types import MappingProxyType
 
 import numpy as np
 from scipy.linalg import solve_triangular
@@ -1010,3 +1012,256 @@ def select_designs(candidates, baselines, *, budgets, mode="exact"):
             )
         )
     return tuple(results)
+
+
+@dataclass(frozen=True)
+class UnresolvedDesign:
+    """Явно неоценённая конфигурация, не бесконечный или плохой риск.
+
+    reason описывает недостающую научную оценку, например неустановленную
+    производную выбранной ветви. Исключения вычислителя не преобразуются
+    в этот результат автоматически.
+    """
+
+    reason: str
+
+    def __post_init__(self):
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise ValueError("An unresolved design requires a nonempty reason")
+
+
+@dataclass(frozen=True)
+class FiniteDesignResult:
+    """Конечный строгий спуск по составу с полным обследованием соседства.
+
+    selected — текущая оценённая конфигурация, либо None при unresolved_start.
+    path содержит только путь данного вызова, начиная с полного пула или
+    явного resume_from. evaluations — неизменяемый кэш по точным frozenset,
+    со значениями Mapping нормированных рисков либо UnresolvedDesign.
+    frontier содержит всё допустимое финальное add/delete/swap-соседство;
+    unresolved_frontier — его неоценённую часть.
+
+    status='local_minimum' удостоверяет лишь отсутствие строгого улучшения
+    вычисленного максимума в полностью оценённом указанном соседстве. Это
+    не глобальная оптимальность или сертификат истинного нелинейного риска.
+    status='incomplete' сохраняет полезный selected без такого утверждения.
+    При unresolved_start соседство ещё не обследовалось, оба frontier пусты.
+    """
+
+    selected: frozenset | None
+    path: tuple
+    evaluations: Mapping
+    frontier: tuple
+    unresolved_frontier: tuple
+    status: str
+
+
+def finite_design_descent(
+    pool,
+    mandatory,
+    evaluate,
+    *,
+    admissible=None,
+    cache=None,
+    resume_from=None,
+    on_evaluation=None,
+):
+    """Сравнить конечные составы без произвольного ограничения их стоимости.
+
+    Parameters
+    ----------
+    pool, mandatory : iterable of str
+        Уникальные непустые идентификаторы полного пула и его обязательного
+        подмножества. Начальная конфигурация — весь pool.
+    evaluate : callable
+        evaluate(frozenset) возвращает Mapping общих нормированных рисков
+        либо явный UnresolvedDesign. Число целей произвольно, значения конечны
+        и неотрицательны. Решатели и вычисление рисков остаются у caller.
+    admissible : callable, optional
+        Фиксированное правило допустимости состава, возвращающее bool.
+        Без него разрешены все подмножества, содержащие mandatory, в том
+        числе пустое при пустом mandatory. Полный pool должен быть допустим.
+        Замеченное изменение ответа для того же состава вызывает ошибку.
+    cache : Mapping, optional
+        Предыдущие значения по точным frozenset ключам; входной кэш не
+        изменяется. Его риски должны относиться к тем же научным входам.
+        Cached UnresolvedDesign не пересчитывается автоматически: caller
+        явно удаляет или заменяет запись после устранения причины.
+    resume_from : frozenset, optional
+        Сохранённая текущая конфигурация той же серии, уже оценённая в cache.
+        Без неё новый путь начинается с полного пула. Старый префикс пути
+        и научную идентичность кэша проверяет вызывающее приложение.
+    on_evaluation : callable, optional
+        Синхронный callback(candidate, immutable_result) ровно один раз для
+        каждой новой валидированной записи, до следующей оценки или перехода.
+        Позволяет сохранять результаты вне библиотеки; исключения пробрасываются.
+
+    Returns
+    -------
+    FiniteDesignResult
+        Путь, owned immutable кэш и точный статус финального соседства.
+
+    Notes
+    -----
+    Соседи получаются добавлением, удалением или обменом одного необязательного
+    элемента. Точные frozenset исключают коллизии строковых обозначений сетей.
+    Сначала оценивается всё допустимое соседство; известные улучшения разрешены
+    и при наличии других UnresolvedDesign. Переход требует строго меньшего
+    максимума рисков; между улучшениями сравниваются максимум, сумма и tuple
+    отсортированных идентификаторов. Меньшая сумма при равном максимуме не
+    разрешает переход. Допусков сравнения или бюджета числа элементов нет.
+
+    Строгий спуск по конечному множеству исключает повторное посещение состояния,
+    если каждая оценка заканчивается. Прерывание или неоценённые соседи не
+    превращаются в научный критерий остановки. Допустимость, риски и общие
+    нормировки должны оставаться фиксированными; обнаруженные изменения и
+    ошибки evaluator/callback завершают вызов исключением, без скрытого fallback.
+    """
+
+    def identifiers(values, name):
+        if isinstance(values, (str, bytes)):
+            raise ValueError(f"{name} must contain distinct string identifiers")
+        entries = tuple(values)
+        if any(not isinstance(value, str) or not value.strip() for value in entries):
+            raise ValueError(f"{name} requires nonempty string identifiers")
+        if len(set(entries)) != len(entries):
+            raise ValueError(f"{name} identifiers must be unique")
+        return frozenset(entries)
+
+    universe = identifiers(pool, "pool")
+    required = identifiers(mandatory, "mandatory")
+    if not universe or not required <= universe:
+        raise ValueError("A nonempty pool must contain every mandatory identifier")
+    if not callable(evaluate) or any(
+        value is not None and not callable(value) for value in (admissible, on_evaluation)
+    ):
+        raise TypeError("Design evaluation, admissibility and callbacks must be callable")
+    if cache is not None and not isinstance(cache, Mapping):
+        raise TypeError("cache must be a Mapping with exact frozenset keys")
+    decisions, evaluations, scores = {}, {}, {}
+    goals = None
+
+    def canonical(candidate):
+        return tuple(sorted(candidate))
+
+    def candidate_key(candidate):
+        if (
+            type(candidate) is not frozenset
+            or any(not isinstance(value, str) or not value.strip() for value in candidate)
+            or not required <= candidate <= universe
+        ):
+            raise ValueError("Cached and resumed designs require exact feasible frozenset keys")
+        return candidate
+
+    def allowed(candidate):
+        value = True if admissible is None else admissible(candidate)
+        if not isinstance(value, (bool, np.bool_)):
+            raise ValueError("Design admissibility must return bool")
+        value = bool(value)
+        if candidate in decisions and value != decisions[candidate]:
+            raise ValueError("Design admissibility changed for the same configuration")
+        decisions[candidate] = value
+        return value
+
+    def validated(value):
+        nonlocal goals
+        if isinstance(value, UnresolvedDesign):
+            return value, None
+        if not isinstance(value, Mapping):
+            raise TypeError("A design evaluation requires normalized risks or UnresolvedDesign")
+        if any(np.ma.isMaskedArray(number) for number in value.values()):
+            raise ValueError("Normalized risks cannot contain masked values")
+        normalized = _named_values(value, "normalized risks")
+        keys = tuple(name for name, _ in normalized)
+        if goals is not None and keys != goals:
+            raise ValueError("Every design must use the same normalized risk goals")
+        numbers = [number for _, number in normalized]
+        try:
+            total = real_scalar(fsum(numbers), name="sum of normalized risks")
+        except OverflowError as error:
+            raise ValueError("The sum of normalized risks is not representable") from error
+        goals = keys
+        return MappingProxyType(dict(normalized)), (max(numbers), total)
+
+    if not allowed(universe):
+        raise ValueError("The full pool must be an admissible starting design")
+    for candidate, value in (() if cache is None else cache.items()):
+        candidate_key(candidate)
+        if not allowed(candidate):
+            raise ValueError("A cached design is inadmissible under the declared fixed rule")
+        record, score = validated(value)
+        evaluations[candidate] = record
+        if score is not None:
+            scores[candidate] = score
+    current = universe if resume_from is None else candidate_key(resume_from)
+    if not allowed(current):
+        raise ValueError("The resumed design must remain admissible")
+    if resume_from is not None and current not in scores:
+        raise ValueError("resume_from must have a resolved entry in cache")
+
+    def obtain(candidate):
+        if not allowed(candidate):
+            raise ValueError("A design became inadmissible before evaluation")
+        if candidate not in evaluations:
+            record, score = validated(evaluate(candidate))
+            evaluations[candidate] = record
+            if score is not None:
+                scores[candidate] = score
+            if on_evaluation is not None:
+                on_evaluation(candidate, record)
+        return evaluations[candidate]
+
+    def result(status, path, frontier=()):
+        unresolved = tuple(
+            candidate
+            for candidate in frontier
+            if isinstance(evaluations[candidate], UnresolvedDesign)
+        )
+        records = {
+            candidate: evaluations[candidate] for candidate in sorted(evaluations, key=canonical)
+        }
+        return FiniteDesignResult(
+            selected=current if current in scores else None,
+            path=tuple(path),
+            evaluations=MappingProxyType(records),
+            frontier=tuple(frontier),
+            unresolved_frontier=unresolved,
+            status=status,
+        )
+
+    path = [current]
+    if isinstance(obtain(current), UnresolvedDesign):
+        return result("unresolved_start", path)
+    while True:
+        optional = current - required
+        outside = universe - current
+        raw_neighbors = {current - {item} for item in optional}
+        raw_neighbors.update(current | {item} for item in outside)
+        raw_neighbors.update((current - {old}) | {new} for old in optional for new in outside)
+        neighbors = tuple(
+            candidate for candidate in sorted(raw_neighbors, key=canonical) if allowed(candidate)
+        )
+        for candidate in neighbors:
+            obtain(candidate)
+        # A changed admissibility rule must not silently alter the final frontier.
+        allowed(current)
+        for candidate in sorted(raw_neighbors, key=canonical):
+            allowed(candidate)
+        improvements = [
+            candidate
+            for candidate in neighbors
+            if candidate in scores and scores[candidate][0] < scores[current][0]
+        ]
+        if not improvements:
+            status = (
+                "incomplete"
+                if any(
+                    isinstance(evaluations[candidate], UnresolvedDesign) for candidate in neighbors
+                )
+                else "local_minimum"
+            )
+            return result(status, path, neighbors)
+        current = min(
+            improvements, key=lambda candidate: (*scores[candidate], canonical(candidate))
+        )
+        path.append(current)

@@ -1,6 +1,7 @@
 """Целевой риск, профильная информация и конечный выбор: независимые матричные случаи."""
 
 from itertools import combinations
+from dataclasses import FrozenInstanceError
 
 import numpy as np
 import pytest
@@ -9,6 +10,8 @@ from adrkit.inverse.design import (
     CenteredBudgetGoalRisk,
     CovarianceFactor,
     DesignCandidate,
+    FiniteDesignResult,
+    UnresolvedDesign,
     affine_goal_risk,
     centered_budget_goal_risk,
     innovation_covariance_budget,
@@ -17,6 +20,7 @@ from adrkit.inverse.design import (
     robust_ball_maximum,
     select_designs,
 )
+from adrkit.inverse import finite_design_descent
 
 
 @pytest.mark.parametrize("diagonal", [False, True])
@@ -1099,3 +1103,287 @@ def test_hard_case_does_not_claim_unattainable_relative_tolerance():
     assert result.status in {"resolution_limit_estimate", "numerical_inconsistency"}
     assert result.certified is False
     np.testing.assert_allclose(result.attained_estimate, 16.0 / 3.0, atol=2e-12)
+
+
+def test_finite_design_descent_uses_all_three_moves_and_certifies_only_the_final_frontier():
+    optional = ("a", "b", "c", "d", "e")
+    pool, mandatory = frozenset(("k", *optional)), frozenset({"k"})
+    route = [
+        optional,
+        ("a", "b", "c", "d"),
+        ("a", "b", "c"),
+        ("a", "b"),
+        ("a", "d"),
+        ("a", "d", "e"),
+    ]
+    expected_path = tuple(frozenset(("k", *items)) for items in route)
+    landscape = {candidate: float(10 - index) for index, candidate in enumerate(expected_path)}
+    global_better = frozenset({"k", "c"})
+    landscape[global_better] = 1.0
+    evaluated, checkpoints = [], []
+
+    def evaluate(candidate):
+        evaluated.append(candidate)
+        value = landscape.get(candidate, 100.0)
+        return {"source:S": value, "coefficients:J": value / 2}
+
+    result = finite_design_descent(
+        reversed(tuple(sorted(pool))),
+        mandatory,
+        evaluate,
+        admissible=lambda candidate: len(candidate) > 1,
+        on_evaluation=lambda candidate, record: checkpoints.append((candidate, record)),
+    )
+    assert isinstance(result, FiniteDesignResult)
+    assert result.path == expected_path
+    assert result.selected == expected_path[-1]
+    assert result.status == "local_minimum"
+    assert len(evaluated) == len(set(evaluated)) == len(checkpoints)
+    assert set(evaluated) == set(result.evaluations)
+    feasible = [
+        frozenset(("k", *items)) for size in range(1, 6) for items in combinations(optional, size)
+    ]
+    # Independent enumeration by symmetric-difference sizes, rather than by moves.
+    frontier = {
+        candidate
+        for candidate in feasible
+        if (len(result.selected - candidate), len(candidate - result.selected))
+        in {(1, 0), (0, 1), (1, 1)}
+    }
+    assert set(result.frontier) == frontier
+    assert not result.unresolved_frontier
+    assert all(max(result.evaluations[candidate].values()) >= 5 for candidate in frontier)
+    assert landscape[global_better] < max(result.evaluations[result.selected].values())
+
+
+@pytest.mark.parametrize("tie", ["sum", "identifier"])
+def test_finite_design_descent_breaks_improving_ties_deterministically(tie):
+    pool, mandatory = frozenset({"k", "a", "b"}), frozenset({"k"})
+    left, right = frozenset({"k", "a"}), frozenset({"k", "b"})
+    risks = {
+        pool: {"g1": 5.0, "g2": 4.0},
+        left: {"g1": 4.0, "g2": 1.0},
+        right: {"g1": 4.0, "g2": 0.0 if tie == "sum" else 1.0},
+    }
+    expected = right if tie == "sum" else left
+    for order in (("a", "k", "b"), ("b", "k", "a")):
+        result = finite_design_descent(
+            order, mandatory, risks.__getitem__, admissible=lambda candidate: len(candidate) > 1
+        )
+        assert result.path == (pool, expected)
+        assert result.status == "local_minimum"
+
+
+def test_finite_design_descent_does_not_cross_a_primary_risk_plateau_for_a_smaller_sum():
+    pool = frozenset({"k", "a", "b"})
+    risks = {
+        pool: {"q": 4.0, "theta": 4.0},
+        frozenset({"k", "a"}): {"q": 4.0, "theta": 0.0},
+        frozenset({"k", "b"}): {"q": 4.0, "theta": 1.0},
+    }
+    result = finite_design_descent(
+        pool, {"k"}, risks.__getitem__, admissible=lambda candidate: len(candidate) > 1
+    )
+    assert result.selected == pool
+    assert result.path == (pool,)
+    assert result.status == "local_minimum"
+
+
+def test_finite_design_descent_preserves_unresolved_risks_and_resumes_from_the_saved_current():
+    pool, left, right = map(frozenset, ({"k", "a", "b"}, {"k", "a"}, {"k", "b"}))
+    values = {
+        pool: {"g": 3.0},
+        left: {"g": 2.0},
+        right: UnresolvedDesign("ordinary derivative is not established"),
+    }
+    result = finite_design_descent(
+        pool, {"k"}, values.__getitem__, admissible=lambda candidate: len(candidate) > 1
+    )
+    assert result.selected == left and result.path == (pool, left)
+    assert result.status == "incomplete" and result.unresolved_frontier == (right,)
+    assert isinstance(result.evaluations[right], UnresolvedDesign)
+
+    def unexpected(candidate):
+        pytest.fail(f"A cached result was evaluated again: {candidate}")
+
+    repeated = finite_design_descent(
+        pool,
+        {"k"},
+        unexpected,
+        admissible=lambda candidate: len(candidate) > 1,
+        cache=result.evaluations,
+        resume_from=left,
+    )
+    assert repeated.path == (left,) and repeated.status == "incomplete"
+    completed = dict(result.evaluations)
+    completed[right] = {"g": 1.0}
+    resumed = finite_design_descent(
+        pool,
+        {"k"},
+        unexpected,
+        admissible=lambda candidate: len(candidate) > 1,
+        cache=completed,
+        resume_from=left,
+    )
+    assert resumed.path == (left, right)
+    assert resumed.selected == right and resumed.status == "local_minimum"
+    assert not resumed.unresolved_frontier
+    assert isinstance(result.evaluations[right], UnresolvedDesign)
+
+
+def test_finite_design_descent_does_not_step_from_an_unresolved_start():
+    pool = frozenset({"k", "a", "b"})
+    evaluated = []
+
+    def evaluate(candidate):
+        evaluated.append(candidate)
+        return UnresolvedDesign("No stationary starting branch")
+
+    result = finite_design_descent(pool, {"k"}, evaluate)
+    assert evaluated == [pool]
+    assert result.status == "unresolved_start" and result.selected is None
+    assert result.path == (pool,) and not result.frontier
+
+
+def test_finite_design_descent_checkpoints_validated_results_and_reuses_them_after_interruption():
+    pool, left, right = map(frozenset, ({"k", "a", "b"}, {"k", "a"}, {"k", "b"}))
+    risks = {pool: {"g": 3.0}, left: {"g": 2.0}, right: {"g": 1.0}}
+    saved, evaluated = {}, []
+
+    def evaluate(candidate):
+        evaluated.append(candidate)
+        return risks[candidate]
+
+    def checkpoint(candidate, record):
+        saved[candidate] = record
+        with pytest.raises(TypeError):
+            record["g"] = 100.0
+        if len(saved) == 2:
+            raise InterruptedError("caller interruption")
+
+    with pytest.raises(InterruptedError, match="caller interruption"):
+        finite_design_descent(
+            pool,
+            {"k"},
+            evaluate,
+            admissible=lambda candidate: len(candidate) > 1,
+            on_evaluation=checkpoint,
+        )
+    assert set(saved) == {pool, left}
+    resumed = finite_design_descent(
+        pool, {"k"}, evaluate, admissible=lambda candidate: len(candidate) > 1, cache=saved
+    )
+    assert resumed.selected == right and resumed.status == "local_minimum"
+    assert len(evaluated) == len(set(evaluated)) == 3
+    risks[right]["g"] = 100.0
+    assert resumed.evaluations[right]["g"] == 1.0
+    with pytest.raises(TypeError):
+        resumed.evaluations[right]["g"] = 2.0
+    with pytest.raises(TypeError):
+        resumed.evaluations[pool] = None
+    with pytest.raises(FrozenInstanceError):
+        resumed.status = "global_minimum"
+
+
+def test_finite_design_descent_uses_exact_set_cache_keys_without_display_identifier_collisions():
+    pool = frozenset({"k", "a", "b", "a|b"})
+    high, low = frozenset({"k", "a", "b"}), frozenset({"k", "a|b"})
+    assert "|".join(sorted(high)) == "|".join(sorted(low))
+    cache = {high: {"g": 9.9}, low: {"g": 1.0}}
+    evaluated = []
+
+    def evaluate(candidate):
+        evaluated.append(candidate)
+        return {"g": 9.0 if candidate == frozenset({"k", "b", "a|b"}) else 10.0}
+
+    result = finite_design_descent(
+        pool, {"k"}, evaluate, admissible=lambda candidate: len(candidate) > 1, cache=cache
+    )
+    assert result.selected == low and result.status == "local_minimum"
+    assert result.evaluations[high]["g"] == 9.9 and result.evaluations[low]["g"] == 1.0
+    assert high not in evaluated and low not in evaluated
+    assert cache == {high: {"g": 9.9}, low: {"g": 1.0}}
+
+
+def test_finite_design_descent_rejects_a_changing_admissibility_rule():
+    pool, left, right = map(frozenset, ({"k", "a", "b"}, {"k", "a"}, {"k", "b"}))
+    invalidated = set()
+
+    def admissible(candidate):
+        return len(candidate) > 1 and candidate not in invalidated
+
+    def evaluate(candidate):
+        if candidate == left:
+            invalidated.add(right)
+        return {"g": 3.0 if candidate == pool else 2.0}
+
+    with pytest.raises(ValueError, match="admissibility changed"):
+        finite_design_descent(pool, {"k"}, evaluate, admissible=admissible)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        {"g": -1.0},
+        {"g": np.inf},
+        {"g": np.ma.array(1.0, mask=True)},
+        {"g": 1e308, "h": 1e308},
+    ],
+)
+def test_finite_design_descent_does_not_checkpoint_invalid_risks_as_unresolved(bad):
+    saved = []
+    with pytest.raises((TypeError, ValueError)):
+        finite_design_descent(
+            {"k", "a"},
+            {"k"},
+            lambda candidate: bad,
+            on_evaluation=lambda *args: saved.append(args),
+        )
+    assert not saved
+
+
+def test_finite_design_descent_keeps_goal_identity_and_propagates_evaluator_failures():
+    pool = frozenset({"k", "a", "b"})
+    cache = {pool: {"source:S": 3.0}}
+    with pytest.raises(ValueError, match="same normalized risk goals"):
+        finite_design_descent(
+            pool,
+            {"k"},
+            lambda candidate: {"coefficients:J": 1.0},
+            admissible=lambda candidate: len(candidate) > 1,
+            cache=cache,
+        )
+    assert cache == {pool: {"source:S": 3.0}}
+
+    def failed(candidate):
+        raise RuntimeError("external evaluation failed")
+
+    with pytest.raises(RuntimeError, match="external evaluation failed"):
+        finite_design_descent(pool, {"k"}, failed)
+
+
+@pytest.mark.parametrize(
+    "defect", ["mandatory", "initial", "cache_key", "cache_inadmissible", "resume_unresolved"]
+)
+def test_finite_design_descent_requires_a_valid_frozen_domain_and_resolved_resume(defect):
+    pool, mandatory, kwargs = frozenset({"k", "a"}), {"k"}, {}
+    if defect == "mandatory":
+        mandatory = {"outside"}
+    elif defect == "initial":
+        kwargs["admissible"] = lambda candidate: False
+    elif defect == "cache_key":
+        kwargs["cache"] = {("k", "a"): {"g": 1.0}}
+    elif defect == "cache_inadmissible":
+        kwargs.update(
+            cache={frozenset({"k"}): {"g": 1.0}}, admissible=lambda candidate: len(candidate) > 1
+        )
+    else:
+        kwargs.update(cache={pool: UnresolvedDesign("not assessed")}, resume_from=pool)
+    with pytest.raises(ValueError):
+        finite_design_descent(
+            pool,
+            mandatory,
+            lambda candidate: pytest.fail("Invalid domain reached evaluator"),
+            **kwargs,
+        )
