@@ -502,6 +502,42 @@ def test_nearly_symmetric_positive_gram_is_accepted_without_replacement():
     np.testing.assert_array_equal(gram, original)
 
 
+def test_nearly_symmetric_penalty_derivative_matches_its_quadratic_form():
+    delta = 2.0**-40
+    gram = np.array([[2.0, 1.0 + delta], [1.0, 2.0]])
+    penalty = QuadraticPenalty(np.zeros(2), gram, 1.0)
+    point, direction = np.array([0.0, 1.0]), np.array([1.0, 0.0])
+    # Центрированная разность с шагом один точна для квадратичной формы;
+    # двоично-рациональный пример различает исходный G и его симметричную часть.
+    derivative = (penalty.value(point + direction) - penalty.value(point - direction)) / 2
+    assert derivative == 1.0 + delta / 2
+    assert penalty.cotangent(point) @ direction == derivative
+    np.testing.assert_array_equal(penalty.gram, gram)
+
+
+def test_nearly_symmetric_projected_penalty_accepts_analytic_stationary_point():
+    delta = 2.0**-40
+    gram = np.array([[2.0, 1.0 + delta], [1.0, 2.0]])
+    point = np.ones(2)
+    # Для F=I и alpha=1 точка (1,1) стационарна при y=(4+delta/2,4+delta/2).
+    # Проверка с нулём итераций не позволяет скрыть ошибку градиента новым подбором.
+    result = fit(
+        LinearFit(),
+        np.full(2, 4.0 + delta / 2),
+        IdentityMetric(),
+        gram,
+        1.0,
+        np.eye(2),
+        np.zeros(2),
+        initial_point=point,
+        max_iterations=0,
+        tolerance=2.0**-48,
+    )
+    assert result["accepted"] and result["iterations"] == 0
+    assert result["stationarity"] == 0.0
+    np.testing.assert_array_equal(result["coefficients"], point)
+
+
 def test_tikhonov_feasibility_tolerance_changes_acceptance(monkeypatch):
     # Заданная неточность решателя делает различие проверяемым: дефект допустимости равен 1e-9, а
     # независимый допуск KKT задан менее строгим.

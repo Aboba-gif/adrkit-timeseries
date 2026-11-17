@@ -62,7 +62,8 @@ class QuadraticPenalty:
     Симметрия и положительная полуопределённость проверяются с численными
     допусками; исходная матрица не заменяется её симметризацией или проекцией.
     Собственные значения проверяются у симметричной части матрицы,
-    определяющей квадратичную форму.
+    определяющей квадратичную форму. Ковектор вычисляется по этой же
+    симметричной части: :math:`\alpha(G+G^\mathsf{T})(a-a_0)/2`.
     """
 
     def __init__(self, center, gram, alpha):
@@ -74,6 +75,11 @@ class QuadraticPenalty:
         if self._center.shape != (n,) or n == 0 or self._alpha < 0:
             raise ValueError("Finite nonempty center and nonnegative alpha required")
         self._gram, _ = symmetric_psd_matrix(gram, n, name="Penalty Gram", copy=True)
+        self._symmetric_gram = (
+            self._gram
+            if np.array_equal(self._gram, self._gram.T)
+            else 0.5 * self._gram + 0.5 * self._gram.T
+        )
 
     @property
     def center(self):
@@ -128,7 +134,7 @@ class QuadraticPenalty:
             Ковектор той же формы, что center.
         """
         d = self._difference(x)
-        return self.alpha * (self._gram @ d)
+        return self.alpha * (self._symmetric_gram @ d)
 
     def capabilities(self, domain):
         """Объявить штраф на пространстве коэффициентов.

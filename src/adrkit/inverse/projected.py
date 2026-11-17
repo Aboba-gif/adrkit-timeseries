@@ -178,7 +178,8 @@ def fit(
 
     .. math::
 
-        H=J_{\mathrm{aff}}^\mathsf{T}WJ_{\mathrm{aff}}+\alpha G.
+        H=J_{\mathrm{aff}}^\mathsf{T}WJ_{\mathrm{aff}}+\alpha G_s,
+        \qquad G_s=(G+G^\mathsf{T})/2.
 
     Здесь :math:`J_{\mathrm{aff}}` — входная `jacobian`;
     она не пересчитывается по текущей точке нелинейного прогноза.
@@ -187,7 +188,9 @@ def fit(
     условиям остановки, а не к глобальной оптимальности.
     Численные входы проверяются до вызовов metric и prediction.
     Проверка симметрии и полуопределённости G использует те же допуски,
-    что QuadraticPenalty; исходная матрица не симметризуется и не проецируется.
+    что QuadraticPenalty. Исходная матрица сохраняется, а ковектор и
+    квадратичная подзадача используют G_s, определяющую ту же форму.
+    Проекция собственных значений не выполняется.
     Проверяются собственные значения симметричной части G,
     определяющей квадратичную форму.
     Только для вычисления penalty_norm отрицательная квадратичная форма
@@ -242,6 +245,7 @@ def fit(
         raise ValueError("offset must have the same shape as observations")
     size = jacobian.shape[1]
     gram, gram_tolerance = symmetric_psd_matrix(gram, size, name="gram", copy=True)
+    penalty_matrix = gram if np.array_equal(gram, gram.T) else 0.5 * gram + 0.5 * gram.T
     if initial_point is not None:
         point = real_array(initial_point, name="initial_point", copy=True)
         if point.shape != (size,) or np.any(point < 0):
@@ -249,7 +253,7 @@ def fit(
                 "initial_point must be a nonnegative coefficient vector of shape (n,)"
             )
     white = metric.whiten_matrix(jacobian)
-    hessian = white.T @ white + alpha * gram
+    hessian = white.T @ white + alpha * penalty_matrix
     root = cholesky(hessian, lower=False)
     if initial_point is None:
         target = white.T @ metric.whiten(observations - offset)
@@ -263,7 +267,7 @@ def fit(
         data = 0.5 * float(residual @ precision)
         penalty = 0.5 * alpha * float(point @ gram @ point)
         gd = prediction.vjp(point, precision)
-        gp = alpha * (gram @ point)
+        gp = alpha * (penalty_matrix @ point)
         gradient = gd + gp
         projected = np.where(point <= active_tolerance, np.minimum(gradient, 0), gradient)
         scale = max(1.0, np.max(np.abs(gd)), np.max(np.abs(gp)))
