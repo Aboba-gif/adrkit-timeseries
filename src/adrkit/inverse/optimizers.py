@@ -221,6 +221,58 @@ def _squared_norm_roundoff(values, value):
     return float(bound) if np.isfinite(bound) else None
 
 
+def _validate_bounded_step(
+    step,
+    step_lower,
+    step_upper,
+    *,
+    point,
+    free,
+    matrix,
+    augmented,
+    target,
+    gradient,
+    damping,
+    qp_tolerance,
+):
+    """Проверить допустимость и исходные ККТ/убывание одного шага подзадачи.
+
+    Вернуть направление, четыре показателя проверки и признак принятия.
+    При недопустимом шаге первые два результата равны None. Метки активных
+    ограничений сюда не передаются: проверяется сам численный кандидат.
+    """
+    if not np.isfinite(step).all() or np.any(step < step_lower) or np.any(step > step_upper):
+        return None, None, False
+    direction = np.zeros_like(point)
+    direction[free] = step
+    qp_gradient = augmented.T @ (augmented @ step - target)
+    defect = qp_gradient.copy()
+    at_lower, at_upper = step == step_lower, step == step_upper
+    defect[at_lower] = np.minimum(defect[at_lower], 0.0)
+    defect[at_upper] = np.maximum(defect[at_upper], 0.0)
+    qp_optimality = float(np.linalg.norm(defect, np.inf))
+    rounding_factor = (sum(augmented.shape) + 3) * np.finfo(float).eps
+    rounding_factor /= 1.0 - rounding_factor
+    product_scale = np.abs(augmented).T @ (np.abs(augmented) @ np.abs(step) + np.abs(target))
+    qp_error_bound = qp_tolerance + rounding_factor * np.linalg.norm(product_scale, np.inf)
+    directional_derivative = float(gradient @ direction)
+    mapped = matrix @ direction
+    step_curvature = float(mapped @ mapped + damping * (direction @ direction))
+    vi_error = qp_error_bound * np.sum(np.abs(step)) + rounding_factor * (
+        np.sum(np.abs(gradient * direction)) + step_curvature
+    )
+    accepted = not (
+        not np.isfinite(
+            [qp_optimality, qp_error_bound, directional_derivative, step_curvature, vi_error]
+        ).all()
+        or qp_optimality > qp_error_bound
+        or directional_derivative >= 0
+        or directional_derivative + step_curvature > vi_error
+    )
+    diagnostics = qp_optimality, qp_error_bound, directional_derivative, step_curvature
+    return direction, diagnostics, accepted
+
+
 def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, callback=None):
     r"""Минимизировать половину квадрата нормы невязки с границами.
 
@@ -293,7 +345,12 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
     проверка исходной стационарности, а не их approximate-Wolfe line search.
     Допуск проверки KKT равен qp_tolerance плюс оценка округления плотных
     произведений; вариационное неравенство проверяется с соответствующей
-    ошибкой. Проекция устраняет только округление допустимого шага на границе.
+    ошибкой. Если исходный шаг отклонён, active_mask метода BVLS может
+    предложить второй кандидат с точными значениями активных границ.
+    Его допустимость, ККТ, убывание и вариационное неравенство проверяются
+    заново с теми же допусками; сама маска не удостоверяет решение.
+    Уже допустимый проверенный шаг не изменяется. Проекция конечной точки
+    устраняет только округление сложения допустимого шага с текущей точкой.
     Постоянный диагональный сдвиг и априорный штраф не добавляются.
     Стационарность не доказывает нулевую невязку или глобальность минимума.
     """
@@ -488,44 +545,51 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
             max_iter=settings["qp_maxiter"],
         )
         step = qp.x
-        if (
-            not qp.success
-            or not np.isfinite(step).all()
-            or np.any(step < step_lower)
-            or np.any(step > step_upper)
-        ):
+        if not qp.success:
             return result(
                 -1,
                 "The bounded least-squares subproblem did not produce a feasible converged step",
             )
-        direction = np.zeros_like(x)
-        direction[free] = step
-        qp_gradient = augmented.T @ (augmented @ step - target)
-        defect = qp_gradient.copy()
-        at_lower, at_upper = step == step_lower, step == step_upper
-        defect[at_lower] = np.minimum(defect[at_lower], 0.0)
-        defect[at_upper] = np.maximum(defect[at_upper], 0.0)
-        qp_optimality = float(np.linalg.norm(defect, np.inf))
-        rounding_factor = (sum(augmented.shape) + 3) * np.finfo(float).eps
-        rounding_factor /= 1.0 - rounding_factor
-        product_scale = np.abs(augmented).T @ (np.abs(augmented) @ np.abs(step) + np.abs(target))
-        qp_error_bound = settings["qp_tolerance"] + rounding_factor * np.linalg.norm(
-            product_scale, np.inf
+        checks = dict(
+            point=x,
+            free=free,
+            matrix=matrix,
+            augmented=augmented,
+            target=target,
+            gradient=gradient,
+            damping=damping,
+            qp_tolerance=settings["qp_tolerance"],
         )
-        directional_derivative = float(gradient @ direction)
-        mapped = matrix @ direction
-        step_curvature = float(mapped @ mapped + damping * (direction @ direction))
-        vi_error = qp_error_bound * np.sum(np.abs(step)) + rounding_factor * (
-            np.sum(np.abs(gradient * direction)) + step_curvature
+        direction, diagnostics, accepted = _validate_bounded_step(
+            step, step_lower, step_upper, **checks
         )
-        if (
-            not np.isfinite(
-                [qp_optimality, qp_error_bound, directional_derivative, step_curvature, vi_error]
-            ).all()
-            or qp_optimality > qp_error_bound
-            or directional_derivative >= 0
-            or directional_derivative + step_curvature > vi_error
-        ):
+        if not accepted and np.isfinite(step).all():
+            active = np.asarray(qp.get("active_mask", ()))
+            if (
+                active.shape == step.shape
+                and active.dtype.kind in "iuf"
+                and np.isfinite(active).all()
+                and np.isin(active, (-1, 0, 1)).all()
+                and np.any(active != 0)
+                and np.isfinite(step_lower[active == -1]).all()
+                and np.isfinite(step_upper[active == 1]).all()
+            ):
+                proposal = step.copy()
+                proposal[active == -1] = step_lower[active == -1]
+                proposal[active == 1] = step_upper[active == 1]
+                checked_direction, checked_diagnostics, checked = _validate_bounded_step(
+                    proposal, step_lower, step_upper, **checks
+                )
+                if checked:
+                    step = proposal
+                    direction, diagnostics, accepted = checked_direction, checked_diagnostics, True
+        if direction is None:
+            return result(
+                -1,
+                "The bounded least-squares subproblem did not produce a feasible converged step",
+            )
+        qp_optimality, qp_error_bound, directional_derivative, step_curvature = diagnostics
+        if not accepted:
             return result(
                 -1, "The bounded least-squares step failed the optimality or descent check"
             )

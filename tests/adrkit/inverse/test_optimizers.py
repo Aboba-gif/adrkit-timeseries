@@ -477,6 +477,151 @@ def test_success_flag_alone_cannot_accept_an_inaccurate_qp(monkeypatch):
     assert result.qp_optimality > result.qp_error_bound
 
 
+@pytest.mark.parametrize("side", ["lower", "upper"])
+@pytest.mark.parametrize("offset_sign", [-1, 1])
+def test_revalidated_bvls_active_bound_removes_signed_roundoff(monkeypatch, side, offset_sign):
+    target = np.array([-1.0 if side == "lower" else 1.0, 1.0])
+    residual = linear_residual(np.eye(2), target)
+    bound = (0.0, None) if side == "lower" else (None, 0.0)
+    active_code = -1 if side == "lower" else 1
+    original = optimizers.lsq_linear
+    returned = []
+
+    def rounded_bound(*args, **kwargs):
+        qp = original(*args, **kwargs)
+        assert qp.success and qp.active_mask[0] == active_code
+        # At x=0, mu=1: the exact QP solution is (0, 1/2).
+        # A signed nonzero first coordinate either violates its bound or
+        # incorrectly appears free with a QP gradient of magnitude near one.
+        qp.x[0] = offset_sign * 2.0**-56
+        returned.append(qp.x.copy())
+        return qp
+
+    monkeypatch.setattr(optimizers, "lsq_linear", rounded_bound)
+    result = optimizers.solve_damped_gauss_newton(
+        residual,
+        [0.0, 0.0],
+        bounds=[bound, (0.0, None)],
+        options={"maxiter": 1, "gtol": 0.0},
+    )
+    assert len(returned) == 1 and returned[0][0] != 0.0
+    assert result.status == 0 and result.nit == 1
+    assert result.x[0] == 0.0
+    np.testing.assert_allclose(result.x[1], 0.5, rtol=0, atol=2e-15)
+    assert result.fun < 1.0 and result.step_size == 1.0
+    assert result.qp_optimality <= result.qp_error_bound
+    assert result.directional_derivative < 0
+
+
+def test_original_valid_bvls_steps_ignore_misleading_masks_bitwise(monkeypatch):
+    residual = linear_residual(np.eye(2), np.array([-1.0, 1.0]))
+    bounds = [(0.0, None)] * 2
+    options = {"maxiter": 8, "gtol": 1e-10, "damping_rule": "projected-gradient"}
+    expected, actual = [], []
+    reference = optimizers.solve_damped_gauss_newton(
+        residual, [0.0, 0.0], bounds=bounds, options=options, callback=expected.append
+    )
+    original = optimizers.lsq_linear
+
+    def misleading_mask(*args, **kwargs):
+        qp = original(*args, **kwargs)
+        # The second coordinate is free. This mask must never alter a step
+        # which already satisfies the original feasibility/KKT/descent checks.
+        qp.active_mask = np.full(qp.x.shape, -1.0)
+        return qp
+
+    monkeypatch.setattr(optimizers, "lsq_linear", misleading_mask)
+    result = optimizers.solve_damped_gauss_newton(
+        residual, [0.0, 0.0], bounds=bounds, options=options, callback=actual.append
+    )
+    assert result.success and reference.success
+    assert len(expected) == len(actual)
+    for before, after in zip(expected, actual):
+        for name in ("x", "jac", "residual"):
+            np.testing.assert_array_equal(before[name], after[name])
+        for name in ("fun", "damping", "qp_optimality", "qp_error_bound", "step_size"):
+            assert before[name] == after[name]
+    assert (result.nit, result.nfev, result.njev, result.njvp) == (
+        reference.nit,
+        reference.nfev,
+        reference.njev,
+        reference.njvp,
+    )
+
+
+def test_bvls_mask_proposal_with_wrong_kkt_sign_is_rejected(monkeypatch):
+    residual = linear_residual(np.eye(2), np.array([-1.0, 1.0]))
+    original = optimizers.lsq_linear
+
+    def wrong_face(*args, **kwargs):
+        qp = original(*args, **kwargs)
+        qp.x[0] = 2.0**-56
+        qp.active_mask[0] = 1
+        return qp
+
+    monkeypatch.setattr(optimizers, "lsq_linear", wrong_face)
+    result = optimizers.solve_damped_gauss_newton(
+        residual, [0.0, 0.0], bounds=[(0.0, 2.0), (0.0, None)], options={"gtol": 0.0}
+    )
+    # The proposal p0=2 is feasible, but its QP gradient is +5 at an upper
+    # bound, where KKT requires a nonpositive gradient. The mask is not proof.
+    assert result.status == -1 and not result.success and result.nfev == 1
+    assert "optimality or descent" in result.message
+    assert result.qp_optimality > result.qp_error_bound
+    np.testing.assert_array_equal(result.x, [0.0, 0.0])
+
+
+def test_bvls_free_coordinate_outside_bounds_is_not_projected(monkeypatch):
+    residual = linear_residual(np.eye(2), np.array([-1.0, 1.0]))
+    original = optimizers.lsq_linear
+
+    def infeasible_free_coordinate(*args, **kwargs):
+        qp = original(*args, **kwargs)
+        qp.x[1] = -(2.0**-56)
+        qp.active_mask[1] = 0
+        return qp
+
+    monkeypatch.setattr(optimizers, "lsq_linear", infeasible_free_coordinate)
+    result = optimizers.solve_damped_gauss_newton(
+        residual, [0.0, 0.0], bounds=[(0.0, None)] * 2, options={"gtol": 0.0}
+    )
+    assert result.status == -1 and not result.success and result.nfev == 1
+    assert "feasible converged step" in result.message
+    assert result.qp_optimality is None
+    np.testing.assert_array_equal(result.x, [0.0, 0.0])
+
+
+@pytest.mark.parametrize(
+    "mask",
+    [
+        [-1.0],
+        [-1.0, 0.25],
+        [-1.0, np.nan],
+        [-1.0, np.inf],
+        [True, False],
+        ["-1", "0"],
+        [1.0, 0.0],
+    ],
+)
+def test_invalid_bvls_mask_or_infinite_active_bound_cannot_repair_step(monkeypatch, mask):
+    residual = linear_residual(np.eye(2), np.array([-1.0, 1.0]))
+    original = optimizers.lsq_linear
+
+    def invalid_mask(*args, **kwargs):
+        qp = original(*args, **kwargs)
+        qp.x[0] = 2.0**-56
+        qp.active_mask = np.asarray(mask)
+        return qp
+
+    monkeypatch.setattr(optimizers, "lsq_linear", invalid_mask)
+    result = optimizers.solve_damped_gauss_newton(
+        residual, [0.0, 0.0], bounds=[(0.0, None)] * 2, options={"gtol": 0.0}
+    )
+    assert result.status == -1 and not result.success and result.nfev == 1
+    assert result.qp_optimality > result.qp_error_bound
+    np.testing.assert_array_equal(result.x, [0.0, 0.0])
+
+
 def test_exhausted_armijo_returns_the_last_accepted_point():
     residual = map_from_functions(
         domain=space(1, "x"),
