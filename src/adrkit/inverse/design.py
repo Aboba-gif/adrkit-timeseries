@@ -9,9 +9,10 @@ from dataclasses import dataclass
 from operator import index
 
 import numpy as np
+from scipy.linalg import solve_triangular
 
 from ._numeric import real_array, real_scalar, symmetric_psd_matrix
-from .linalg import _symmetric_matrix, gram_root, whiten
+from .linalg import _spd_factor, _symmetric_matrix, gram_root, whiten
 
 
 def _matrix(value, name):
@@ -62,6 +63,107 @@ class CovarianceFactor:
 
     def __init__(self, factor):
         object.__setattr__(self, "factor", _owned(_matrix(factor, "covariance factor")))
+
+
+@dataclass(frozen=True)
+class InnovationBudget:
+    """Разделение заданного общего ковариационного бюджета инноваций.
+
+    physical_scale — omega, множитель физической ковариации; сами физические
+    отклонения в данных И цели умножаются на sqrt(omega). max_ratio — Lambda,
+    максимальная относительная физическая дисперсия до масштабирования.
+    residual_factor задаёт C_nu=F@F.T; F не обязан быть симметричным.
+    """
+
+    physical_scale: float
+    max_ratio: float
+    fraction: float
+    residual_factor: CovarianceFactor
+
+
+def innovation_covariance_budget(physical_innovation_factor, innovation_covariance, *, fraction):
+    r"""Распределить положительный бюджет инноваций между физикой и остатком.
+
+    Parameters
+    ----------
+    physical_innovation_factor : array_like, shape (n, r)
+        Уже вычисленная вызывающим кодом матрица P=L@O@R, C_xi=R@R.T.
+        n>0, r>=0. Нулевая P, включая r=0, допустима.
+    innovation_covariance : array_like, shape (n,n) or (n,)
+        Строго положительно определённая общая ковариация C_I либо её
+        строго положительная диагональ. Используется существующий контракт
+        SPD-разложения, без сдвига диагонали и исправления собственных чисел.
+    fraction : float
+        Явная доля gamma, 0<gamma<1, не значение по умолчанию.
+
+    Returns
+    -------
+    InnovationBudget
+        Lambda=||A^-1@P||_2**2, A@A.T=C_I;
+        omega=1 при P=0, иначе min(1,gamma/Lambda).
+        residual_factor.factor=F, F@F.T=C_I-omega*P@P.T.
+
+    Notes
+    -----
+    В точной арифметике C_nu >= (1-gamma)*C_I > 0. Тонкое SVD отбелённой
+    P даёт Q,s; используется F=A-(A@Q*d)@Q.T,
+    d=(omega*s**2)/(1+sqrt(1-omega*s**2)). Формула не вычитает близкие
+    корни и не требует спектрального усечения. Возвращается плотный фактор
+    формы (n,n), а не симметричный квадратный корень.
+
+    Вызывающий код обязан умножить И физическую карту данных O, И карту
+    истинной цели T на sqrt(omega), сохранить их перекрёстные моменты и
+    согласовать средние. Нулевая P не означает нулевую физическую цель.
+    Функция не оценивает L/O/T/R, закон ошибок или физическую определимость;
+    это только распределение объявленного ковариационного бюджета.
+    Проверки FP64 не являются интервальным сертификатом неравенства.
+    """
+    if any(
+        np.ma.isMaskedArray(value)
+        for value in (physical_innovation_factor, innovation_covariance, fraction)
+    ):
+        raise ValueError("Innovation budget inputs cannot be masked arrays")
+    physical = _matrix(physical_innovation_factor, "physical innovation factor")
+    if not physical.shape[0]:
+        raise ValueError("Innovation budget requires n>0")
+    gamma = real_scalar(fraction, name="innovation budget fraction")
+    if not 0 < gamma < 1:
+        raise ValueError("Innovation budget fraction must satisfy 0<fraction<1")
+    factor = _spd_factor(innovation_covariance, physical.shape[0], "innovation covariance")
+    if not np.any(physical):
+        matrix = np.diag(factor) if factor.ndim == 1 else factor
+        return InnovationBudget(1.0, 0.0, gamma, CovarianceFactor(matrix))
+    try:
+        with np.errstate(over="raise", invalid="raise", divide="raise", under="raise"):
+            white = (
+                physical / factor[:, None]
+                if factor.ndim == 1
+                else solve_triangular(factor, physical, lower=True)
+            )
+            white = real_array(white, name="whitened physical innovation factor")
+            directions, singular, _ = np.linalg.svd(white, full_matrices=False)
+            ratio = _square_norm(singular[:1], "maximum physical innovation ratio")
+            if ratio == 0:
+                raise ValueError("A nonzero physical factor lost its whitened spectral scale")
+            omega = (
+                1.0
+                if ratio <= gamma
+                else real_scalar(np.divide(gamma, ratio), name="physical covariance scale")
+            )
+            if omega <= 0:
+                raise ValueError("A positive physical covariance scale underflowed")
+            allocated = omega * singular**2
+            if not np.isfinite(allocated).all() or np.any(allocated < 0) or np.any(allocated >= 1):
+                raise ValueError("Allocated physical spectrum must remain in [0,1)")
+            correction = allocated / (1.0 + np.sqrt(1.0 - allocated))
+            matrix = np.diag(factor) if factor.ndim == 1 else factor
+            residual = matrix - ((matrix @ directions) * correction) @ directions.T
+            residual = real_array(residual, name="residual innovation covariance factor")
+    except FloatingPointError as error:
+        raise ValueError(
+            "Innovation budget arithmetic lost its scale; rescale the input units"
+        ) from error
+    return InnovationBudget(omega, ratio, gamma, CovarianceFactor(residual))
 
 
 def _covariance_factor(value, size, name):

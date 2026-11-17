@@ -1,9 +1,10 @@
-"""Медианное абсолютное отклонение и его локальная чувствительность.
+"""Статистики временных рядов и условная калибровка нормальной модели.
 
 Пропуски не удаляются неявно: вызывающая сторона передаёт конечный вектор
-и сохраняет его соответствие исходным наблюдениям. Ранги и ветви вычисляются
-над точными двоично-рациональными значениями входов float64. Значения и
-производные возвращаются с округлением в float64.
+и сохраняет его соответствие исходным наблюдениям. Для MAD ранги и ветви
+вычисляются над точными двоично-рациональными входами; результаты округляются
+в float64. Reference-калибровка нормального ряда использует арифметику FP64
+и не предоставляет интервальных сертификатов.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 
 import numpy as np
+from scipy.linalg import cholesky, solve_triangular
+from scipy.special import logsumexp
 
 
 def _finite_vector(values, name, *, size=None):
@@ -405,3 +408,316 @@ def mad_of_differences_sensitivity(left, right, normalization=1.0):
         else _immutable(np.stack((-mad.ordinary_gradient, mad.ordinary_gradient)))
     )
     return DifferenceMADSensitivity(mad.value, gradient, mad.status, mad)
+
+
+def _hour_positions(values, name, *, size=None):
+    if np.ma.isMaskedArray(values):
+        raise ValueError(f"{name} must explicitly select integer positions")
+    raw = np.asarray(values)
+    if raw.ndim != 1 or raw.dtype.kind not in "iu" or not raw.size:
+        raise ValueError(f"{name} must be a nonempty integer vector")
+    integers = tuple(int(value) for value in raw)
+    limits = np.iinfo(np.int64)
+    if (
+        (size is not None and len(integers) != size)
+        or integers[0] < limits.min
+        or integers[-1] > limits.max
+        or any(left >= right for left, right in zip(integers, integers[1:]))
+        or integers[-1] - integers[0] > limits.max
+    ):
+        raise ValueError(f"{name} requires increasing distinct positions in a safe int64 range")
+    array = np.array(integers, dtype=np.int64)
+    return np.frombuffer(array.tobytes(), dtype=array.dtype)
+
+
+def _ar1_correlation(left, right, rho):
+    span = max(int(left[-1]), int(right[-1])) - min(int(left[0]), int(right[0]))
+    if span > np.iinfo(np.int64).max:
+        raise ValueError("Combined hour positions exceed the safe integer-lag range")
+    lags = np.abs(left[:, None] - right[None, :])
+    if rho == 0:
+        return (lags == 0).astype(float)
+    # Sign uses exact integer parity even when a lag is larger than 2**53.
+    # Rounding a tiny magnitude to zero is ordinary FP64, not a rho threshold.
+    with np.errstate(over="raise", invalid="raise", under="ignore"):
+        correlation = np.power(abs(rho), lags)
+    return np.where(lags % 2, -correlation, correlation) if rho < 0 else correlation
+
+
+def _reference_weights(log_masses):
+    if not np.isfinite(log_masses).all():
+        raise FloatingPointError("Reference log-weights must remain finite")
+    with np.errstate(over="raise", invalid="raise", under="ignore"):
+        weights = np.exp(log_masses - logsumexp(log_masses))
+    if not np.isfinite(weights).all() or np.any(weights <= 0):
+        raise FloatingPointError("A positive reference weight is not representable in FP64")
+    weights /= weights.sum()
+    if not np.isfinite(weights).all() or np.any(weights <= 0):
+        raise FloatingPointError("Normalized reference weights must remain positive and finite")
+    return weights, np.log(weights)
+
+
+def _reference_covariance(matrix):
+    if not np.isfinite(matrix).all():
+        raise FloatingPointError("Reference predictive covariance must remain finite")
+    # Remove only antisymmetric rounding; no eigenvalue or diagonal correction.
+    symmetric = 0.5 * matrix + 0.5 * matrix.T
+    try:
+        cholesky(symmetric, lower=True, check_finite=False)
+    except np.linalg.LinAlgError as error:
+        raise FloatingPointError(
+            "Reference predictive covariance lost positive definiteness"
+        ) from error
+    return symmetric
+
+
+@dataclass(frozen=True, eq=False, init=False)
+class AR1ReferenceCalibration:
+    """Reference-калибровка одного коррелированного нормального ряда.
+
+    Parameters
+    ----------
+    values, positions, rho_grid, prior_weights
+        Те же явные входы, что у fit_ar1_reference. Конструктор выполняет
+        единственную калибровку; фабрика не добавляет другого алгоритма.
+
+    Attributes
+    ----------
+    values : numpy.ndarray, shape (n,)
+        Конечный исходный ряд в выбранной пользователем единице, n>=4.
+    positions : numpy.ndarray of int64, shape (n,)
+        Действительные целочасовые координаты; пропуски не сжимают лаги.
+    rho_grid : numpy.ndarray, shape (J,)
+        Различные коэффициенты строго внутри (-1,1).
+    prior_weights, posterior_weights, log_posterior_weights : numpy.ndarray, shape (J,)
+        Нормированные положительные веса сетки и логарифмы posterior-весов.
+    mean_location, mean_precision : numpy.ndarray, shape (J,)
+        GLS-оценки среднего и tau=1.T@inv(R)@1. Первые имеют единицу ряда;
+        tau безразмерно, поскольку R — корреляционная матрица.
+    residual_sum_squares, variance_mean : numpy.ndarray, shape (J,)
+        Q и E[v|y,rho]=Q/(n-3), в квадрате единицы ряда.
+    degrees_of_freedom : int
+        n-1, число степеней свободы каждой прогнозной Student-компоненты.
+
+    Notes
+    -----
+    Объявляется рабочая модель y|mu,v,rho~N(mu*1,v*R), R_ij=rho**|t_i-t_j|,
+    и одна общая мера prior_weights[j]*dmu*dv/v для всех узлов rho.
+    Сетка и prior-веса задаются до использования values. Их подбор по тому же
+    ряду задаёт иной эмпирический prior, а не posterior объявленного анализа.
+    Это не установленная ковариация атмосферной или приборной ошибки.
+    Параметр v — маргинальная дисперсия ряда, не дисперсия AR-инновации.
+
+    Все массивы собственные и неизменяемые. Отбеливание и суммы вычисляются
+    в FP64 без явной обратной матрицы, добавок к диагонали и усечения спектра.
+    Очень малая корреляция на большом лаге может округлиться в ноль; исходный
+    rho сохраняется. Непредставимые положительные Q, масштабы или веса вызывают
+    FloatingPointError. FP64-проверки не являются интервальным сертификатом.
+    """
+
+    values: np.ndarray
+    positions: np.ndarray
+    rho_grid: np.ndarray
+    prior_weights: np.ndarray
+    posterior_weights: np.ndarray
+    log_posterior_weights: np.ndarray
+    mean_location: np.ndarray
+    mean_precision: np.ndarray
+    residual_sum_squares: np.ndarray
+    variance_mean: np.ndarray
+    degrees_of_freedom: int
+    _mean_offsets: np.ndarray = field(repr=False)
+    _cholesky: tuple = field(repr=False)
+    _whitened_ones: tuple = field(repr=False)
+    _whitened_residuals: tuple = field(repr=False)
+
+    def __init__(self, values, positions, *, rho_grid, prior_weights):
+        data = _finite_vector(values, "values")
+        if len(data) < 4:
+            raise ValueError("Reference predictive covariance requires at least four observations")
+        if np.all(data == data[0]):
+            raise ValueError("A constant series has Q=0 and an improper reference posterior")
+        times = _hour_positions(positions, "positions", size=len(data))
+        rho = _finite_vector(rho_grid, "rho_grid")
+        prior = _finite_vector(prior_weights, "prior_weights", size=len(rho))
+        if np.any(np.abs(rho) >= 1) or len(np.unique(rho)) != len(rho):
+            raise ValueError("rho_grid requires distinct values strictly inside (-1,1)")
+        if np.any(prior <= 0):
+            raise ValueError("prior_weights must be strictly positive")
+        prior, log_prior = _reference_weights(np.log(prior))
+        locations, offsets, precisions, residual_sums, log_masses = [], [], [], [], []
+        factors, white_ones, white_residuals = [], [], []
+        with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+            centered = data - data[0]
+            if not np.isfinite(centered).all():
+                raise FloatingPointError("Reference centering lost its numerical scale")
+            for index, correlation in enumerate(rho):
+                matrix = _ar1_correlation(times, times, correlation)
+                try:
+                    factor = cholesky(matrix, lower=True, check_finite=False)
+                except np.linalg.LinAlgError as error:
+                    raise FloatingPointError(
+                        "AR(1) correlation factorization failed in FP64"
+                    ) from error
+                one = solve_triangular(factor, np.ones(len(data)), lower=True, check_finite=False)
+                white = solve_triangular(factor, centered, lower=True, check_finite=False)
+                precision = float(one @ one)
+                if not np.isfinite(precision) or precision <= 0:
+                    raise FloatingPointError("Reference mean precision lost its numerical scale")
+                offset = float((one @ white) / precision)
+                residual = solve_triangular(
+                    factor, centered - offset, lower=True, check_finite=False
+                )
+                squared = float(residual @ residual)
+                location = float(data[0] + offset)
+                if not np.isfinite([squared, offset, location]).all() or squared <= 0:
+                    raise FloatingPointError(
+                        "A positive reference residual sum is not representable"
+                    )
+                locations.append(location)
+                offsets.append(offset)
+                precisions.append(precision)
+                residual_sums.append(squared)
+                log_masses.append(
+                    log_prior[index]
+                    - np.log(np.diag(factor)).sum()
+                    - 0.5 * np.log(precision)
+                    - 0.5 * (len(data) - 1) * np.log(squared)
+                )
+                factors.append(_immutable(factor))
+                white_ones.append(_immutable(one))
+                white_residuals.append(_immutable(residual))
+            posterior, log_posterior = _reference_weights(np.asarray(log_masses))
+            variance = np.asarray(residual_sums) / (len(data) - 3)
+            if not np.isfinite(variance).all() or np.any(variance <= 0):
+                raise FloatingPointError("Reference variance means are not representable")
+        arrays = dict(
+            values=data,
+            rho_grid=rho,
+            prior_weights=prior,
+            posterior_weights=posterior,
+            log_posterior_weights=log_posterior,
+            mean_location=locations,
+            mean_precision=precisions,
+            residual_sum_squares=residual_sums,
+            variance_mean=variance,
+            _mean_offsets=offsets,
+        )
+        for name, array in arrays.items():
+            object.__setattr__(self, name, _immutable(array))
+        object.__setattr__(self, "positions", times)
+        object.__setattr__(self, "degrees_of_freedom", len(data) - 1)
+        object.__setattr__(self, "_cholesky", tuple(factors))
+        object.__setattr__(self, "_whitened_ones", tuple(white_ones))
+        object.__setattr__(self, "_whitened_residuals", tuple(white_residuals))
+
+    def predictive_moments(self, positions, *, relation):
+        """Вернуть общие среднее и ковариацию конечной прогнозной смеси.
+
+        Parameters
+        ----------
+        positions : array_like of int, shape (m,)
+            Различные возрастающие целочасовые координаты, m>=1.
+        relation : {'replicate', 'continuation'}
+            replicate задаёт новую независимую реализацию при общих mu,v,rho.
+            continuation условится на исходном ряде того же AR(1)-процесса;
+            её координаты должны быть непересекающимися с positions калибровки.
+
+        Returns
+        -------
+        mean : numpy.ndarray, shape (m,)
+            Собственное неизменяемое среднее в единице исходного ряда.
+        covariance : numpy.ndarray, shape (m,m)
+            Собственная неизменяемая ковариация в квадрате этой единицы,
+            включая неопределённость mu,v и межкомпонентный разброс средних.
+
+        Notes
+        -----
+        При фиксированном rho результат интегрирования mu,v является Student
+        с n-1 степенями свободы; его матрица масштаба не равна ковариации.
+        Смесь по rho в общем случае не является ни Student, ни нормальной.
+        Для continuation используется Schur complement R_**-R_*o R_oo^-1 R_o*.
+        Его mean-uncertainty член равен b*b.T/tau, b=1-R_*o R_oo^-1 1.
+        Возвращается симметричная часть ковариации FP64; отрицательные
+        собственные числа не исправляются, потеря SPD вызывает исключение.
+        """
+        if not isinstance(relation, str) or relation not in ("replicate", "continuation"):
+            raise ValueError("relation must be explicitly 'replicate' or 'continuation'")
+        future = _hour_positions(positions, "predictive positions")
+        if relation == "continuation" and not set(future).isdisjoint(self.positions):
+            raise ValueError("Continuation positions must be disjoint from training positions")
+        count = len(future)
+        means, covariances = [], []
+        with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+            for index, rho in enumerate(self.rho_grid):
+                correlation = _ar1_correlation(future, future, rho)
+                if relation == "replicate":
+                    relative_mean = np.full(count, self._mean_offsets[index])
+                    conditional = correlation
+                    shift = np.ones(count)
+                else:
+                    cross = _ar1_correlation(future, self.positions, rho)
+                    projected = solve_triangular(
+                        self._cholesky[index], cross.T, lower=True, check_finite=False
+                    )
+                    relative_mean = (
+                        self._mean_offsets[index] + projected.T @ self._whitened_residuals[index]
+                    )
+                    conditional = correlation - projected.T @ projected
+                    shift = np.ones(count) - projected.T @ self._whitened_ones[index]
+                component = self.variance_mean[index] * (
+                    conditional + np.outer(shift, shift) / self.mean_precision[index]
+                )
+                if not np.isfinite(relative_mean).all():
+                    raise FloatingPointError("Reference predictive mean lost its numerical scale")
+                means.append(relative_mean)
+                covariances.append(_reference_covariance(component))
+            relative_mean = self.posterior_weights @ np.asarray(means)
+            covariance = np.zeros((count, count))
+            for weight, mean, component in zip(self.posterior_weights, means, covariances):
+                difference = mean - relative_mean
+                covariance += weight * (component + np.outer(difference, difference))
+            mean = self.values[0] + relative_mean
+            if not np.isfinite(mean).all():
+                raise FloatingPointError("Reference mixture mean lost its numerical scale")
+            covariance = _reference_covariance(covariance)
+        return _immutable(mean), _immutable(covariance)
+
+
+def fit_ar1_reference(values, positions, *, rho_grid, prior_weights):
+    """Калибровать mu,v и конечную AR(1)-сетку под общей мерой dmu*dv/v.
+
+    Parameters
+    ----------
+    values : array_like, shape (n,)
+        Конечный неконстантный вещественный ряд в одной объявленной единице;
+        n>=4 требуется для конечной прогнозной ковариации. Пропуски явно
+        выбираются вызывающим кодом; маска фиксирована для всех узлов rho.
+    positions : array_like of int, shape (n,)
+        Различные возрастающие целочасовые координаты с безопасным int64 span.
+    rho_grid : array_like, shape (J,)
+        Явная непустая сетка различных коэффициентов строго внутри (-1,1).
+        Задаётся до использования values, как и prior_weights.
+    prior_weights : array_like, shape (J,)
+        Явные конечные строго положительные массы prior сетки; нормируются.
+
+    Returns
+    -------
+    AR1ReferenceCalibration
+        Собственные неизменяемые данные, GLS/IG-статистики и posterior-веса.
+        Календарное окно, физическая интерпретация остатков и перенос закона
+        между эпизодами остаются явными решениями вызывающего приложения.
+
+    Raises
+    ------
+    ValueError
+        Нарушена форма, диапазон или математическая предпосылка, включая n<4,
+        константный ряд, повторный rho или неположительный вес prior.
+    FloatingPointError
+        Допустимая модель потеряла численную представимость при факторизации,
+        вычислении положительных статистик, весов или прогнозных моментов.
+        Параметры не обрезаются, дополнительная дисперсия не вводится.
+    """
+    return AR1ReferenceCalibration(
+        values, positions, rho_grid=rho_grid, prior_weights=prior_weights
+    )

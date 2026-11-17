@@ -1,8 +1,11 @@
 """Временные базисы источника и линейные отображения коэффициентов."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from importlib.metadata import entry_points
+import json
+from operator import index
 
 import numpy as np
 from scipy.special import erf
@@ -430,13 +433,242 @@ class P1Basis:
         }
 
 
-_SOURCE_BASIS_FACTORIES = {"gaussian": GaussianBasis, "p1": P1Basis}
+@dataclass(frozen=True, init=False)
+class ShiftedBasis:
+    r"""Сдвинуть временную координату и явно продолжить исходный базис.
+
+    Parameters
+    ----------
+    basis : object or Mapping
+        Объект с size, time_unit, values, integrals, gram и to_record либо
+        запись зарегистрированного базиса. Сохраняется собственная копия.
+        В записи отсутствующая time_unit наследуется от адаптера; явно
+        указанная единица должна с ней совпадать.
+    origin : float
+        Конечное начало локального времени в time_unit: psi(s)=E phi(s-origin).
+    time_unit : str
+        Явная единица времени, совпадающая с единицей исходного базиса.
+    extension : {'native', 'zero', 'constant'}, optional
+        native делегирует исходному базису без изменения его области
+        определения. zero и constant задают соответственно нулевые и
+        постоянные по крайним значениям продолжения за interval.
+    interval : pair of float or None, optional
+        Конечные строго возрастающие границы локального времени исходного
+        базиса для zero или constant. Для native интервал не задаётся.
+
+    Notes
+    -----
+    Продолжение применяется к каждой функции базиса и её интегралам,
+    сохраняя число и порядок амплитуд. Для constant внешние части Gram
+    равны длине участка, умноженной на внешнее произведение крайних
+    значений. Интервалы пересечения интегрируются исходным методом;
+    временная квадратура не добавляется. Необязательные производные
+    исходного базиса адаптер не объявляет.
+    """
+
+    _basis: object
+    _size: int
+    origin: float
+    time_unit: str
+    extension: str
+    interval: tuple[float, float] | None
+
+    def __init__(self, basis, origin, *, time_unit, extension="native", interval=None):
+        if not isinstance(time_unit, str) or not time_unit.strip():
+            raise ValueError("A shifted basis requires an explicit time unit")
+        if (
+            np.ma.isMaskedArray(origin)
+            or not is_scalar_constant(origin)
+            or not np.isfinite(origin)
+        ):
+            raise ValueError("The time origin must be a finite real scalar")
+        if not isinstance(extension, str) or extension not in ("native", "zero", "constant"):
+            raise ValueError("extension must be 'native', 'zero', or 'constant'")
+        if extension == "native":
+            if interval is not None:
+                raise ValueError("The native extension does not accept an interval")
+            limits = None
+        else:
+            if np.ma.isMaskedArray(interval) or np.iscomplexobj(interval):
+                raise ValueError("An extension requires a finite increasing interval")
+            limits = np.asarray(interval, dtype=float)
+            if limits.shape != (2,) or not np.isfinite(limits).all() or limits[0] >= limits[1]:
+                raise ValueError("An extension requires a finite increasing interval")
+            limits = tuple(limits.tolist())
+        if isinstance(basis, Mapping):
+            record = self._child_record(basis, time_unit)
+            child = deepcopy(source_basis_from_record(record))
+        else:
+            child = deepcopy(basis)
+        if getattr(child, "time_unit", None) != time_unit:
+            raise ValueError("The shifted basis and its child must use the same time unit")
+        try:
+            size = index(child.size)
+        except (TypeError, AttributeError) as error:
+            raise ValueError("The child basis size must be a positive integer") from error
+        if isinstance(child.size, (bool, np.bool_)) or size < 1:
+            raise ValueError("The child basis size must be a positive integer")
+        for method in ("values", "integrals", "gram", "to_record"):
+            if not callable(getattr(child, method, None)):
+                raise TypeError(f"The child basis must provide {method}")
+        object.__setattr__(self, "_basis", child)
+        object.__setattr__(self, "_size", size)
+        object.__setattr__(self, "origin", float(origin))
+        object.__setattr__(self, "time_unit", time_unit)
+        object.__setattr__(self, "extension", extension)
+        object.__setattr__(self, "interval", limits)
+
+    @staticmethod
+    def _child_record(basis, time_unit):
+        if not isinstance(basis, Mapping):
+            raise TypeError("A serialized shifted basis requires a child mapping")
+        if not isinstance(time_unit, str) or not time_unit.strip():
+            raise ValueError("A shifted basis requires an explicit time unit")
+        record = deepcopy(dict(basis))
+        if record.get("time_unit", time_unit) != time_unit:
+            raise ValueError("The shifted basis and its child must use the same time unit")
+        record.setdefault("time_unit", time_unit)
+        return record
+
+    @staticmethod
+    def source_basis_dependencies(parameters):
+        """Объявить единственный вложенный базис без вызова его конструктора."""
+        return (ShiftedBasis._child_record(parameters["basis"], parameters["time_unit"]),)
+
+    @property
+    def basis(self):
+        """Независимая копия исходного базиса без доступа к сохранённому объекту."""
+        return deepcopy(self._basis)
+
+    @property
+    def size(self):
+        """Неизменённое число функций исходного базиса."""
+        return self._size
+
+    def _local(self, values):
+        if np.ma.isMaskedArray(values) or np.iscomplexobj(values):
+            raise ValueError("Shifted sample times must be finite real values")
+        values = np.array(values, dtype=float, copy=True)
+        if not np.isfinite(values).all():
+            raise ValueError("Shifted sample times must be finite real values")
+        with np.errstate(over="raise", invalid="raise"):
+            return values - self.origin
+
+    def _evaluate(self, method, *arguments, shape):
+        result = getattr(self._basis, method)(*arguments)
+        if np.ma.isMaskedArray(result) or np.iscomplexobj(result):
+            raise ValueError(f"The child basis {method} must return finite real values")
+        result = np.array(result, dtype=float, copy=True)
+        if result.shape != shape or not np.isfinite(result).all():
+            raise ValueError(f"The child basis {method} must have finite values of shape {shape}")
+        return result
+
+    def _endpoints(self, left, right):
+        if np.ma.isMaskedArray(left) or np.ma.isMaskedArray(right):
+            raise ValueError("Integration endpoints must be explicit finite values")
+        left, right = _integration_endpoints(left, right)
+        return self._local(left), self._local(right)
+
+    def values(self, times):
+        """Вычислить psi(s)=E phi(s-origin), вернув массив формы (m,size)."""
+        local = self._local(times)
+        if local.ndim != 1:
+            raise ValueError("Shifted sample times must be a finite vector")
+        if self.extension == "native":
+            return self._evaluate("values", local, shape=(len(local), self.size))
+        lo, hi = self.interval
+        if self.extension == "constant":
+            return self._evaluate("values", np.clip(local, lo, hi), shape=(len(local), self.size))
+        result = np.zeros((len(local), self.size))
+        inside = (local >= lo) & (local <= hi)
+        if np.any(inside):
+            result[inside] = self._evaluate(
+                "values", local[inside], shape=(int(inside.sum()), self.size)
+            )
+        return result
+
+    def integrals(self, left, right):
+        """Интегрировать продолженный базис по совместимым интервалам времени."""
+        left, right = self._endpoints(left, right)
+        shape = (*left.shape, self.size)
+        if self.extension == "native":
+            return self._evaluate("integrals", left, right, shape=shape)
+        lo, hi = self.interval
+        result = self._evaluate(
+            "integrals", np.clip(left, lo, hi), np.clip(right, lo, hi), shape=shape
+        )
+        if self.extension == "constant":
+            endpoints = self._evaluate("values", np.array([lo, hi]), shape=(2, self.size))
+            with np.errstate(over="raise", invalid="raise"):
+                left_length = np.minimum(right, lo) - np.minimum(left, lo)
+                right_length = np.maximum(right, hi) - np.maximum(left, hi)
+                result += left_length[..., None] * endpoints[0]
+                result += right_length[..., None] * endpoints[1]
+        return result
+
+    def gram(self, left, right):
+        """Интегрировать попарные произведения psi на одном интервале времени."""
+        left, right = self._endpoints(left, right)
+        if left.ndim or right.ndim:
+            raise ValueError("Gram endpoints must be scalars")
+        shape = (self.size, self.size)
+        if self.extension == "native":
+            return self._evaluate("gram", left.item(), right.item(), shape=shape)
+        lo, hi = self.interval
+        result = self._evaluate(
+            "gram", float(np.clip(left, lo, hi)), float(np.clip(right, lo, hi)), shape=shape
+        )
+        if self.extension == "constant":
+            endpoints = self._evaluate("values", np.array([lo, hi]), shape=(2, self.size))
+            with np.errstate(over="raise", invalid="raise"):
+                left_length = np.minimum(right, lo) - np.minimum(left, lo)
+                right_length = np.maximum(right, hi) - np.maximum(left, hi)
+                for length, endpoint in zip((left_length, right_length), endpoints):
+                    if length > 0:
+                        result += length * np.outer(endpoint, endpoint)
+        return result
+
+    def to_record(self):
+        """Сохранить вложенный базис, начало координат и правило продолжения."""
+        record = self._basis.to_record()
+        if not isinstance(record, Mapping):
+            raise TypeError("The child basis to_record must return a mapping")
+        if record.get("time_unit", self.time_unit) != self.time_unit:
+            raise ValueError("The child basis record must preserve its time unit")
+        return {
+            "type": "shifted",
+            "basis": deepcopy(dict(record)),
+            "origin": self.origin,
+            "time_unit": self.time_unit,
+            "extension": self.extension,
+            "interval": None if self.interval is None else list(self.interval),
+        }
+
+
+_SOURCE_BASIS_FACTORIES = {"gaussian": GaussianBasis, "p1": P1Basis, "shifted": ShiftedBasis}
 _SOURCE_BASIS_ENTRY_POINT_GROUP = "adrkit_timeseries.source_bases"
 
 
 def _source_basis_name(name):
     if not isinstance(name, str) or not name or name != name.strip():
         raise ValueError("Source basis name must be a nonempty string without surrounding spaces")
+
+
+def _source_basis_factory(name):
+    """Разрешить одну явно запрошенную фабрику и её установленного поставщика."""
+    _source_basis_name(name)
+    factory = _SOURCE_BASIS_FACTORIES.get(name)
+    installed = tuple(entry_points(group=_SOURCE_BASIS_ENTRY_POINT_GROUP, name=name))
+    if len(installed) + int(factory is not None) > 1:
+        raise ValueError(f"Multiple source basis factories are registered: {name!r}")
+    provider = installed[0] if installed else None
+    if provider is not None:
+        factory = provider.load()
+    if factory is None:
+        raise ValueError(f"Unknown source basis: {name!r}")
+    if not callable(factory):
+        raise TypeError(f"Source basis factory must be callable: {name!r}")
+    return factory, provider
 
 
 def register_source_basis(name, factory):
@@ -518,18 +750,104 @@ def source_basis_from_record(record):
         raise TypeError("Source basis record must be a mapping")
     parameters = dict(record)
     name = parameters.pop("type")
-    _source_basis_name(name)
-    factory = _SOURCE_BASIS_FACTORIES.get(name)
-    installed = tuple(entry_points(group=_SOURCE_BASIS_ENTRY_POINT_GROUP, name=name))
-    if len(installed) + int(factory is not None) > 1:
-        raise ValueError(f"Multiple source basis factories are registered: {name!r}")
-    if installed:
-        factory = installed[0].load()
-    if factory is None:
-        raise ValueError(f"Unknown source basis: {name!r}")
-    if not callable(factory):
-        raise TypeError(f"Source basis factory must be callable: {name!r}")
+    factory, _ = _source_basis_factory(name)
     return factory(**parameters)
+
+
+def _source_basis_signature(record):
+    if not isinstance(record, Mapping):
+        raise TypeError("Source basis dependencies must be mappings")
+    try:
+        return json.dumps(dict(record), sort_keys=True, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError, RecursionError) as error:
+        raise ValueError(
+            "Source provenance requires finite acyclic serialized JSON records"
+        ) from error
+
+
+def source_basis_providers(record, *additional_records):
+    """Собрать установленных поставщиков явно объявленного дерева базисов.
+
+    Parameters
+    ----------
+    record : Mapping
+        Конечная ациклическая JSON-сериализуемая запись базиса. В отличие
+        от source_basis_from_record, массивы NumPy и объекты базисов здесь
+        не принимаются: происхождение относится к сохраняемой конфигурации.
+        Пользовательский метод получает собственную JSON-декодированную запись.
+    *additional_records : Mapping
+        Дополнительные явно заданные корни с тем же контрактом. Например,
+        вызывающий код передаёт и запрошенный базис, и итоговую запись объекта:
+        фабрика может вернуть объект другого зарегистрированного семейства.
+
+    Returns
+    -------
+    list of dict
+        Уникальные установленные поставщики с полями name, factory,
+        distribution, version. Порядок — сначала родитель, затем дети
+        в порядке объявления; корни обходятся в порядке аргументов.
+        Встроенные и локальные фабрики не получают
+        вымышленной версии пакета; список для таких листьев пуст.
+
+    Notes
+    -----
+    Фабрика составного базиса явно предоставляет необязательный метод
+    source_basis_dependencies(parameters), где parameters — поля записи
+    без type. Он возвращает конечную последовательность записей детей,
+    не вызывает их конструкторы и не изменяет исходные настройки. Отсутствие
+    метода означает лист. Ключи type внутри произвольных параметров сами
+    по себе зависимостями не становятся.
+
+    Разрешаются те же конфликты поставщиков, что при создании базиса.
+    Загружаются только явно запрошенные фабрики, но их конструкторы не
+    вызываются. Цикл определяется повторением канонической JSON-записи
+    на активном пути; повторный тип с другими настройками и общий ребёнок
+    разных ветвей допустимы. Объявления зависимостей должны задавать конечный
+    детерминированный граф. Произвольное незавершающееся выполнение метода
+    или бесконечная последовательность различных записей не ограничиваются
+    искусственным порогом. Локальная регистрация по-прежнему не заменяет
+    установленную точку входа для независимых процессов spawn.
+    """
+    providers, recorded, complete, active = [], set(), set(), set()
+
+    def visit(current):
+        signature = _source_basis_signature(current)
+        if signature in active:
+            raise ValueError("Source basis dependencies contain a cycle")
+        if signature in complete:
+            return
+        parameters = json.loads(signature)
+        factory, provider = _source_basis_factory(parameters.pop("type"))
+        if provider is not None:
+            description = {
+                "name": provider.name,
+                "factory": provider.value,
+                "distribution": provider.dist.metadata["Name"],
+                "version": provider.dist.version,
+            }
+            if any(not isinstance(value, str) or not value for value in description.values()):
+                raise ValueError("Source provider metadata must contain nonempty strings")
+            key = tuple(description.values())
+            if key not in recorded:
+                providers.append(description)
+                recorded.add(key)
+        active.add(signature)
+        missing = object()
+        hook = getattr(factory, "source_basis_dependencies", missing)
+        if hook is not missing:
+            if not callable(hook):
+                raise TypeError("source_basis_dependencies must be callable")
+            children = hook(parameters)
+            if isinstance(children, (str, bytes, bytearray)) or not isinstance(children, Sequence):
+                raise TypeError("Source dependencies must be a finite sequence of mappings")
+            for child in children:
+                visit(child)
+        active.remove(signature)
+        complete.add(signature)
+
+    for root in (record, *additional_records):
+        visit(root)
+    return providers
 
 
 def matrix_source_map(matrix, *, scale, domain, codomain):

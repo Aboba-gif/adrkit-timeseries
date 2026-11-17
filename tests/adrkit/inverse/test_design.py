@@ -9,11 +9,142 @@ from adrkit.inverse.design import (
     CovarianceFactor,
     DesignCandidate,
     affine_goal_risk,
+    innovation_covariance_budget,
     joint_moment_risk,
     profile_information,
     robust_ball_maximum,
     select_designs,
 )
+
+
+@pytest.mark.parametrize("diagonal", [False, True])
+@pytest.mark.parametrize("physical_size", [0.1, 4.0])
+def test_innovation_budget_reconstructs_spd_covariance_and_preserves_floor(
+    diagonal, physical_size
+):
+    covariance = np.array([2.0, 1.0]) if diagonal else np.array([[2.0, 0.4], [0.4, 1.0]])
+    matrix = np.diag(covariance) if diagonal else covariance
+    physical = physical_size * np.eye(2)
+    result = innovation_covariance_budget(physical, covariance, fraction=0.7)
+    factor = result.residual_factor.factor
+    residual = factor @ factor.T
+    np.testing.assert_allclose(
+        residual + result.physical_scale * physical @ physical.T,
+        matrix,
+        rtol=2e-14,
+        atol=2e-14,
+    )
+    floor = residual - (1 - result.fraction) * matrix
+    assert np.linalg.eigvalsh(floor).min() >= -2e-14
+    expected_ratio = physical_size**2 / np.linalg.eigvalsh(matrix).min()
+    np.testing.assert_allclose(result.max_ratio, expected_ratio, rtol=2e-14)
+    if physical_size < 1:
+        assert result.physical_scale == 1.0
+    else:
+        np.testing.assert_allclose(
+            result.physical_scale * result.max_ratio, result.fraction, rtol=2e-14
+        )
+        assert 0 < result.physical_scale < 1
+
+
+def test_innovation_budget_is_invariant_under_latent_orthogonal_rotation():
+    covariance = np.array([[2.0, 0.4, -0.1], [0.4, 1.0, 0.2], [-0.1, 0.2, 1.5]])
+    physical = np.array([[2.0, -0.3], [0.4, 1.2], [-0.2, 0.5]])
+    angle = 0.37
+    rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+    first = innovation_covariance_budget(physical, covariance, fraction=0.6)
+    second = innovation_covariance_budget(physical @ rotation, covariance, fraction=0.6)
+    np.testing.assert_allclose(first.max_ratio, second.max_ratio, rtol=2e-14)
+    np.testing.assert_allclose(first.physical_scale, second.physical_scale, rtol=2e-14)
+    a, b = first.residual_factor.factor, second.residual_factor.factor
+    np.testing.assert_allclose(a @ a.T, b @ b.T, rtol=2e-14, atol=2e-14)
+
+
+@pytest.mark.parametrize("columns", [0, 2])
+def test_zero_physical_innovations_keep_full_budget_with_valid_nonsymmetric_factor(
+    columns,
+):
+    covariance = np.array([[2.0, 0.4], [0.4, 1.0]])
+    result = innovation_covariance_budget(np.zeros((2, columns)), covariance, fraction=0.6)
+    assert result.physical_scale == 1.0 and result.max_ratio == 0.0
+    factor = result.residual_factor.factor
+    assert not np.allclose(factor, factor.T)
+    np.testing.assert_allclose(factor @ factor.T, covariance, rtol=2e-14, atol=2e-14)
+
+
+def test_zero_physical_innovation_factor_does_not_remove_unobserved_true_target():
+    physical, target, estimator = (
+        np.zeros((2, 1)),
+        np.array([[2.0]]),
+        np.array([[0.3, -0.2]]),
+    )
+    budget = innovation_covariance_budget(physical, [1.0, 2.0], fraction=0.6)
+    error_map = np.column_stack(
+        (
+            np.sqrt(budget.physical_scale) * (estimator @ physical - target),
+            estimator @ budget.residual_factor.factor,
+        )
+    )
+    result = joint_moment_risk(error_map, [0.0], np.zeros(3), np.ones(3))
+    noise_variance = np.linalg.norm(estimator @ budget.residual_factor.factor) ** 2
+    np.testing.assert_allclose(result.value, 4.0 + noise_variance, rtol=2e-14)
+
+
+def test_innovation_budget_requires_matching_physical_scaling_in_data_and_target():
+    physical = np.diag([2.0, 0.5])
+    result = innovation_covariance_budget(physical, np.ones(2), fraction=0.6)
+    residual = result.residual_factor.factor @ result.residual_factor.factor.T
+    wrong_budget = residual + physical @ physical.T
+    excess = (1 - result.physical_scale) * physical @ physical.T
+    np.testing.assert_allclose(wrong_budget - np.eye(2), excess, rtol=2e-14, atol=2e-14)
+    assert np.linalg.eigvalsh(wrong_budget - np.eye(2)).min() > 0
+    root_scale = np.sqrt(result.physical_scale)
+    # Identity estimator and physical target have the same map before allocation.
+    correct = np.column_stack(
+        (root_scale * physical - root_scale * physical, result.residual_factor.factor)
+    )
+    wrong = np.column_stack((root_scale * physical - physical, result.residual_factor.factor))
+    correct_risk = joint_moment_risk(correct, np.zeros(2), np.zeros(4), np.ones(4))
+    wrong_risk = joint_moment_risk(wrong, np.zeros(2), np.zeros(4), np.ones(4))
+    np.testing.assert_allclose(correct_risk.value, np.trace(residual), rtol=2e-14)
+    assert wrong_risk.value > correct_risk.value
+
+
+@pytest.mark.parametrize("fraction", [0.0, 1.0, -0.1, True, np.nan])
+def test_innovation_budget_rejects_invalid_fraction(fraction):
+    with pytest.raises(ValueError):
+        innovation_covariance_budget(np.eye(2), np.ones(2), fraction=fraction)
+
+
+@pytest.mark.parametrize(
+    "covariance",
+    [[1.0, 0.0], [1.0, -1.0], [[1.0, 1.0], [1.0, 1.0]], [[1.0, 0.5], [0.1, 1.0]]],
+)
+def test_innovation_budget_requires_strictly_positive_covariance(covariance):
+    with pytest.raises(ValueError):
+        innovation_covariance_budget(np.eye(2), covariance, fraction=0.7)
+
+
+@pytest.mark.parametrize("size", [1e-200, 1e200])
+def test_innovation_budget_rejects_unrepresentable_spectral_scale(size):
+    with pytest.raises(ValueError):
+        innovation_covariance_budget([[size]], [1.0], fraction=0.7)
+
+
+def test_innovation_budget_validates_shape_mask_and_owns_factor():
+    with pytest.raises(ValueError):
+        innovation_covariance_budget(np.zeros((0, 1)), [], fraction=0.7)
+    with pytest.raises(ValueError):
+        innovation_covariance_budget(np.ma.array([[1.0]], mask=True), [1.0], fraction=0.7)
+    with pytest.raises(ValueError):
+        innovation_covariance_budget([[1.0 + 1j]], [1.0], fraction=0.7)
+    physical, covariance = np.eye(2), np.array([[2.0, 0.4], [0.4, 1.0]])
+    result = innovation_covariance_budget(physical, covariance, fraction=0.7)
+    saved = result.residual_factor.factor.copy()
+    physical[:] = 9
+    covariance[:] = 8
+    np.testing.assert_array_equal(result.residual_factor.factor, saved)
+    assert not result.residual_factor.factor.flags.writeable
 
 
 def test_joint_moment_risk_matches_finite_joint_population_with_nonlinear_component():
