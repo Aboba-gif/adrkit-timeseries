@@ -1,5 +1,6 @@
 """Гладкая оптимизация функционалов и нелинейных наименьших квадратов."""
 
+from fractions import Fraction
 from operator import index
 
 import numpy as np
@@ -219,6 +220,50 @@ def _squared_norm_roundoff(values, value):
     with np.errstate(over="ignore", under="ignore"):
         bound = np.nextafter(relative * value, np.inf)
     return float(bound) if np.isfinite(bound) else None
+
+
+def _armijo_decrease(values, trial_values, coefficient, step_size, slope):
+    """Сравнить точное изменение нормы сохранённых невязок с порогом Армихо.
+
+    В обычном случае применяется разложение разности квадратов и оценка
+    округления для суммы со знаками. Рядом с границей или при субнормальных
+    операциях сравниваются точные двоичные значения уже вычисленных входов.
+    Точность вычисления самих невязок и направленной производной не оценивается.
+    """
+    limits = np.finfo(float)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        differences = trial_values - values
+        midpoints = 0.5 * (trial_values + values)
+        terms = differences * midpoints
+        change = float(terms.sum())
+        magnitude = float(np.abs(terms).sum())
+        threshold = coefficient * slope * step_size
+        # 2*(n+3)*eps bounds both the signed reduction and the two RHS products.
+        relative_error = 2 * (terms.size + 3) * limits.eps
+        margin = np.nextafter(relative_error * (magnitude + abs(threshold)), np.inf)
+        zero_terms = (values == trial_values) | (values == -trial_values)
+        normal_terms = (
+            (np.abs(differences) >= limits.tiny)
+            & (np.abs(midpoints) >= limits.tiny)
+            & (np.abs(terms) >= limits.tiny)
+        )
+        if (
+            abs(threshold) >= limits.tiny
+            and relative_error < 0.5
+            and np.isfinite(margin)
+            and np.all(zero_terms | normal_terms)
+        ):
+            if change <= np.nextafter(threshold - margin, -np.inf):
+                return True
+            if change > np.nextafter(threshold + margin, np.inf):
+                return False
+
+    twice_change = Fraction()
+    for before, after in zip(values, trial_values, strict=True):
+        if abs(before) != abs(after):
+            previous, current = Fraction(float(before)), Fraction(float(after))
+            twice_change += (current - previous) * (current + previous)
+    return twice_change <= 2 * Fraction(coefficient) * Fraction(step_size) * Fraction(slope)
 
 
 def _validate_bounded_step(
@@ -670,9 +715,8 @@ def solve_damped_gauss_newton(
                 )
             if gradient @ (trial - x) < 0:
                 trial_r, trial_fun = evaluate(trial)
-                if (
-                    trial_fun
-                    <= fun + settings["armijo_coefficient"] * step_size * directional_derivative
+                if _armijo_decrease(
+                    r, trial_r, settings["armijo_coefficient"], step_size, directional_derivative
                 ):
                     x, r, fun = trial, trial_r, trial_fun
                     step_acceptance = "armijo"

@@ -135,6 +135,50 @@ def test_dot_roundoff_bound_covers_exact_rational_half_squared_norm():
     assert abs(Fraction.from_float(computed) - exact) <= Fraction.from_float(bound)
 
 
+def test_armijo_rejects_an_increase_hidden_by_a_constant_residual():
+    def predict(point):
+        x = point[0]
+        return np.array([1.0 + x + 4.0 * x**2, 2.0**30])
+
+    def jacobian(point):
+        return np.array([[1.0 + 8.0 * point[0]], [0.0]])
+
+    residual = map_from_functions(
+        domain=space(1, "parameter"),
+        codomain=space(2, "residual"),
+        predict=predict,
+        jacobian=jacobian,
+    )
+    # The projected-gradient damping is 1, so the full GN direction is -1/2.
+    # At that point the variable residual grows from 1 to 3/2, while the
+    # constant channel makes both computed scalar costs round to the same value.
+    result = optimizers.solve_damped_gauss_newton(
+        residual,
+        [0.0],
+        bounds=[(-1.0, 1.0)],
+        options={"damping_rule": "projected-gradient", "max_backtracks": 0},
+    )
+    assert result.status == -2 and result.nit == 0
+    assert result.step_acceptance is None
+    np.testing.assert_array_equal(result.x, [0.0])
+
+
+def test_armijo_resolves_cancellation_between_signed_residual_changes():
+    unit = 2.0**-52
+    values = np.array([1 + 2 * unit, 1 + 2 * unit, 1 + 3 * unit, unit])
+    trial_values = np.array([1 + 3 * unit, 1 + 3 * unit, 1 + unit, 0.0])
+
+    # Rounding the two sums 2 + 5*unit can reverse the sign of the factored dot.
+    assert not optimizers._armijo_decrease(values, trial_values, 0.25, 1.0, -(unit**2))
+    assert optimizers._armijo_decrease(trial_values, values, 0.25, 1.0, -(unit**2))
+
+
+def test_armijo_requires_decrease_even_if_the_negative_threshold_underflows():
+    values = np.ones(1)
+    slope = -float(np.nextafter(0.0, 1.0))
+    assert not optimizers._armijo_decrease(values, values, 0.25, 0.5, slope)
+
+
 def test_roundoff_trial_near_a_bound_still_requires_the_interior_gradient():
     origin, floor = 2.0**-20, 2.0**28
     offset = 1.0 - 2.0**-8
@@ -307,7 +351,16 @@ def test_descent_to_known_nonzero_residual_stationary_point():
     assert result.success and result.status == 2
     assert result.fun > 0.99
     np.testing.assert_allclose(result.x, 0.0, atol=5e-11, rtol=0)
-    assert all(b.fun <= a.fun for a, b in zip(trajectory, trajectory[1:]))
+
+    def squared_norm(point):
+        values = residual.predict.predict(point.x)
+        return sum(Fraction(float(value)) ** 2 for value in values)
+
+    for current, trial in zip(trajectory, trajectory[1:]):
+        if trial.step_acceptance == "stationary_trial":
+            assert trial is trajectory[-1] and trial.optimality <= 1e-10
+        else:
+            assert squared_norm(trial) < squared_norm(current)
     for point in trajectory[1:]:
         assert point.directional_derivative < 0.0
         assert point.directional_derivative + point.step_curvature <= point.qp_error_bound
