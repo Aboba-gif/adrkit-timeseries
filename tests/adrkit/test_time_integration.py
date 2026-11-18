@@ -26,7 +26,8 @@ def generator():
 
 
 @pytest.mark.parametrize("distributed", [False, True])
-def test_many_tangents_match_finite_differences_scalar_actions_and_pullback(distributed):
+@pytest.mark.parametrize("beta", [0.0, 0.3])
+def test_many_tangents_match_finite_differences_scalar_actions_and_pullback(distributed, beta):
     rng = np.random.default_rng(501)
     count, intervals = 4, 5
     q = generator()
@@ -37,9 +38,10 @@ def test_many_tangents_match_finite_differences_scalar_actions_and_pullback(dist
     load = None if distributed else np.array([0.4, 0.0, 0.2])
     di = rng.normal(scale=0.1, size=(3, count))
     df = rng.normal(scale=0.1, size=(*forcing.shape, count))
-    da, db = rng.normal(scale=0.1, size=count), rng.normal(scale=0.1, size=count)
+    da = rng.normal(scale=0.1, size=count)
+    db = rng.normal(scale=0.1, size=count) if beta else np.zeros(count)
     action = PositiveAffineAction(q, -0.2, step=0.1, rate=5, degree=14)
-    trajectory = solve_strang(action, initial, forcing, beta=0.3, load=load)
+    trajectory = solve_strang(action, initial, forcing, beta=beta, load=load)
     batch = trajectory.jvp_many(
         di, df, operator_partials=partials, operator_directions=coefficients, dalpha=da, dbeta=db
     )
@@ -69,7 +71,7 @@ def test_many_tangents_match_finite_differences_scalar_actions_and_pullback(dist
                 ),
                 initial + sign * step * di[:, j],
                 forcing + sign * step * df[..., j],
-                beta=0.3 + sign * step * db[j],
+                beta=beta + sign * step * db[j],
                 load=load,
             ).states
             for sign in (1, -1)
@@ -107,6 +109,26 @@ def test_affine_many_tangent_shares_the_same_fixed_polynomial_action():
         ]
     )
     np.testing.assert_allclose(actual, expected, rtol=3e-14, atol=3e-15)
+
+
+def test_source_and_initial_tangents_without_quadratic_decay_are_affine_steps(monkeypatch):
+    action = PositiveAffineAction(generator(), -0.2, step=0.1, rate=5, degree=14)
+    load = np.array([0.4, 0.0, 0.2])
+    trajectory = solve_strang(action, [0.3, 0.1, 0.4], [0.3, 0.2], load=load)
+    di = np.array([[0.1, 0.0], [0.0, 0.0], [0.4, 0.0]])
+    df = np.array([[0.0, 0.4], [0.0, 0.2]])
+    expected = np.stack(
+        [solve_strang(action, di[:, j], df[:, j], load=load).states for j in range(2)],
+        axis=-1,
+    )
+
+    def forbid_primal_powers(*args):
+        pytest.fail("Fixed linear dynamics do not require replaying primal powers")
+
+    monkeypatch.setattr(PositiveAffineAction, "_powers", forbid_primal_powers)
+    np.testing.assert_allclose(
+        trajectory.jvp_many(di, df, dbeta=np.zeros(2)), expected, rtol=3e-14, atol=3e-15
+    )
 
 
 def test_many_tangent_requires_declared_operator_direction_dimensions():

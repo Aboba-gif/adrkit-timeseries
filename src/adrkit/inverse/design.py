@@ -297,6 +297,56 @@ class CenteredBudgetGoalRisk:
     value: float
     argmax: float
 
+    @classmethod
+    def from_coefficients(cls, d, h, a, *, max_scale):
+        """Вычислить характеристики полинома риска d-2*h*s+a*s**2."""
+        d = real_scalar(d, name="centered constant coefficient")
+        h = real_scalar(h, name="centered mean cross term")
+        a = real_scalar(a, name="centered quadratic coefficient")
+        limit = real_scalar(max_scale, name="maximum physical scale")
+        if not 0 <= limit <= 1:
+            raise ValueError("Maximum physical scale must lie in [0,1]")
+        if d < 0:
+            raise ValueError("The risk at scale zero must be nonnegative")
+
+        def risk(scale):
+            if scale == 0:
+                return d
+            linear = np.multiply(h, scale)
+            quadratic = np.multiply(np.multiply(a, scale), scale)
+            value = real_scalar(
+                fsum((d, -linear, -linear, quadratic)), name="centered goal risk"
+            )
+            if value < 0:
+                raise ValueError(
+                    "A centered risk value is negative: incompatible inputs or "
+                    "unresolved FP64 cancellation; no PSD conclusion is certified"
+                )
+            return value
+
+        try:
+            with np.errstate(over="raise", invalid="raise", divide="raise", under="raise"):
+                endpoint = risk(limit)
+                vertex, vertex_value = None, None
+                # Только h/a из (0,1) может быть внутренней точкой.
+                if limit > 0 and a * np.sign(h) > 0 and 0 < abs(h) < abs(a):
+                    candidate = real_scalar(np.divide(h, a), name="stationary physical scale")
+                    if candidate == 0:
+                        raise ValueError(
+                            "An interior physical scale underflowed; rescale target units"
+                        )
+                    if candidate < limit:
+                        vertex, vertex_value = candidate, risk(candidate)
+        except (FloatingPointError, OverflowError) as error:
+            raise ValueError(
+                "Centered budget arithmetic lost its scale; rescale the target units"
+            ) from error
+        points = [(0.0, d), (limit, endpoint)]
+        if vertex is not None:
+            points.append((vertex, vertex_value))
+        argmax, maximum = min(points, key=lambda pair: (-pair[1], pair[0]))
+        return cls(d, h, a, limit, d, endpoint, vertex, vertex_value, maximum, argmax)
+
 
 def centered_budget_goal_risk(
     offset,
@@ -409,43 +459,11 @@ def centered_budget_goal_risk(
                 name="centered quadratic coefficient",
             )
 
-            def risk(scale):
-                if scale == 0:
-                    return d
-                linear = np.multiply(h, scale)
-                quadratic = np.multiply(np.multiply(a, scale), scale)
-                value = real_scalar(
-                    fsum((d, -linear, -linear, quadratic)), name="centered goal risk"
-                )
-                if value < 0:
-                    raise ValueError(
-                        "A centered risk value is negative: incompatible inputs or "
-                        "unresolved FP64 cancellation; no PSD conclusion is certified"
-                    )
-                return value
-
-            endpoint = risk(limit)
-            vertex, vertex_value = None, None
-            # Only h/a in (0,1) can be interior; avoid an overflowing exterior ratio.
-            if limit > 0 and a * np.sign(h) > 0 and 0 < abs(h) < abs(a):
-                candidate = real_scalar(np.divide(h, a), name="stationary physical scale")
-                if candidate == 0:
-                    raise ValueError(
-                        "An interior physical scale underflowed; rescale target units"
-                    )
-                if candidate < limit:
-                    vertex, vertex_value = candidate, risk(candidate)
     except (FloatingPointError, OverflowError) as error:
         raise ValueError(
             "Centered budget arithmetic lost its scale; rescale the target units"
         ) from error
-    points = [(0.0, d), (limit, endpoint)]
-    if vertex is not None:
-        points.append((vertex, vertex_value))
-    argmax, maximum = min(points, key=lambda pair: (-pair[1], pair[0]))
-    return CenteredBudgetGoalRisk(
-        d, h, a, limit, d, endpoint, vertex, vertex_value, maximum, argmax
-    )
+    return CenteredBudgetGoalRisk.from_coefficients(d, h, a, max_scale=limit)
 
 
 @dataclass(frozen=True)

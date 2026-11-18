@@ -682,6 +682,50 @@ def test_default_damping_preserves_the_explicit_objective_rule():
     assert default.damping_rule == explicit.damping_rule == "objective"
 
 
+def test_cyclic_gauss_newton_reopens_source_after_coefficients_change():
+    residual = linear_residual(np.array([[1.0, -1.0], [0.0, 1.0]]), np.array([-0.1, 1.0]))
+    trajectory = []
+    result = optimizers.solve_damped_gauss_newton(
+        residual,
+        [0.0, 0.0],
+        bounds=((0.0, None), (0.0, 2.0)),
+        blocks=((0,), (1,)),
+        callback=trajectory.append,
+    )
+    assert trajectory[0].block_optimality[0] == 0
+    assert trajectory[1].x[0] == 0 and trajectory[1].x[1] > 0
+    assert trajectory[1].block_optimality[0] > 0
+    assert trajectory[2].x[0] > 0 and trajectory[2].x[1] == trajectory[1].x[1]
+    assert result.success
+    np.testing.assert_allclose(result.x, [0.9, 1.0], rtol=0.0, atol=1e-7)
+    assert max(result.block_optimality) == result.optimality <= 1e-8
+    for previous, current in zip(trajectory, trajectory[1:]):
+        assert np.count_nonzero(current.x != previous.x) == 1
+        assert current.fun <= previous.fun
+
+
+def test_cyclic_gauss_newton_reports_early_limit_on_the_current_pair():
+    residual = linear_residual(np.array([[1.0, -1.0], [0.0, 1.0]]), np.array([-0.1, 1.0]))
+    result = optimizers.solve_damped_gauss_newton(
+        residual,
+        [0.0, 0.0],
+        bounds=((0.0, None), (0.0, 2.0)),
+        blocks=((0,), (1,)),
+        options={"maxiter": 1},
+    )
+    assert result.status == 0 and not result.success
+    assert result.x[0] == 0 and result.block_optimality[0] > 0
+
+
+@pytest.mark.parametrize(
+    "blocks", [((0,),), ((0,), (0, 1)), ((0,), (2,)), ((0, False), (1,)), ((), (0, 1))]
+)
+def test_cyclic_gauss_newton_rejects_invalid_partitions(blocks):
+    residual = linear_residual(np.eye(2), np.ones(2))
+    with pytest.raises(ValueError, match="[Cc]oordinate blocks"):
+        optimizers.solve_damped_gauss_newton(residual, [0.0, 0.0], blocks=blocks)
+
+
 def test_projected_gradient_damping_resolves_weak_curvature_with_nonzero_noise_floor():
     curvature, floor_residual = 2e-8, 0.02
     residual = linear_residual(

@@ -273,7 +273,29 @@ def _validate_bounded_step(
     return direction, diagnostics, accepted
 
 
-def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, callback=None):
+def _coordinate_blocks(blocks, size):
+    """Validate an ordered partition of the flattened domain."""
+    groups = []
+    try:
+        for block in blocks:
+            coordinates = []
+            for coordinate in block:
+                if isinstance(coordinate, (bool, np.bool_)):
+                    raise TypeError
+                coordinates.append(index(coordinate))
+            if not coordinates:
+                raise ValueError("Coordinate blocks must be nonempty")
+            groups.append(coordinates)
+    except TypeError as error:
+        raise ValueError("Coordinate blocks must contain integer indices") from error
+    if sorted(coordinate for block in groups for coordinate in block) != list(range(size)):
+        raise ValueError("Coordinate blocks must partition the residual domain")
+    return tuple(np.asarray(block, dtype=np.intp) for block in groups)
+
+
+def solve_damped_gauss_newton(
+    residual, initial, *, bounds=None, options=None, callback=None, blocks=None
+):
     r"""Минимизировать половину квадрата нормы невязки с границами.
 
     Parameters
@@ -299,6 +321,12 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
     callback : callable or None, optional
         callback(result) вызывается в начальной и каждой принятой точке.
         Получает независимый OptimizeResult; StopIteration останавливает метод.
+    blocks : sequence of sequences of int or None, optional
+        Упорядоченное разбиение координат в порядке C. При None шаг включает
+        все свободные координаты. С разбиением метод циклически делает по одному
+        шагу Гаусса — Ньютона на блок, пропуская блоки, уже удовлетворяющие gtol.
+        Поиск Армихо использует полную невязку, критерий остановки — полный
+        проекционный градиент в текущей точке.
 
     Returns
     -------
@@ -316,6 +344,8 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
         -1 — не подтверждён шаг подзадачи; -2 — не выполнено Армихо;
         -3 — численный застой; 99 — остановка callback.
         success истинен только для status 1 или 2.
+        При заданных blocks nit и maxiter относятся к принятым блочным шагам,
+        а block_optimality содержит нормы по блокам в одной возвращаемой точке.
 
     Notes
     -----
@@ -420,7 +450,9 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
     upper = np.array([np.inf if b is None else b for _, b in pairs])
     if np.any(x < lower) or np.any(x > upper):
         raise ValueError("initial must satisfy the coefficient bounds")
-    free = lower < upper
+    movable = lower < upper
+    coordinate_blocks = None if blocks is None else _coordinate_blocks(blocks, x.size)
+    next_block = 0
     nfev = njev = njvp = 0
     step_size = damping = 0.0
     qp_optimality = qp_error_bound = directional_derivative = step_curvature = None
@@ -472,7 +504,7 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
         return matrix, matrix.T @ values
 
     def result(status, message):
-        return OptimizeResult(
+        outcome = OptimizeResult(
             x=x.copy(),
             fun=fun,
             jac=gradient.copy(),
@@ -495,6 +527,9 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
             step_acceptance=step_acceptance,
             step_acceptance_reason=step_acceptance_reason,
         )
+        if coordinate_blocks is not None:
+            outcome.block_optimality = block_optimality
+        return outcome
 
     r, fun = evaluate(x)
     for iteration in range(settings["maxiter"] + 1):
@@ -509,6 +544,10 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
             gradient > 0, np.minimum(gradient, x - lower), np.maximum(gradient, x - upper)
         )
         optimality = float(np.linalg.norm(projected, np.inf))
+        if coordinate_blocks is not None:
+            block_optimality = tuple(
+                float(np.linalg.norm(projected[block], np.inf)) for block in coordinate_blocks
+            )
         if callback is not None:
             try:
                 callback(result(0, "Current accepted point"))
@@ -528,6 +567,19 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
             return result(0, "Maximum number of iterations reached")
         if fun == 0:
             return result(-3, "Positive residual cost underflowed; rescale the residual")
+
+        free = movable
+        if coordinate_blocks is not None:
+            for _ in coordinate_blocks:
+                active_block = next_block
+                next_block = (next_block + 1) % len(coordinate_blocks)
+                if block_optimality[active_block] > settings["gtol"]:
+                    block = coordinate_blocks[active_block]
+                    free = np.zeros_like(movable)
+                    free[block] = movable[block]
+                    break
+            else:
+                return result(-3, "No coordinate block has a finite descent certificate")
 
         step_size = 0.0
         qp_optimality = qp_error_bound = directional_derivative = step_curvature = None
@@ -640,17 +692,17 @@ def solve_damped_gauss_newton(residual, initial, *, bounds=None, options=None, c
                         and np.all(trial <= upper)
                     ):
                         trial_matrix, trial_gradient = linearize(trial, trial_r)
-                        projected = np.where(
+                        trial_projected = np.where(
                             trial_gradient > 0,
                             np.minimum(trial_gradient, trial - lower),
                             np.maximum(trial_gradient, trial - upper),
                         )
                         interior = (trial > lower) & (trial < upper)
-                        trial_lower = (trial == lower) & free
-                        trial_upper = (trial == upper) & free
+                        trial_lower = (trial == lower) & movable
+                        trial_upper = (trial == upper) & movable
                         if (
                             np.isfinite(trial_gradient).all()
-                            and np.max(np.abs(projected)) <= settings["gtol"]
+                            and np.max(np.abs(trial_projected)) <= settings["gtol"]
                             and np.max(np.abs(trial_gradient[interior]), initial=0.0)
                             <= settings["gtol"]
                             and np.min(trial_gradient[trial_lower], initial=0.0)

@@ -634,7 +634,6 @@ class PositiveAffineAction:
 
     def _tangent_many(self, powers, du, df, partials, directions, dalpha, *, plan=None):
         xp = self._xp
-        up, fp = powers
         result = xp.zeros_like(du)
         if plan is None:
             active = xp.flatnonzero(xp.any(directions, axis=0))
@@ -643,6 +642,8 @@ class PositiveAffineAction:
                 slice(None) if active.size == du.shape[1] else active,
             )
         varying_alpha, selected = plan
+        if varying_alpha or partials:
+            up, fp = powers
         operator_coefficients = directions[:, selected]
         for k in range(self.degree + 1):
             result += self._growth * self._a[k] * du + self._b[k] * df
@@ -1044,7 +1045,9 @@ class StrangTrajectory:
             как nt*N*K. Исходная траектория и входные направления остаются
             в памяти; распределённый d_forcing сам имеет форму (nt,N,K).
             На GPU накопленная проверка конечности завершается при полном
-            исчерпании итератора. Прямой шаг не изменяется.
+            исчерпании итератора. При beta=0 и dbeta=0 реакционные
+            подшаги в производной тождественны. Если транспорт и линейная
+            реакция также фиксированы, исходные степени полинома не нужны.
         """
         affine, half = self.affine, self.affine.step / 2
         xp = affine.array_module
@@ -1074,14 +1077,19 @@ class StrangTrajectory:
             bool(xp.any(dalpha)),
             slice(None) if active.size == count else active,
         )
+        linear_reaction = self.beta == 0.0 and not bool(xp.any(dbeta))
+        needs_powers = not linear_reaction or tangent_plan[0] or bool(partials)
         valid = xp.asarray(True)
         yield current if xp is np else current.copy()
         for n in range(len(self._states) - 1):
-            first = _decay(self._states[n], self.beta, half, xp=xp)
-            du, db = _decay_partials(self._states[n], first, half, xp=xp)
-            powers = affine._powers(first, self._frame(n))
-            middle = affine._value(powers)
-            first_direction = du[:, None] * current + xp.multiply.outer(db, dbeta)
+            state = self._states[n]
+            if linear_reaction:
+                first, first_direction = state, current
+            else:
+                first = _decay(state, self.beta, half, xp=xp)
+                du, db = _decay_partials(state, first, half, xp=xp)
+                first_direction = du[:, None] * current + xp.multiply.outer(db, dbeta)
+            powers = affine._powers(first, self._frame(n)) if needs_powers else None
             if forcing is None:
                 forcing_direction = xp.zeros_like(current)
             else:
@@ -1097,8 +1105,12 @@ class StrangTrajectory:
                 dalpha,
                 plan=tangent_plan,
             )
-            du, db = _decay_partials(middle, self._states[n + 1], half, xp=xp)
-            current = du[:, None] * tangent + xp.multiply.outer(db, dbeta)
+            if linear_reaction:
+                current = tangent
+            else:
+                middle = affine._value(powers)
+                du, db = _decay_partials(middle, self._states[n + 1], half, xp=xp)
+                current = du[:, None] * tangent + xp.multiply.outer(db, dbeta)
             if xp is np:
                 if not np.isfinite(current).all():
                     raise FloatingPointError("The batched tangent is not representable")
