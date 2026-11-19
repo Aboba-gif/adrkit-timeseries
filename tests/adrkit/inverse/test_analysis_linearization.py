@@ -235,6 +235,36 @@ def test_minres_success_flag_does_not_replace_the_true_residual_check(monkeypatc
         linearization.operator @ [1.0, 0.0]
 
 
+def test_inverse_action_scales_a_tiny_physical_right_hand_side():
+    hessian = np.diag([2.0, 5.0, 10.0])
+    inverse = constraints._restricted_inverse_action(
+        lambda direction: hessian @ direction, 3, [0, 2], solve_rtol=1e-12, maxiter=6
+    )
+    amplitude = 1e-200
+    with np.errstate(under="raise"):
+        actual = inverse(amplitude * np.array([1.0, 8.0, -2.0]))
+    np.testing.assert_allclose(actual / amplitude, [0.5, 0.0, -0.2], rtol=1e-12)
+
+
+def test_inverse_action_rescales_for_underflow_in_the_minres_solution_norm():
+    inverse = constraints._restricted_inverse_action(
+        lambda direction: 1e100 * direction, 1, [0], solve_rtol=1e-12, maxiter=6
+    )
+    with np.errstate(under="raise"):
+        actual = inverse(np.array([1e-100]))
+    np.testing.assert_allclose(actual / 1e-200, [1.0], rtol=1e-12)
+
+
+def test_inverse_action_checks_residual_after_subnormal_solution_rounding():
+    inverse = constraints._restricted_inverse_action(
+        lambda direction: 2.0 * direction, 1, [0], solve_rtol=1e-12, maxiter=6
+    )
+    right = np.array([np.finfo(float).smallest_subnormal])
+    with np.errstate(under="raise"):
+        with pytest.raises(RuntimeError, match="true relative linear residual"):
+            inverse(right)
+
+
 @pytest.mark.parametrize("budget", [1, 6])
 def test_true_residual_controls_correction_with_one_shared_iteration_budget(monkeypatch, budget):
     options = {**_options(), "maxiter": budget}

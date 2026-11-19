@@ -2,11 +2,12 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from math import fsum
+from math import frexp, fsum
 from types import MappingProxyType
 
 import numpy as np
 from scipy.linalg import norm, solve_triangular
+from scipy.linalg.blas import dnrm2
 from scipy.optimize import OptimizeResult, linprog
 from scipy.sparse.linalg import LinearOperator, minres
 
@@ -131,6 +132,19 @@ def _restricted_inverse_action(hessian_action, size, free, *, solve_rtol, maxite
         else None
     )
 
+    def scale_power_of_two(values, exponent):
+        # The returned physical solution can be subnormal. Its residual is
+        # checked after this rounding, even when a component rounds to zero.
+        with np.errstate(under="ignore"):
+            return np.ldexp(values, exponent)
+
+    def normalization_exponent(values):
+        return frexp(float(np.max(np.abs(values))))[1]
+
+    # MINRES squares Krylov vectors in the working precision. Below this scale
+    # their squared norm can be subnormal, even for a nonzero right-hand side.
+    minimum_native_norm = float(np.sqrt(np.finfo(float).tiny))
+
     def inverse_action(right):
         right = real_array(right, name="inverse Hessian right-hand side")
         if right.shape not in ((size,), (size, 1)):
@@ -146,8 +160,11 @@ def _restricted_inverse_action(hessian_action, size, free, *, solve_rtol, maxite
         if inner_rtol == 0:
             raise ValueError("The requested internal MINRES tolerance is not representable")
         right_norm = norm(selected)
-        if not np.isfinite(right_norm) or right_norm == 0:
-            raise ValueError("The free right-hand-side norm is not representable")
+        scaled = right_norm < minimum_native_norm or not np.isfinite(right_norm)
+        if scaled:
+            right_exponent = normalization_exponent(selected)
+            selected = scale_power_of_two(selected, -right_exponent)
+            right_norm = dnrm2(selected)
         solution = np.zeros(free.size)
         residual = selected.copy()
         residual_norm = right_norm
@@ -159,23 +176,55 @@ def _restricted_inverse_action(hessian_action, size, free, *, solve_rtol, maxite
                 nonlocal used
                 used += 1
 
-            correction, info = minres(
-                reduced,
-                residual,
-                rtol=inner_rtol,
-                maxiter=maxiter - iterations,
-                callback=count_iteration,
-                check=True,
+            residual_exponent = (
+                normalization_exponent(residual)
+                if scaled or residual_norm < minimum_native_norm
+                else 0
             )
+            try:
+                correction, info = minres(
+                    reduced,
+                    scale_power_of_two(residual, -residual_exponent)
+                    if residual_exponent
+                    else residual,
+                    rtol=inner_rtol,
+                    maxiter=maxiter - iterations,
+                    callback=count_iteration,
+                    check=True,
+                )
+            except FloatingPointError as error:
+                if scaled or not str(error).startswith("underflow encountered"):
+                    raise
+                # An interrupted Krylov step can underflow before its callback.
+                iterations += used + 1
+                right_exponent = normalization_exponent(selected)
+                if not right_exponent:
+                    raise
+                selected = scale_power_of_two(selected, -right_exponent)
+                solution = scale_power_of_two(solution, -right_exponent)
+                residual = scale_power_of_two(residual, -right_exponent)
+                right_norm = dnrm2(selected)
+                residual_norm = dnrm2(residual)
+                scaled = True
+                continue
             iterations += used
             if info < 0:
                 raise RuntimeError("MINRES failed the requested true relative linear residual")
             correction = real_array(correction, name="free linear correction")
-            updated = real_array(solution + correction, name="free linear solution")
+            if residual_exponent:
+                correction = scale_power_of_two(correction, residual_exponent)
+            updated = solution + correction
+            if scaled:
+                represented = real_array(
+                    scale_power_of_two(updated, right_exponent), name="free linear solution"
+                )
+                updated = scale_power_of_two(represented, -right_exponent)
+            else:
+                represented = real_array(updated, name="free linear solution")
             actual = real_array(selected - reduced @ updated, name="free linear residual")
-            actual_norm = norm(actual)
+            actual_norm = dnrm2(actual) if scaled else norm(actual)
             if actual_norm / right_norm <= solve_rtol:
-                result[free] = updated
+                result[free] = represented
                 return result
             if (
                 info > 0
