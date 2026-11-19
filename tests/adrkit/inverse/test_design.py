@@ -1417,6 +1417,70 @@ def test_finite_design_descent_persists_screening_separately_and_resumes():
     assert resumed.pruned_frontier == (excluded,) and reused == bounds
 
 
+@pytest.mark.parametrize("tied_total", [1.0, 2.0])
+def test_streamed_design_tightens_only_unsent_jobs_and_preserves_ties(tied_total):
+    pool = frozenset("kabcd")
+    first, second, excluded, tied = (pool - {name} for name in "dcba")
+    values = {
+        pool: {"g": 8.0, "h": 8.0},
+        first: {"g": 3.0, "h": 2.0},
+        second: {"g": 5.0, "h": 3.0},
+        excluded: {"g": 4.0, "h": 1.0},
+        tied: {"g": 3.0, "h": tied_total},
+    }
+    submitted, archived, bounds = [], {}, {}
+
+    def stream(claim):
+        initial = claim()
+        if initial is None:
+            return
+        submitted.extend((initial, claim()))
+        assert submitted == [(first, 8.0), (second, 8.0)]
+        yield first, values[first]
+        submitted.append(claim())
+        yield excluded, CertifiedDesignBound(4.0)
+        yield second, values[second]
+        submitted.append(claim())
+        yield tied, values[tied]
+        assert claim() is None
+
+    def admissible(candidate):
+        return len(candidate) >= 4
+
+    result = finite_design_descent(
+        pool,
+        {"k"},
+        values.__getitem__,
+        admissible=admissible,
+        evaluate_stream_with_cutoff=stream,
+        on_evaluation=archived.__setitem__,
+        on_pruning=bounds.__setitem__,
+    )
+    cutoff = np.nextafter(3.0, np.inf)
+    assert submitted[2:] == [(excluded, cutoff), (tied, cutoff)]
+    expected = tied if tied_total == 1.0 else first
+    assert result.path == (pool, expected) and result.pruned == {excluded: 4.0}
+    replayed = finite_design_descent(
+        pool, {"k"}, pytest.fail, admissible=admissible, cache=archived, bound_cache=bounds
+    )
+    assert replayed == result
+
+
+def test_streamed_design_rejects_a_certificate_below_its_submission_cutoff():
+    pool = frozenset("kab")
+
+    def stream(claim):
+        first, _ = claim()
+        second, _ = claim()
+        yield first, {"g": 3.0}
+        yield second, CertifiedDesignBound(4.0)
+
+    with pytest.raises(ValueError, match="bound below the incumbent"):
+        finite_design_descent(
+            pool, {"k"}, lambda _: {"g": 5.0}, evaluate_stream_with_cutoff=stream
+        )
+
+
 def test_finite_design_descent_keeps_an_unresolved_score_distinct_from_a_bound():
     pool, unknown, excluded = map(frozenset, ("kab", "ka", "kb"))
     cache = {pool: {"g": 5.0}, unknown: UnresolvedDesign("undefined derivative")}

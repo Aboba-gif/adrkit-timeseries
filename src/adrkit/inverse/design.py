@@ -7,7 +7,7 @@
 
 from dataclasses import dataclass, field
 from collections.abc import Mapping
-from math import fsum
+from math import fsum, inf, nextafter
 from operator import index
 from types import MappingProxyType
 
@@ -1094,6 +1094,7 @@ def finite_design_descent(
     evaluate_many=None,
     evaluate_with_cutoff=None,
     evaluate_many_with_cutoff=None,
+    evaluate_stream_with_cutoff=None,
     bound_cache=None,
     on_pruning=None,
 ):
@@ -1139,10 +1140,18 @@ def finite_design_descent(
         тех же рисков. Она должна быть не меньше incumbent_score. Старт
         по-прежнему оценивается без порога. Пакетный вариант несовместим
         с одновременным заданием evaluate_many.
+    evaluate_stream_with_cutoff : callable, optional
+        Получает функцию claim(). Она выдаёт следующую пару (состав, порог)
+        или None, когда новых работ нет. Исполнитель возвращает пары
+        (состав, результат) по готовности. Состав выдаётся один раз, а его
+        сертификат проверяется по порогу выдачи. При получении полной оценки
+        лучшего улучшающего соседа порог меняется только для следующих работ.
+        Этот режим не сочетается с другими соседними исполнителями.
     bound_cache : Mapping, optional
         Сохранённые границы того же критерия по точным frozenset ключам.
         Они проверяются по известным полным оценкам и применяются заново
-        с порогом текущего шага.
+        с порогом текущего шага. Для воспроизведения отсева по улучшившемуся
+        соседу его полная оценка передаётся в cache.
     on_pruning : callable, optional
         Синхронный callback(candidate, bound) при первом исключении состава
         в данном вызове. Вызывается и для границы из bound_cache. Позволяет
@@ -1193,12 +1202,18 @@ def finite_design_descent(
             evaluate_many,
             evaluate_with_cutoff,
             evaluate_many_with_cutoff,
+            evaluate_stream_with_cutoff,
             on_pruning,
         )
     ):
         raise TypeError("Design evaluation, admissibility and callbacks must be callable")
     if evaluate_many is not None and evaluate_many_with_cutoff is not None:
         raise ValueError("Specify one batch design evaluator")
+    if evaluate_stream_with_cutoff is not None and any(
+        evaluator is not None
+        for evaluator in (evaluate_many, evaluate_with_cutoff, evaluate_many_with_cutoff)
+    ):
+        raise ValueError("A streamed design evaluator requires exclusive scheduling")
     if cache is not None and not isinstance(cache, Mapping):
         raise TypeError("cache must be a Mapping with exact frozenset keys")
     if bound_cache is not None and not isinstance(bound_cache, Mapping):
@@ -1347,37 +1362,67 @@ def finite_design_descent(
             candidate for candidate in sorted(raw_neighbors, key=canonical) if allowed(candidate)
         )
         threshold = scores[current][0]
-        pending = []
-        for candidate in neighbors:
-            if candidate in evaluations or candidate in pruned:
-                continue
-            bound = bounds.get(candidate)
-            if bound is not None and bound >= threshold:
-                prune(candidate, bound)
-            else:
-                pending.append(candidate)
-        if evaluate_many is None and evaluate_many_with_cutoff is None:
+        best_max = min(
+            (scores[candidate][0] for candidate in neighbors if candidate in scores),
+            default=threshold,
+        )
+
+        def pending_jobs():
             for candidate in neighbors:
-                if candidate in pruned:
+                if candidate in evaluations or candidate in pruned:
                     continue
-                if evaluate_with_cutoff is None or candidate in evaluations:
-                    obtain(candidate)
+                # A tie with an improving neighbour must still be compared
+                # by the total risk and the identifiers.
+                limit = nextafter(best_max, inf) if best_max < threshold else threshold
+                bound = bounds.get(candidate)
+                if bound is not None and bound >= limit:
+                    prune(candidate, bound)
                 else:
-                    if not allowed(candidate):
-                        raise ValueError("A design became inadmissible before evaluation")
-                    accept(candidate, evaluate_with_cutoff(candidate, threshold), threshold)
-        elif pending:
-            candidates = tuple(pending)
-            bounded = evaluate_many_with_cutoff is not None
-            batch = (
-                evaluate_many_with_cutoff(candidates, threshold)
-                if bounded
-                else evaluate_many(candidates)
-            )
-            for candidate, value in zip(candidates, batch, strict=True):
+                    yield candidate, limit
+
+        pending = pending_jobs()
+        if evaluate_stream_with_cutoff is not None:
+            submitted = {}
+
+            def claim():
+                job = next(pending, None)
+                if job is not None:
+                    candidate, limit = job
+                    submitted[candidate] = limit
+                return job
+
+            for candidate, value in evaluate_stream_with_cutoff(claim):
+                candidate_key(candidate)
+                if candidate not in submitted:
+                    raise ValueError("A streamed design result requires a single matching job")
                 if not allowed(candidate):
                     raise ValueError("A design became inadmissible before evaluation")
-                accept(candidate, value, threshold if bounded else None)
+                accept(candidate, value, submitted.pop(candidate))
+                if candidate in scores:
+                    best_max = min(best_max, scores[candidate][0])
+            if submitted or next(pending, None) is not None:
+                raise ValueError("A streamed design evaluator omitted a neighbour result")
+        else:
+            candidates = tuple(candidate for candidate, _ in pending)
+            if evaluate_many is None and evaluate_many_with_cutoff is None:
+                for candidate in candidates:
+                    if evaluate_with_cutoff is None:
+                        obtain(candidate)
+                    else:
+                        if not allowed(candidate):
+                            raise ValueError("A design became inadmissible before evaluation")
+                        accept(candidate, evaluate_with_cutoff(candidate, threshold), threshold)
+            elif candidates:
+                bounded = evaluate_many_with_cutoff is not None
+                batch = (
+                    evaluate_many_with_cutoff(candidates, threshold)
+                    if bounded
+                    else evaluate_many(candidates)
+                )
+                for candidate, value in zip(candidates, batch, strict=True):
+                    if not allowed(candidate):
+                        raise ValueError("A design became inadmissible before evaluation")
+                    accept(candidate, value, threshold if bounded else None)
         # A changed admissibility rule must not silently alter the final frontier.
         allowed(current)
         for candidate in sorted(raw_neighbors, key=canonical):
