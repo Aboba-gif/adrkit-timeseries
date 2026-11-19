@@ -20,7 +20,7 @@ from adrkit.inverse.design import (
     robust_ball_maximum,
     select_designs,
 )
-from adrkit.inverse import finite_design_descent
+from adrkit.inverse import CertifiedDesignBound, finite_design_descent
 
 
 @pytest.mark.parametrize("diagonal", [False, True])
@@ -1331,6 +1331,131 @@ def test_finite_design_descent_batches_only_uncached_neighbors_in_checkpoint_ord
     assert result.status == "incomplete" and result.unresolved_frontier == (middle,)
     assert batches == [(middle, right), (small,)]
     assert checkpoints == [pool, middle, right, small]
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_finite_design_descent_screens_equal_risk_and_reuses_the_bound(batch):
+    pool, preferred, excluded, smaller = map(frozenset, ("kab", "ka", "kb", "k"))
+    risks = {pool: {"g": 5.0}, preferred: {"g": 3.0}, excluded: {"g": 5.0}, smaller: {"g": 2.0}}
+    evaluated, pruned, calls = [], [], []
+
+    def evaluate(candidate):
+        assert candidate == pool
+        return risks[candidate]
+
+    def get_neighbor(candidate, cutoff):
+        calls.append((candidate, cutoff))
+        if candidate == excluded:
+            return CertifiedDesignBound(5.0)
+        return risks[candidate]
+
+    def evaluate_batch(candidates, cutoff):
+        return (get_neighbor(candidate, cutoff) for candidate in candidates)
+
+    mode = (
+        {"evaluate_many_with_cutoff": evaluate_batch}
+        if batch
+        else {"evaluate_with_cutoff": get_neighbor}
+    )
+    result = finite_design_descent(
+        pool,
+        {"k"},
+        evaluate,
+        on_evaluation=lambda candidate, _: evaluated.append(candidate),
+        on_pruning=lambda candidate, bound: pruned.append((candidate, bound)),
+        **mode,
+    )
+    reference = finite_design_descent(pool, {"k"}, risks.__getitem__)
+    assert result.path == reference.path == (pool, preferred, smaller)
+    assert result.frontier == reference.frontier and result.status == "local_minimum"
+    assert result.pruned_frontier == (excluded,) and not result.unresolved_frontier
+    assert result.pruned == {excluded: 5.0} and pruned == [(excluded, 5.0)]
+    assert evaluated == [pool, preferred, smaller] and excluded not in result.evaluations
+    assert calls == [(preferred, 5.0), (excluded, 5.0), (smaller, 3.0)]
+
+
+def test_finite_design_descent_persists_screening_separately_and_resumes():
+    pool, improving, excluded = map(frozenset, ("kab", "ka", "kb"))
+    evaluations = {pool: {"g": 5.0}}
+    bounds = {}
+
+    def cutoff(candidate, incumbent):
+        assert incumbent == 5.0
+        return {"g": 4.0} if candidate == improving else CertifiedDesignBound(6.0)
+
+    def checkpoint(candidate, bound):
+        bounds[candidate] = bound
+        raise InterruptedError("save before interruption")
+
+    with pytest.raises(InterruptedError):
+        finite_design_descent(
+            pool,
+            {"k"},
+            pytest.fail,
+            admissible=lambda candidate: len(candidate) > 1,
+            cache=evaluations,
+            evaluate_with_cutoff=cutoff,
+            on_evaluation=evaluations.__setitem__,
+            on_pruning=checkpoint,
+        )
+    assert evaluations == {pool: {"g": 5.0}, improving: {"g": 4.0}}
+    assert bounds == {excluded: 6.0}
+    reused = {}
+    resumed = finite_design_descent(
+        pool,
+        {"k"},
+        pytest.fail,
+        admissible=lambda candidate: len(candidate) > 1,
+        cache=evaluations,
+        resume_from=improving,
+        bound_cache=bounds,
+        evaluate_with_cutoff=pytest.fail,
+        on_pruning=reused.__setitem__,
+    )
+    assert resumed.path == (improving,)
+    assert resumed.status == "local_minimum"
+    assert resumed.pruned_frontier == (excluded,) and reused == bounds
+
+
+def test_finite_design_descent_keeps_an_unresolved_score_distinct_from_a_bound():
+    pool, unknown, excluded = map(frozenset, ("kab", "ka", "kb"))
+    cache = {pool: {"g": 5.0}, unknown: UnresolvedDesign("undefined derivative")}
+    result = finite_design_descent(
+        pool,
+        {"k"},
+        pytest.fail,
+        cache=cache,
+        bound_cache={unknown: 5.0, excluded: 5.0},
+        evaluate_with_cutoff=pytest.fail,
+    )
+    assert result.status == "incomplete"
+    assert result.pruned_frontier == (excluded,)
+    assert result.unresolved_frontier == (unknown,)
+
+
+@pytest.mark.parametrize("bound", [4.0, -1.0, np.nan, np.inf, True])
+def test_finite_design_descent_rejects_an_invalid_screening_certificate(bound):
+    pool = frozenset({"k", "a"})
+    with pytest.raises(ValueError, match="design.*bound"):
+        finite_design_descent(
+            pool,
+            {"k"},
+            lambda _: {"g": 5.0},
+            evaluate_with_cutoff=lambda *args: CertifiedDesignBound(bound),
+            on_pruning=pytest.fail,
+        )
+
+
+def test_finite_design_descent_checks_below_cutoff_bound_against_full_score():
+    pool, neighbor = map(frozenset, ("ka", "k"))
+    risks = {pool: {"g": 5.0}, neighbor: {"g": 4.0}}
+    result = finite_design_descent(pool, {"k"}, risks.__getitem__, bound_cache={neighbor: 3.0})
+    assert result.path == (pool, neighbor) and not result.pruned
+    for cache in ({pool: risks[pool]}, risks):
+        with pytest.raises(ValueError, match="contradicts its lower bound"):
+            finite_design_descent(
+                pool, {"k"}, risks.__getitem__, cache=cache, bound_cache={neighbor: 4.5}
+            )
 
 
 @pytest.mark.parametrize("length", [0, 2])

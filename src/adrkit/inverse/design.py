@@ -5,7 +5,7 @@
 максимума в FP64 не являются интервальными сертификатами.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Mapping
 from math import fsum
 from operator import index
@@ -314,9 +314,7 @@ class CenteredBudgetGoalRisk:
                 return d
             linear = np.multiply(h, scale)
             quadratic = np.multiply(np.multiply(a, scale), scale)
-            value = real_scalar(
-                fsum((d, -linear, -linear, quadratic)), name="centered goal risk"
-            )
+            value = real_scalar(fsum((d, -linear, -linear, quadratic)), name="centered goal risk")
             if value < 0:
                 raise ValueError(
                     "A centered risk value is negative: incompatible inputs or "
@@ -1049,19 +1047,27 @@ class UnresolvedDesign:
 
 
 @dataclass(frozen=True)
+class CertifiedDesignBound:
+    """Доверенная нижняя граница максимума общих нормированных рисков."""
+
+    lower_bound: float
+
+
+@dataclass(frozen=True)
 class FiniteDesignResult:
-    """Конечный строгий спуск по составу с полным обследованием соседства.
+    """Конечный строгий спуск по составу с проверкой соседства.
 
     selected — текущая оценённая конфигурация, либо None при unresolved_start.
     path содержит только путь данного вызова, начиная с полного пула или
     явного resume_from. evaluations — неизменяемый кэш по точным frozenset,
     со значениями Mapping нормированных рисков либо UnresolvedDesign.
     frontier содержит всё допустимое финальное add/delete/swap-соседство;
-    unresolved_frontier — его неоценённую часть.
+    unresolved_frontier — часть с явно неопределённой оценкой.
+    pruned — независимый кэш нижних границ для исключённых составов этого вызова.
+    pruned_frontier — те из них, которые входят в конечное соседство.
 
     status='local_minimum' удостоверяет лишь отсутствие строгого улучшения
-    вычисленного максимума в полностью оценённом указанном соседстве. Это
-    не глобальная оптимальность или сертификат истинного нелинейного риска.
+    вычисленного максимума в указанном соседстве по оценкам и нижним границам.
     status='incomplete' сохраняет полезный selected без такого утверждения.
     При unresolved_start соседство ещё не обследовалось, оба frontier пусты.
     """
@@ -1072,6 +1078,8 @@ class FiniteDesignResult:
     frontier: tuple
     unresolved_frontier: tuple
     status: str
+    pruned: Mapping = field(default_factory=lambda: MappingProxyType({}))
+    pruned_frontier: tuple = ()
 
 
 def finite_design_descent(
@@ -1084,6 +1092,10 @@ def finite_design_descent(
     resume_from=None,
     on_evaluation=None,
     evaluate_many=None,
+    evaluate_with_cutoff=None,
+    evaluate_many_with_cutoff=None,
+    bound_cache=None,
+    on_pruning=None,
 ):
     """Сравнить конечные составы без произвольного ограничения их стоимости.
 
@@ -1120,6 +1132,21 @@ def finite_design_descent(
         и возвращает итерируемый объект с одним результатом на соседа в том же
         порядке. Позволяет запускать независимые оценки параллельно. Начальный
         состав по-прежнему проверяется через evaluate или cache.
+    evaluate_with_cutoff, evaluate_many_with_cutoff : callable, optional
+        Варианты оценки соседей с дополнительным аргументом incumbent_score.
+        Могут вернуть CertifiedDesignBound вместо полной оценки. Вызывающий
+        код удостоверяет конечную неотрицательную нижнюю границу максимума
+        тех же рисков. Она должна быть не меньше incumbent_score. Старт
+        по-прежнему оценивается без порога. Пакетный вариант несовместим
+        с одновременным заданием evaluate_many.
+    bound_cache : Mapping, optional
+        Сохранённые границы того же критерия по точным frozenset ключам.
+        Они проверяются по известным полным оценкам и применяются заново
+        с порогом текущего шага.
+    on_pruning : callable, optional
+        Синхронный callback(candidate, bound) при первом исключении состава
+        в данном вызове. Вызывается и для границы из bound_cache. Позволяет
+        сохранить исключение до запуска дорогих оценок оставшихся соседей.
 
     Returns
     -------
@@ -1130,8 +1157,9 @@ def finite_design_descent(
     -----
     Соседи получаются добавлением, удалением или обменом одного необязательного
     элемента. Точные frozenset исключают коллизии строковых обозначений сетей.
-    Сначала оценивается всё допустимое соседство; известные улучшения разрешены
-    и при наличии других UnresolvedDesign. Переход требует строго меньшего
+    Проверяется всё допустимое соседство по оценкам и нижним границам.
+    Известные улучшения разрешены и при наличии других UnresolvedDesign.
+    Переход требует строго меньшего
     максимума рисков; между улучшениями сравниваются максимум, сумма и tuple
     отсортированных идентификаторов. Меньшая сумма при равном максимуме не
     разрешает переход. Допусков сравнения или бюджета числа элементов нет.
@@ -1159,12 +1187,24 @@ def finite_design_descent(
         raise ValueError("A nonempty pool must contain every mandatory identifier")
     if not callable(evaluate) or any(
         value is not None and not callable(value)
-        for value in (admissible, on_evaluation, evaluate_many)
+        for value in (
+            admissible,
+            on_evaluation,
+            evaluate_many,
+            evaluate_with_cutoff,
+            evaluate_many_with_cutoff,
+            on_pruning,
+        )
     ):
         raise TypeError("Design evaluation, admissibility and callbacks must be callable")
+    if evaluate_many is not None and evaluate_many_with_cutoff is not None:
+        raise ValueError("Specify one batch design evaluator")
     if cache is not None and not isinstance(cache, Mapping):
         raise TypeError("cache must be a Mapping with exact frozenset keys")
+    if bound_cache is not None and not isinstance(bound_cache, Mapping):
+        raise TypeError("bound_cache must be a Mapping with exact frozenset keys")
     decisions, evaluations, scores = {}, {}, {}
+    bounds, pruned = {}, {}
     goals = None
 
     def canonical(candidate):
@@ -1209,13 +1249,38 @@ def finite_design_descent(
         goals = keys
         return MappingProxyType(dict(normalized)), (max(numbers), total)
 
+    def validated_bound(value):
+        if np.ma.isMaskedArray(value):
+            raise ValueError("A design lower bound cannot contain a masked value")
+        bound = real_scalar(value, name="design lower bound")
+        if bound < 0:
+            raise ValueError("A design lower bound must be nonnegative")
+        return bound
+
+    def check_bound(candidate, score):
+        if score is not None and candidate in bounds and bounds[candidate] > score[0]:
+            raise ValueError("A design score contradicts its lower bound")
+
+    def prune(candidate, bound):
+        if candidate in pruned:
+            return
+        pruned[candidate] = bound
+        if on_pruning is not None:
+            on_pruning(candidate, bound)
+
     if not allowed(universe):
         raise ValueError("The full pool must be an admissible starting design")
+    for candidate, value in (() if bound_cache is None else bound_cache.items()):
+        candidate_key(candidate)
+        if not allowed(candidate):
+            raise ValueError("A cached bound design is inadmissible under the declared fixed rule")
+        bounds[candidate] = validated_bound(value)
     for candidate, value in (() if cache is None else cache.items()):
         candidate_key(candidate)
         if not allowed(candidate):
             raise ValueError("A cached design is inadmissible under the declared fixed rule")
         record, score = validated(value)
+        check_bound(candidate, score)
         evaluations[candidate] = record
         if score is not None:
             scores[candidate] = score
@@ -1225,8 +1290,15 @@ def finite_design_descent(
     if resume_from is not None and current not in scores:
         raise ValueError("resume_from must have a resolved entry in cache")
 
-    def accept(candidate, value):
+    def accept(candidate, value, threshold=None):
+        if isinstance(value, CertifiedDesignBound) and threshold is not None:
+            bound = validated_bound(value.lower_bound)
+            if bound < threshold:
+                raise ValueError("A design bound below the incumbent cannot exclude improvement")
+            prune(candidate, bound)
+            return
         record, score = validated(value)
+        check_bound(candidate, score)
         evaluations[candidate] = record
         if score is not None:
             scores[candidate] = score
@@ -1244,7 +1316,7 @@ def finite_design_descent(
         unresolved = tuple(
             candidate
             for candidate in frontier
-            if isinstance(evaluations[candidate], UnresolvedDesign)
+            if isinstance(evaluations.get(candidate), UnresolvedDesign)
         )
         records = {
             candidate: evaluations[candidate] for candidate in sorted(evaluations, key=canonical)
@@ -1256,6 +1328,10 @@ def finite_design_descent(
             frontier=tuple(frontier),
             unresolved_frontier=unresolved,
             status=status,
+            pruned=MappingProxyType(
+                {candidate: pruned[candidate] for candidate in sorted(pruned, key=canonical)}
+            ),
+            pruned_frontier=tuple(candidate for candidate in frontier if candidate in pruned),
         )
 
     path = [current]
@@ -1270,16 +1346,38 @@ def finite_design_descent(
         neighbors = tuple(
             candidate for candidate in sorted(raw_neighbors, key=canonical) if allowed(candidate)
         )
-        if evaluate_many is None:
+        threshold = scores[current][0]
+        pending = []
+        for candidate in neighbors:
+            if candidate in evaluations or candidate in pruned:
+                continue
+            bound = bounds.get(candidate)
+            if bound is not None and bound >= threshold:
+                prune(candidate, bound)
+            else:
+                pending.append(candidate)
+        if evaluate_many is None and evaluate_many_with_cutoff is None:
             for candidate in neighbors:
-                obtain(candidate)
-        else:
-            pending = tuple(candidate for candidate in neighbors if candidate not in evaluations)
-            if pending:
-                for candidate, value in zip(pending, evaluate_many(pending), strict=True):
+                if candidate in pruned:
+                    continue
+                if evaluate_with_cutoff is None or candidate in evaluations:
+                    obtain(candidate)
+                else:
                     if not allowed(candidate):
                         raise ValueError("A design became inadmissible before evaluation")
-                    accept(candidate, value)
+                    accept(candidate, evaluate_with_cutoff(candidate, threshold), threshold)
+        elif pending:
+            candidates = tuple(pending)
+            bounded = evaluate_many_with_cutoff is not None
+            batch = (
+                evaluate_many_with_cutoff(candidates, threshold)
+                if bounded
+                else evaluate_many(candidates)
+            )
+            for candidate, value in zip(candidates, batch, strict=True):
+                if not allowed(candidate):
+                    raise ValueError("A design became inadmissible before evaluation")
+                accept(candidate, value, threshold if bounded else None)
         # A changed admissibility rule must not silently alter the final frontier.
         allowed(current)
         for candidate in sorted(raw_neighbors, key=canonical):
@@ -1293,7 +1391,8 @@ def finite_design_descent(
             status = (
                 "incomplete"
                 if any(
-                    isinstance(evaluations[candidate], UnresolvedDesign) for candidate in neighbors
+                    isinstance(evaluations.get(candidate), UnresolvedDesign)
+                    for candidate in neighbors
                 )
                 else "local_minimum"
             )

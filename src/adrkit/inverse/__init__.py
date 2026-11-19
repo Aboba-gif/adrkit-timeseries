@@ -26,6 +26,7 @@ from .constraints import (
 )
 from .design import (
     CenteredBudgetGoalRisk,
+    CertifiedDesignBound,
     CovarianceFactor,
     DesignCandidate,
     FiniteDesignResult,
@@ -71,6 +72,7 @@ __all__ = [
     "stationary_box_inverse",
     "CovarianceFactor",
     "CenteredBudgetGoalRisk",
+    "CertifiedDesignBound",
     "DesignCandidate",
     "FiniteDesignResult",
     "InnovationBudget",
