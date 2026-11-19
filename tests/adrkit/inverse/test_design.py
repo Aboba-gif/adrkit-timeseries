@@ -1285,6 +1285,69 @@ def test_finite_design_descent_checkpoints_validated_results_and_reuses_them_aft
         resumed.status = "global_minimum"
 
 
+def test_finite_design_descent_batches_only_uncached_neighbors_in_checkpoint_order():
+    pool = frozenset({"k", "a", "b", "c"})
+    left, middle, right = (pool - {name} for name in ("c", "b", "a"))
+    small = frozenset({"k", "c"})
+    risks = {
+        pool: {"q": 6.0, "theta": 5.0},
+        left: {"q": 3.0, "theta": 1.0},
+        middle: UnresolvedDesign("no stationary derivative"),
+        right: {"q": 3.0, "theta": 0.0},
+        small: {"q": 2.0, "theta": 0.0},
+    }
+    cache = {left: risks[left]}
+    checkpoints, batches = [], []
+    offered = [pool]
+
+    def admissible(candidate):
+        return candidate in risks
+
+    def serial(candidate):
+        assert candidate == pool
+        return risks[candidate]
+
+    def batch(candidates):
+        batches.append(candidates)
+        for candidate in candidates:
+            assert checkpoints == offered
+            offered.append(candidate)
+            yield risks[candidate]
+
+    expected = finite_design_descent(
+        pool, {"k"}, risks.__getitem__, admissible=admissible, cache=cache
+    )
+    result = finite_design_descent(
+        pool,
+        {"k"},
+        serial,
+        admissible=admissible,
+        cache=cache,
+        on_evaluation=lambda candidate, _: checkpoints.append(candidate),
+        evaluate_many=batch,
+    )
+    assert result == expected
+    assert result.path == (pool, right, small)
+    assert result.status == "incomplete" and result.unresolved_frontier == (middle,)
+    assert batches == [(middle, right), (small,)]
+    assert checkpoints == [pool, middle, right, small]
+
+
+@pytest.mark.parametrize("length", [0, 2])
+def test_finite_design_descent_rejects_batch_result_with_wrong_length(length):
+    pool, neighbor = frozenset({"k", "a"}), frozenset({"k"})
+    checkpoints = []
+    with pytest.raises(ValueError, match="zip"):
+        finite_design_descent(
+            pool,
+            {"k"},
+            lambda candidate: {"q": 2.0},
+            evaluate_many=lambda candidates: [{"q": 1.0}] * length,
+            on_evaluation=lambda candidate, _: checkpoints.append(candidate),
+        )
+    assert checkpoints == ([pool] if length == 0 else [pool, neighbor])
+
+
 def test_finite_design_descent_uses_exact_set_cache_keys_without_display_identifier_collisions():
     pool = frozenset({"k", "a", "b", "a|b"})
     high, low = frozenset({"k", "a", "b"}), frozenset({"k", "a|b"})

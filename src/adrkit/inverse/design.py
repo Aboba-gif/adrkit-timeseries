@@ -1083,6 +1083,7 @@ def finite_design_descent(
     cache=None,
     resume_from=None,
     on_evaluation=None,
+    evaluate_many=None,
 ):
     """Сравнить конечные составы без произвольного ограничения их стоимости.
 
@@ -1111,8 +1112,14 @@ def finite_design_descent(
         и научную идентичность кэша проверяет вызывающее приложение.
     on_evaluation : callable, optional
         Синхронный callback(candidate, immutable_result) ровно один раз для
-        каждой новой валидированной записи, до следующей оценки или перехода.
+        каждой новой валидированной записи, до приёма следующего результата
+        или перехода.
         Позволяет сохранять результаты вне библиотеки; исключения пробрасываются.
+    evaluate_many : callable, optional
+        Принимает кортеж неоценённых допустимых соседей в каноническом порядке
+        и возвращает итерируемый объект с одним результатом на соседа в том же
+        порядке. Позволяет запускать независимые оценки параллельно. Начальный
+        состав по-прежнему проверяется через evaluate или cache.
 
     Returns
     -------
@@ -1151,7 +1158,8 @@ def finite_design_descent(
     if not universe or not required <= universe:
         raise ValueError("A nonempty pool must contain every mandatory identifier")
     if not callable(evaluate) or any(
-        value is not None and not callable(value) for value in (admissible, on_evaluation)
+        value is not None and not callable(value)
+        for value in (admissible, on_evaluation, evaluate_many)
     ):
         raise TypeError("Design evaluation, admissibility and callbacks must be callable")
     if cache is not None and not isinstance(cache, Mapping):
@@ -1217,16 +1225,19 @@ def finite_design_descent(
     if resume_from is not None and current not in scores:
         raise ValueError("resume_from must have a resolved entry in cache")
 
+    def accept(candidate, value):
+        record, score = validated(value)
+        evaluations[candidate] = record
+        if score is not None:
+            scores[candidate] = score
+        if on_evaluation is not None:
+            on_evaluation(candidate, record)
+
     def obtain(candidate):
         if not allowed(candidate):
             raise ValueError("A design became inadmissible before evaluation")
         if candidate not in evaluations:
-            record, score = validated(evaluate(candidate))
-            evaluations[candidate] = record
-            if score is not None:
-                scores[candidate] = score
-            if on_evaluation is not None:
-                on_evaluation(candidate, record)
+            accept(candidate, evaluate(candidate))
         return evaluations[candidate]
 
     def result(status, path, frontier=()):
@@ -1259,8 +1270,16 @@ def finite_design_descent(
         neighbors = tuple(
             candidate for candidate in sorted(raw_neighbors, key=canonical) if allowed(candidate)
         )
-        for candidate in neighbors:
-            obtain(candidate)
+        if evaluate_many is None:
+            for candidate in neighbors:
+                obtain(candidate)
+        else:
+            pending = tuple(candidate for candidate in neighbors if candidate not in evaluations)
+            if pending:
+                for candidate, value in zip(pending, evaluate_many(pending), strict=True):
+                    if not allowed(candidate):
+                        raise ValueError("A design became inadmissible before evaluation")
+                    accept(candidate, value)
         # A changed admissibility rule must not silently alter the final frontier.
         allowed(current)
         for candidate in sorted(raw_neighbors, key=canonical):
