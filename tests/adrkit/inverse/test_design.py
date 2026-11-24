@@ -914,6 +914,29 @@ def test_profile_requires_positive_definite_working_covariance(covariance):
         profile_information(np.ones((2, 1)), np.ones((2, 1)), covariance)
 
 
+@pytest.mark.parametrize("hidden", [0.01, 100.0])
+def test_design_inputs_reject_missing_risks_and_covariances(hidden):
+    missing = np.ma.array(hidden, mask=True)
+    row = np.ma.array([hidden, 1.0], mask=[True, False])
+    for factor in (row[None, :], [row], [[missing]]):
+        with pytest.raises(ValueError, match="masked"):
+            CovarianceFactor(factor)
+    with pytest.raises(ValueError, match="risks"):
+        DesignCandidate("missing", 1, {"g": missing})
+    candidate = DesignCandidate("known", 1, {"g": 1.0})
+    with pytest.raises(ValueError, match="baselines"):
+        select_designs([candidate], {"g": missing}, budgets=(1,))
+    with pytest.raises(ValueError, match="budget"):
+        select_designs([candidate], {"g": 1.0}, budgets=np.ma.array([hidden], mask=[True]))
+
+
+def test_unmasked_covariance_entries_and_zero_risk_remain_valid():
+    factor = CovarianceFactor(np.ma.array([[2.0]], mask=False))
+    assert joint_moment_risk([[1.0]], [0.0], [0.0], factor).value == 4.0
+    candidate = DesignCandidate("known", 1, {"g": np.ma.array(0.0, mask=False)})
+    assert select_designs([candidate], {"g": 1.0}, budgets=(1,))[0].winner == "known"
+
+
 @pytest.mark.parametrize("baseline", [0.0, -1.0, np.nan, np.inf])
 def test_selection_rejects_invalid_baselines(baseline):
     with pytest.raises((TypeError, ValueError)):

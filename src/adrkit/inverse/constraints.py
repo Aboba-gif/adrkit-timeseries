@@ -184,9 +184,11 @@ def _restricted_inverse_action(hessian_action, size, free, *, solve_rtol, maxite
             try:
                 correction, info = minres(
                     reduced,
-                    scale_power_of_two(residual, -residual_exponent)
-                    if residual_exponent
-                    else residual,
+                    (
+                        scale_power_of_two(residual, -residual_exponent)
+                        if residual_exponent
+                        else residual
+                    ),
                     rtol=inner_rtol,
                     maxiter=maxiter - iterations,
                     callback=count_iteration,

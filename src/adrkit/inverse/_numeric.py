@@ -1,6 +1,17 @@
 """Проверки вещественных числовых входов для операций обратной задачи."""
 
+from collections.abc import Sequence
+
 import numpy as np
+
+
+def _contains_masked_values(value):
+    """Проверить маску до того, как NumPy отбросит её у массива или вложенной строки."""
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray, memoryview, range)
+    ):
+        return any(_contains_masked_values(item) for item in value)
+    return np.ma.is_masked(value)
 
 
 def real_array(value, *, name, dtype=float, finite=True, copy=False):
@@ -9,7 +20,7 @@ def real_array(value, *, name, dtype=float, finite=True, copy=False):
     Parameters
     ----------
     value : array_like
-        Вещественные числа; bool, комплексные и нечисловые массивы
+        Вещественные числа; пропуски под маской, bool, комплексные и нечисловые массивы
         отклоняются.
     name : str
         Имя входа в сообщении об ошибке.
@@ -25,6 +36,8 @@ def real_array(value, *, name, dtype=float, finite=True, copy=False):
     array : ndarray
         Массив исходной формы в заданном dtype.
     """
+    if _contains_masked_values(value):
+        raise ValueError(f"{name} contains masked values")
     raw = np.asarray(value)
     if raw.dtype.kind not in "fiu" or (finite and not np.isfinite(raw).all()):
         qualifier = "finite real" if finite else "real"
