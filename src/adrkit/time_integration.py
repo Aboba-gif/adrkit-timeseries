@@ -959,6 +959,15 @@ class StrangTrajectory:
             return _readonly(self._states, np)
         return self._states.copy()
 
+    @property
+    def array_module(self):
+        """Array implementation holding this trajectory and its derivatives."""
+        return self.affine.array_module
+
+    def to_host(self, values):
+        """Return trajectory values in host coordinates."""
+        return self.affine.to_host(values)
+
     def _frame(self, n, direction=None):
         values = self._forcing if direction is None else direction
         return values[n] if self._load is None else self._load * values[n]
